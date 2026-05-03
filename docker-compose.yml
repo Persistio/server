@@ -1,0 +1,29 @@
+services:
+  persistio:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "4827:4827"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mnemex
+      POSTGRES_USER: mnemex
+      POSTGRES_PASSWORD: mnemex
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U mnemex -d mnemex']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
