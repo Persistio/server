@@ -1,0 +1,238 @@
+openapi: 3.1.0
+info:
+  title: Persistio API
+  version: 0.1.0
+  description: Self-hosted memory service for AI agents.
+servers:
+  - url: http://localhost:4827
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service is healthy
+  /v1/ingest:
+    post:
+      summary: Append raw conversation chunks
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, chunks]
+              properties:
+                session_id:
+                  type: string
+                chunks:
+                  type: array
+                  items:
+                    type: object
+                    required: [role, content]
+                    properties:
+                      role:
+                        type: string
+                        enum: [user, assistant, tool]
+                      content:
+                        type: string
+      responses:
+        '202':
+          description: Chunks accepted
+  /v1/recall:
+    post:
+      summary: Semantic recall across memories and optional raw chunks
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                top_k:
+                  type: integer
+                include_raw:
+                  type: boolean
+      responses:
+        '200':
+          description: Recall results
+  /v1/memories:
+    get:
+      summary: List memories
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: archived
+          schema:
+            type: boolean
+        - in: query
+          name: category
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+        - in: query
+          name: offset
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Paginated memories
+    post:
+      summary: Create a memory
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data, subject]
+              properties:
+                data:
+                  type: string
+                subject:
+                  type: string
+                categories:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Memory created
+  /v1/memories/{id}:
+    get:
+      summary: Fetch one memory
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Memory details
+        '404':
+          description: Memory not found
+    patch:
+      summary: Update a memory
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Memory updated
+        '404':
+          description: Memory not found
+    delete:
+      summary: Archive a memory
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Memory archived
+        '404':
+          description: Memory not found
+  /v1/extract:
+    post:
+      summary: Trigger extraction
+      security:
+        - bearerAuth: []
+      responses:
+        '202':
+          description: Extraction job queued
+  /v1/jobs/{id}:
+    get:
+      summary: Check extraction job status
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job status
+        '404':
+          description: Job not found
+  /admin/tenants:
+    get:
+      summary: List tenants
+      security:
+        - adminKey: []
+      responses:
+        '200':
+          description: Tenant list
+    post:
+      summary: Create a tenant
+      security:
+        - adminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+      responses:
+        '201':
+          description: Tenant created
+  /admin/tenants/{id}:
+    delete:
+      summary: Delete a tenant
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Tenant deleted
+        '404':
+          description: Tenant not found
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    adminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
