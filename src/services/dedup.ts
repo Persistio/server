@@ -17,6 +17,7 @@ import { withSpan } from '../telemetry';
 export interface DedupInput {
   vaultId: string;
   fact: string;
+  score: number;
   subject: string;
   embedding: number[];
   sourceChunks: string[];
@@ -104,9 +105,9 @@ export async function deduplicateMemory(
       await db.query(
         `UPDATE memories
          SET data = $2, hash = $3, embedding = $4::vector,
-             source_chunks = $5::uuid[], updated_at = now(), confidence = confidence + 1
+             source_chunks = $5::uuid[], score = GREATEST(score, $6), updated_at = now(), confidence = confidence + 1
          WHERE id = $1`,
-        [bestMatch.id, storedFact, hash, JSON.stringify(input.embedding), input.sourceChunks]
+        [bestMatch.id, storedFact, hash, JSON.stringify(input.embedding), input.sourceChunks, input.score]
       );
       span.setAttribute('dedup.result', 'updated');
       return { action: 'updated', memoryId: bestMatch.id };
@@ -125,9 +126,9 @@ export async function deduplicateMemory(
         await db.query(
           `UPDATE memories
            SET data = $2, hash = $3, embedding = $4::vector,
-               source_chunks = $5::uuid[], updated_at = now(), confidence = confidence + 1
+               source_chunks = $5::uuid[], score = GREATEST(score, $6), updated_at = now(), confidence = confidence + 1
            WHERE id = $1`,
-          [bestMatch.id, storedFact, hash, JSON.stringify(input.embedding), input.sourceChunks]
+          [bestMatch.id, storedFact, hash, JSON.stringify(input.embedding), input.sourceChunks, input.score]
         );
         span.setAttribute('dedup.result', 'updated');
         return { action: 'updated', memoryId: bestMatch.id };
@@ -149,9 +150,9 @@ export async function deduplicateMemory(
       const encryptedSubject = await encryptSubjectForVault(bestMatchVault, input.subject);
       const inserted = await db.query<{ id: string }>(
         `INSERT INTO memories (
-           vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, source_chunks
+           vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, source_chunks, score
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[])
+         VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[], $9)
          RETURNING id`,
         [
           input.vaultId,
@@ -161,7 +162,8 @@ export async function deduplicateMemory(
           encryptedSubject?.hmac ?? null,
           hash,
           JSON.stringify(input.embedding),
-          input.sourceChunks
+          input.sourceChunks,
+          input.score
         ]
       );
       await incrementUsage(input.vaultId, 'memory_adds');
@@ -180,9 +182,9 @@ export async function deduplicateMemory(
     const encryptedSubject = await encryptSubjectForVault(vault, input.subject);
     const inserted = await db.query<{ id: string }>(
       `INSERT INTO memories (
-         vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, source_chunks
+         vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, source_chunks, score
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[])
+       VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[], $9)
        RETURNING id`,
       [
         input.vaultId,
@@ -192,7 +194,8 @@ export async function deduplicateMemory(
         encryptedSubject?.hmac ?? null,
         hash,
         JSON.stringify(input.embedding),
-        input.sourceChunks
+        input.sourceChunks,
+        input.score
       ]
     );
     await incrementUsage(input.vaultId, 'memory_adds');

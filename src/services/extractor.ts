@@ -6,6 +6,7 @@ import { getConfig } from '../config';
 
 export interface ExtractedFact {
   fact: string;
+  score: number;
   subject: string;
 }
 
@@ -138,6 +139,14 @@ export class ExtractorService {
       return [];
     }
 
+    const normalizeScore = (score: unknown): number => {
+      const parsedScore = typeof score === 'number' ? score : Number(score);
+      if (Number.isInteger(parsedScore) && parsedScore >= 1 && parsedScore <= 10) {
+        return parsedScore;
+      }
+      return 5;
+    };
+
     return parsed
       .filter((item): item is ExtractedFact => {
         return Boolean(
@@ -149,6 +158,7 @@ export class ExtractorService {
       })
       .map((item) => ({
         fact: item.fact.trim(),
+        score: normalizeScore((item as { score?: unknown }).score),
         subject: item.subject.trim()
       }))
       .filter((item) => item.fact && item.subject);

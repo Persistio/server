@@ -49,7 +49,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     values.push(qs.limit, qs.offset);
 
     const result = await query<Record<string, unknown>>(
-      `SELECT *
+      `SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
+              categories, confidence, score, archived_at, created_at, updated_at
        FROM memories
        WHERE ${conditions.join(' AND ')}
        ORDER BY updated_at DESC, created_at DESC
@@ -85,7 +86,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
          vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, categories
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::text[])
-       RETURNING *`,
+       RETURNING id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
+                 categories, confidence, score, archived_at, created_at, updated_at`,
       [
         request.vault.id,
         storedData,
@@ -106,7 +108,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
   app.get('/v1/memories/:id', { preHandler: requireVaultAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await query<Record<string, unknown>>(
-      `SELECT *
+      `SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
+              categories, confidence, score, archived_at, created_at, updated_at
        FROM memories
        WHERE vault_id = $1 AND id = $2
        LIMIT 1`,
@@ -196,7 +199,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
            hash = COALESCE($9, hash),
            embedding = COALESCE($10::vector, embedding)
        WHERE vault_id = $1 AND id = $2
-       RETURNING *`,
+       RETURNING id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
+                 categories, confidence, score, archived_at, created_at, updated_at`,
       [
         request.vault.id,
         params.id,
@@ -229,8 +233,10 @@ async function decryptMemoryRow(
     ? await decryptForVault(vault, row.subject_encrypted)
     : row.subject;
 
+  const { subject_encrypted, ...safeRow } = row as typeof row & { subject_encrypted?: unknown };
+
   return {
-    ...row,
+    ...safeRow,
     data: typeof row.data === 'string' ? await decryptForVault(vault, row.data) : row.data,
     subject: decryptedSubject
   };

@@ -128,12 +128,18 @@ async function processBatch(vaultId?: string) {
             .map((chunk) => `${chunk.role}: ${chunk.decryptedContent}`)
             .join('\n');
           const facts = await extractor.extractFacts(conversation);
+          const threshold = getConfig().EXTRACTION_SCORE_THRESHOLD;
+          const filteredFacts = facts.filter((fact) => fact.score >= threshold);
+          if (filteredFacts.length < facts.length) {
+            console.log(JSON.stringify({ level: 30, msg: 'score threshold filtered facts', dropped: facts.length - filteredFacts.length, total: facts.length, threshold }));
+          }
 
-          for (const fact of facts) {
+          for (const fact of filteredFacts) {
             const embedding = await embedder.embed(fact.fact);
             const result = await deduplicateMemory({
               vaultId: sessionChunks[0].vault_id,
               fact: fact.fact,
+              score: fact.score,
               subject: fact.subject,
               embedding,
               sourceChunks: sessionChunks.map((chunk) => chunk.id)

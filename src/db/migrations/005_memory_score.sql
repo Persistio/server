@@ -1,0 +1,1 @@
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS score INTEGER DEFAULT 5 CHECK (score >= 1 AND score <= 10);
