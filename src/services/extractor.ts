@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import OpenAI from 'openai';
 
 import { getConfig } from '../config';
@@ -7,7 +9,7 @@ export interface ExtractedFact {
   subject: string;
 }
 
-const systemPrompt = `You are a memory extraction engine. Extract durable, searchable facts from the conversation chunk below.
+const HARDCODED_PROMPT = `You are a memory extraction engine. Extract durable, searchable facts from the conversation chunk below.
 
 Rules:
 - Extract DECISIONS, PREFERENCES, PROBLEMS, FAILURES, TECHNICAL DETAILS, and PEOPLE/PROJECT facts
@@ -19,9 +21,41 @@ Rules:
 - Skip conversational filler, acknowledgements, and speculative thinking
 - Output ONLY valid JSON: [{"fact":"...","subject":"..."}]`;
 
+function resolveSystemPrompt(promptFile: string, promptsDir: string): string {
+  if (promptFile) {
+    const allowedDir = path.resolve(promptsDir);
+    let resolved: string;
+    try {
+      resolved = fs.realpathSync(path.resolve(promptFile));
+    } catch {
+      console.warn('[extractor] Could not resolve prompt file path, falling back to default');
+      return HARDCODED_PROMPT;
+    }
+
+    if (!resolved.startsWith(allowedDir + path.sep)) {
+      console.warn('[extractor] EXTRACTOR_PROMPT_FILE is outside allowed directory, ignoring');
+      return HARDCODED_PROMPT;
+    }
+
+    try {
+      const content = fs.readFileSync(resolved, 'utf8').trim();
+      if (Buffer.byteLength(content, 'utf8') > 65536) {
+        console.warn('[extractor] Prompt file exceeds 64KB limit, falling back to default');
+        return HARDCODED_PROMPT;
+      }
+      return content;
+    } catch {
+      console.warn('[extractor] Failed to read prompt file, falling back to default');
+    }
+  }
+
+  return HARDCODED_PROMPT;
+}
+
 export class ExtractorService {
   private readonly client: OpenAI;
   private readonly model: string;
+  private readonly systemPrompt: string;
 
   constructor() {
     const config = getConfig();
@@ -30,6 +64,7 @@ export class ExtractorService {
       baseURL: config.EXTRACTOR_BASE_URL
     });
     this.model = config.EXTRACTOR_MODEL;
+    this.systemPrompt = resolveSystemPrompt(config.EXTRACTOR_PROMPT_FILE, config.PROMPTS_DIR);
   }
 
   async arbitrateConflict(existingFact: string, newFact: string): Promise<'update' | 'keep_both' | 'discard_new'> {
@@ -73,7 +108,7 @@ export class ExtractorService {
       messages: [
         {
           role: 'system',
-          content: systemPrompt
+          content: this.systemPrompt
         },
         {
           role: 'user',

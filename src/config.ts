@@ -27,6 +27,8 @@ const configSchema = z.object({
   EXTRACTOR_BASE_URL: z.string().url().default('https://api.openai.com/v1'),
   EXTRACTOR_API_KEY: z.string().default(''),
   EXTRACTOR_MODEL: z.string().default('gpt-4o-mini'),
+  EXTRACTOR_PROMPT_FILE: z.string().default(''),
+  PROMPTS_DIR: z.string().default('/prompts'),
   APPLICATIONINSIGHTS_CONNECTION_STRING: z.string().default(''),
   EXTRACTION_INTERVAL_MS: z.coerce.number().int().positive().default(30000),
   EXTRACTION_BATCH_SIZE: z.coerce.number().int().positive().default(20),
