@@ -1,115 +1,101 @@
 # Persistio Server
 
-**Self-hosted semantic memory service for AI agents.**
-
-Persistio Server stores raw conversation chunks, asynchronously extracts durable facts and memories using an LLM, and exposes semantic recall via a REST API. Designed to be embedded in agent workflows — give your agents persistent, queryable memory without relying on a hosted service.
-
----
+Self-hosted, API-first memory service for AI agents. Stores raw conversation chunks, extracts durable facts asynchronously, and exposes semantic recall over both layers with vault-scoped API key auth.
 
 ## Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/)
-- An OpenAI-compatible API key (for embeddings and extraction), **or** [Ollama](https://ollama.com/) running locally
-
----
+- Docker & Docker Compose
+- A PostgreSQL instance with the [pgvector](https://github.com/pgvector/pgvector) extension enabled
+- An OpenAI API key (or a compatible Ollama instance) for embeddings and extraction
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/Persistio/server.git
-cd server
+git clone https://github.com/chriscoveyduck/persistio.git
+cd persistio
 cp .env.example .env
-# Edit .env with your API keys
+# fill in your DATABASE_URL, ADMIN_API_KEY, and OPENAI_API_KEY
 docker compose up
 ```
 
-The API will be available at **http://localhost:4827**.
+The API listens on `http://localhost:4827`.
 
----
+## Deployment Modes
 
-## Using Ollama Instead of OpenAI
+Persistio uses a single Docker image that can run in three modes, controlled by the `PERSISTIO_MODE` environment variable:
 
-Set `EMBEDDER_PROVIDER=ollama` in your `.env` and point `OLLAMA_BASE_URL` at your Ollama instance. To include the bundled Ollama service (useful for local dev with no existing Ollama install):
+| Value | Role | Notes |
+|---|---|---|
+| `combined` | Runs the HTTP server and extraction worker in a single process | **Default.** Suitable for local dev and single-host deployments. |
+| `api` | HTTP server only — ingest, recall, memories, admin, health | Run this on your internet-facing instance. |
+| `worker` | Extraction pipeline only — no HTTP server | Run alongside an `api` instance, sharing the same database. No external ingress required. |
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up
-```
-
-This starts Ollama alongside Persistio and Postgres in the same Compose project.
-
----
+The `api` + `worker` split is useful when you want to scale the HTTP layer and the extraction pipeline independently, or keep extraction off your public-facing host.
 
 ## API Overview
 
-All tenant endpoints require a `Bearer` token obtained when you create a tenant. Admin endpoints require the `X-Admin-Key` header.
-
 | Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/ingest` | Append raw conversation chunks |
-| `POST` | `/v1/recall` | Semantic recall across memories and raw chunks |
-| `GET` | `/v1/memories` | List memories (supports filtering and pagination) |
-| `POST` | `/v1/memories` | Create a memory manually |
-| `GET` | `/v1/memories/:id` | Fetch a single memory |
-| `PATCH` | `/v1/memories/:id` | Update a memory |
-| `DELETE` | `/v1/memories/:id` | Archive a memory |
-| `POST` | `/v1/extract` | Trigger extraction manually |
-| `GET` | `/v1/jobs/:id` | Check extraction job status |
-| `POST` | `/admin/tenants` | Create a tenant |
-| `GET` | `/admin/tenants` | List all tenants |
-| `DELETE` | `/admin/tenants/:id` | Delete a tenant |
+|---|---|---|
+| GET | `/health` | Service health probe |
+| POST | `/v1/ingest` | Append raw conversation chunks for extraction |
+| POST | `/v1/recall` | Semantic search across memories and raw chunks |
+| GET | `/v1/memories` | List memories for the authenticated vault |
+| POST | `/v1/memories` | Manually add a memory |
+| GET | `/v1/memories/:id` | Fetch a single memory |
+| PATCH | `/v1/memories/:id` | Update a memory |
+| DELETE | `/v1/memories/:id` | Archive a memory |
+| POST | `/v1/extract` | Trigger an extraction run |
+| GET | `/v1/jobs/:id` | Check extraction job status |
+| GET | `/stats` | Vault plan, quota, and usage stats |
+| POST | `/admin/vaults` | Create a vault and return its API key |
+| GET | `/admin/vaults` | List vaults |
+| DELETE | `/admin/vaults/:id` | Delete a vault |
+| POST | `/admin/vaults/:id/rotate-key` | Rotate a vault API key |
 
-Full API spec: [`openapi.yaml`](./openapi.yaml)
-
----
+The full OpenAPI description is in [`openapi.yaml`](https://github.com/chriscoveyduck/persistio/blob/main/openapi.yaml).
 
 ## Configuration
 
-All configuration is via environment variables. Copy `.env.example` to `.env` and edit as needed.
-
 | Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://mnemex:mnemex@postgres:5432/mnemex` |
-| `PORT` | HTTP port the server listens on | `4827` |
-| `ADMIN_API_KEY` | Secret key for admin endpoints | *(required — change before deploying)* |
+|---|---|---|
+| `PERSISTIO_MODE` | Deployment mode: `combined`, `api`, or `worker` | `combined` |
+| `DATABASE_URL` | PostgreSQL connection string | — |
+| `PORT` | HTTP listen port | `4827` |
+| `ADMIN_API_KEY` | API key for `/admin/*` routes | — |
+| `HEALTH_API_KEY` | Optional secret for `/health` endpoint. If set, requests must include `X-Health-Key: <value>`. Leave empty to allow unauthenticated health checks. | `""` |
 | `EMBEDDER_PROVIDER` | Embedding provider: `openai` or `ollama` | `openai` |
-| `OPENAI_API_KEY` | OpenAI (or compatible) API key | *(required for openai provider)* |
-| `OPENAI_EMBEDDING_MODEL` | Embedding model to use | `text-embedding-3-small` |
+| `OPENAI_API_KEY` | OpenAI API key (required when `EMBEDDER_PROVIDER=openai`) | — |
+| `OPENAI_EMBEDDING_MODEL` | OpenAI embedding model | `text-embedding-3-small` |
 | `OLLAMA_BASE_URL` | Ollama base URL | `http://ollama:11434` |
 | `OLLAMA_EMBEDDING_MODEL` | Ollama embedding model | `nomic-embed-text` |
-| `EXTRACTOR_BASE_URL` | LLM extractor API base URL | `https://api.openai.com/v1` |
-| `EXTRACTOR_API_KEY` | LLM extractor API key | *(required)* |
-| `EXTRACTOR_MODEL` | LLM model for extraction | `gpt-4o-mini` |
-| `EXTRACTION_INTERVAL_MS` | How often the extraction daemon runs (ms) | `30000` |
-| `EXTRACTION_BATCH_SIZE` | Max chunks processed per extraction run | `20` |
-| `MEMORY_ARCHIVE_TTL_DAYS` | Days before archived memories are purged | `90` |
-| `DEFAULT_TOKEN_BUDGET` | Hint to clients: max tokens in recall response | `2000` |
-| `DEFAULT_RECALL_TOP_K` | Hint to clients: default number of recall results | `10` |
+| `EXTRACTOR_BASE_URL` | OpenAI-compatible base URL for fact extraction | `https://api.openai.com/v1` |
+| `EXTRACTOR_API_KEY` | API key for the extractor model | — |
+| `EXTRACTOR_MODEL` | Chat model used for fact extraction | `gpt-4o-mini` |
+| `EXTRACTION_INTERVAL_MS` | Worker polling interval (ms) | `30000` |
+| `EXTRACTION_BATCH_SIZE` | Max chunks processed per extraction cycle | `20` |
+| `MEMORY_ARCHIVE_TTL_DAYS` | Days before stale memories are archived | `90` |
+| `DEFAULT_TOKEN_BUDGET` | Client-side recall token budget hint | `2000` |
+| `DEFAULT_RECALL_TOP_K` | Default result count for recall | `10` |
+| `ENCRYPTION_ENABLED` | Enable envelope encryption for memory subjects | `false` |
+| `KEY_VAULT_URI` | Key vault URI (required when `ENCRYPTION_ENABLED=true`) | `""` |
+| `KEK_KEY_NAME` | Key encryption key name in the vault | `""` |
 
----
+## TLS / HTTPS
 
-## Tenant Management
+Persistio does not implement TLS directly. The server speaks plain HTTP on port 4827 and is designed to run behind a reverse proxy that handles TLS termination. **Do not expose port 4827 directly to the internet.**
 
-Persistio is multi-tenant. Use the admin API to create and manage tenants:
-
-```bash
-curl -X POST http://localhost:4827/admin/tenants \
-  -H "X-Admin-Key: your-admin-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-agent"}'
-```
-
-The response includes an API key scoped to that tenant. Each tenant is fully isolated — memories, sessions, and extraction jobs are never shared across tenants.
-
----
+Recommended setup: place Persistio behind [Traefik](https://traefik.io), [nginx](https://nginx.org), or an equivalent ingress controller that terminates HTTPS and proxies to the container internally.
 
 ## OpenClaw Plugin
 
-Use Persistio as the memory backend for your [OpenClaw](https://openclaw.ai) agents with the official plugin:
+If you're using [OpenClaw](https://openclaw.ai), install the official plugin to connect your agents to Persistio automatically:
 
-👉 **[https://github.com/Persistio/openclaw-persistio](https://github.com/Persistio/openclaw-persistio)**
+```bash
+npm install -g @persistio/openclaw-plugin
+```
 
----
+See the [plugin repo](https://github.com/persistio/openclaw-persistio) for setup instructions.
 
 ## License
 
-[Business Source License 1.1](https://mariadb.com/bsl11/)
+Business Source License 1.1 (BUSL-1.1).

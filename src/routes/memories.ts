@@ -1,10 +1,13 @@
 import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import type { QueryResultRow } from 'pg';
 
 import { query } from '../db/client';
-import { requireTenantAuth } from '../middleware/auth';
+import { requireVaultAuth } from '../middleware/auth';
+import { decryptForVault, encryptForVault, encryptSubjectForVault, isVaultEncryptionActive } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
+import { canCreateMemory, incrementUsage } from '../services/usage';
 
 const listQuerySchema = z.object({
   archived: z.enum(['true', 'false']).optional().default('false'),
@@ -27,10 +30,10 @@ const updateMemorySchema = z.object({
 });
 
 export async function registerMemoryRoutes(app: FastifyInstance) {
-  app.get('/v1/memories', { preHandler: requireTenantAuth }, async (request) => {
+  app.get('/v1/memories', { preHandler: requireVaultAuth }, async (request) => {
     const qs = listQuerySchema.parse(request.query);
-    const values: unknown[] = [request.tenant.id];
-    const conditions = ['tenant_id = $1'];
+    const values: unknown[] = [request.vault.id];
+    const conditions = ['vault_id = $1'];
 
     if (qs.archived === 'false') {
       conditions.push('archived_at IS NULL');
@@ -45,7 +48,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
 
     values.push(qs.limit, qs.offset);
 
-    const result = await query(
+    const result = await query<Record<string, unknown>>(
       `SELECT *
        FROM memories
        WHERE ${conditions.join(' AND ')}
@@ -55,55 +58,77 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       values
     );
 
+    const items = await Promise.all(result.rows.map((row) => decryptMemoryRow(request.vault, row)));
     return {
-      items: result.rows,
+      items,
       limit: qs.limit,
       offset: qs.offset
     };
   });
 
-  app.post('/v1/memories', { preHandler: requireTenantAuth }, async (request, reply) => {
+  app.post('/v1/memories', { preHandler: requireVaultAuth }, async (request, reply) => {
     const body = createMemorySchema.parse(request.body);
+    const canWrite = await canCreateMemory(request.vault.id);
+    if (!canWrite) {
+      return reply.code(429).send({ error: 'memories_max quota exceeded' });
+    }
+
     const embedder = getEmbedder();
     const embedding = await embedder.embed(body.data);
     const hash = crypto.createHash('md5').update(body.data).digest('hex');
+    const storedData = await encryptForVault(request.vault, body.data);
+    const encryptedSubject = await encryptSubjectForVault(request.vault, body.subject);
+    const storedSubject = isVaultEncryptionActive(request.vault) ? '' : body.subject;
 
-    const result = await query(
-      `INSERT INTO memories (tenant_id, data, subject, hash, embedding, categories)
-       VALUES ($1, $2, $3, $4, $5::vector, $6::text[])
+    const result = await query<Record<string, unknown>>(
+      `INSERT INTO memories (
+         vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, categories
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::text[])
        RETURNING *`,
-      [request.tenant.id, body.data, body.subject, hash, JSON.stringify(embedding), body.categories]
+      [
+        request.vault.id,
+        storedData,
+        storedSubject,
+        encryptedSubject?.encrypted ?? null,
+        encryptedSubject?.hmac ?? null,
+        hash,
+        JSON.stringify(embedding),
+        body.categories
+      ]
     );
 
-    return reply.code(201).send(result.rows[0]);
+    await incrementUsage(request.vault.id, 'memory_adds');
+
+    return reply.code(201).send(await decryptMemoryRow(request.vault, result.rows[0]));
   });
 
-  app.get('/v1/memories/:id', { preHandler: requireTenantAuth }, async (request, reply) => {
+  app.get('/v1/memories/:id', { preHandler: requireVaultAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const result = await query(
+    const result = await query<Record<string, unknown>>(
       `SELECT *
        FROM memories
-       WHERE tenant_id = $1 AND id = $2
+       WHERE vault_id = $1 AND id = $2
        LIMIT 1`,
-      [request.tenant.id, params.id]
+      [request.vault.id, params.id]
     );
 
     if (!result.rowCount) {
       return reply.code(404).send({ error: 'Memory not found' });
     }
 
-    return result.rows[0];
+    return decryptMemoryRow(request.vault, result.rows[0]);
   });
 
-  app.delete('/v1/memories/:id', { preHandler: requireTenantAuth }, async (request, reply) => {
+  app.delete('/v1/memories/:id', { preHandler: requireVaultAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await query(
       `UPDATE memories
        SET archived_at = now(),
            updated_at = now()
-       WHERE tenant_id = $1 AND id = $2
+       WHERE vault_id = $1 AND id = $2
        RETURNING id, archived_at`,
-      [request.tenant.id, params.id]
+      [request.vault.id, params.id]
     );
 
     if (!result.rowCount) {
@@ -113,7 +138,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     return result.rows[0];
   });
 
-  app.patch('/v1/memories/:id', { preHandler: requireTenantAuth }, async (request, reply) => {
+  app.patch('/v1/memories/:id', { preHandler: requireVaultAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = updateMemorySchema.parse(request.body);
 
@@ -121,14 +146,16 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       id: string;
       data: string;
       subject: string;
+      subject_encrypted: string | null;
+      subject_hmac: string | null;
       categories: string[];
       confidence: number;
     }>(
-      `SELECT id, data, subject, categories, confidence
+      `SELECT id, data, subject, subject_encrypted, subject_hmac, categories, confidence
        FROM memories
-       WHERE tenant_id = $1 AND id = $2
+       WHERE vault_id = $1 AND id = $2
        LIMIT 1`,
-      [request.tenant.id, params.id]
+      [request.vault.id, params.id]
     );
 
     if (!existing.rowCount) {
@@ -136,36 +163,47 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     }
 
     const current = existing.rows[0];
-    const nextData = body.data ?? current.data;
+    const nextStoredData = body.data
+      ? await encryptForVault(request.vault, body.data)
+      : current.data;
     const nextSubject = body.subject ?? current.subject;
+    const nextEncryptedSubject = body.subject
+      ? await encryptSubjectForVault(request.vault, body.subject)
+      : current.subject_encrypted
+        ? { encrypted: current.subject_encrypted, hmac: current.subject_hmac ?? null }
+        : null;
     const nextCategories = body.categories ?? current.categories;
     const nextConfidence = body.confidence ?? current.confidence;
 
-    let embedding = undefined as string | undefined;
-    let hash = undefined as string | undefined;
+    let embedding: string | undefined;
+    let hash: string | undefined;
 
     if (body.data) {
       const embedder = getEmbedder();
-      embedding = JSON.stringify(await embedder.embed(nextData));
-      hash = crypto.createHash('md5').update(nextData).digest('hex');
+      embedding = JSON.stringify(await embedder.embed(body.data));
+      hash = crypto.createHash('md5').update(body.data).digest('hex');
     }
 
-    const result = await query(
+    const result = await query<Record<string, unknown>>(
       `UPDATE memories
        SET data = $3,
            subject = $4,
-           categories = $5::text[],
-           confidence = $6,
+           subject_encrypted = $5,
+           subject_hmac = $6,
+           categories = $7::text[],
+           confidence = $8,
            updated_at = now(),
-           hash = COALESCE($7, hash),
-           embedding = COALESCE($8::vector, embedding)
-       WHERE tenant_id = $1 AND id = $2
+           hash = COALESCE($9, hash),
+           embedding = COALESCE($10::vector, embedding)
+       WHERE vault_id = $1 AND id = $2
        RETURNING *`,
       [
-        request.tenant.id,
+        request.vault.id,
         params.id,
-        nextData,
-        nextSubject,
+        nextStoredData,
+        isVaultEncryptionActive(request.vault) ? '' : nextSubject,
+        nextEncryptedSubject?.encrypted ?? null,
+        nextEncryptedSubject?.hmac ?? null,
         nextCategories,
         nextConfidence,
         hash,
@@ -173,6 +211,27 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       ]
     );
 
-    return result.rows[0];
+    return decryptMemoryRow(request.vault, result.rows[0]);
   });
+}
+
+interface MemoryResponseRow extends QueryResultRow {
+  data?: unknown;
+  subject?: unknown;
+  subject_encrypted?: unknown;
+}
+
+async function decryptMemoryRow(
+  vault: { id: string; encrypted_dek: string | null; vault_encryption_enabled: boolean },
+  row: MemoryResponseRow
+) {
+  const decryptedSubject = typeof row.subject_encrypted === 'string' && isVaultEncryptionActive(vault)
+    ? await decryptForVault(vault, row.subject_encrypted)
+    : row.subject;
+
+  return {
+    ...row,
+    data: typeof row.data === 'string' ? await decryptForVault(vault, row.data) : row.data,
+    subject: decryptedSubject
+  };
 }

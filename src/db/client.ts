@@ -19,12 +19,45 @@ export async function runMigrations() {
   const client = await pool.connect();
 
   try {
-    // Run migrations first (creates the vector extension)
-    const sql = fs.readFileSync(
-      path.resolve(__dirname, 'migrations', '001_initial.sql'),
-      'utf8'
-    );
-    await client.query(sql);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+
+    const migrationsDir = path.resolve(__dirname, 'migrations');
+    const filenames = fs.readdirSync(migrationsDir)
+      .filter((filename) => filename.endsWith('.sql'))
+      .sort();
+
+    for (const filename of filenames) {
+      const existing = await client.query<{ filename: string }>(
+        `SELECT filename
+         FROM schema_migrations
+         WHERE filename = $1
+         LIMIT 1`,
+        [filename]
+      );
+      if (existing.rowCount) {
+        continue;
+      }
+
+      const sql = fs.readFileSync(path.join(migrationsDir, filename), 'utf8');
+      await client.query('BEGIN');
+      try {
+        await client.query(sql);
+        await client.query(
+          `INSERT INTO schema_migrations (filename)
+           VALUES ($1)`,
+          [filename]
+        );
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      }
+    }
   } finally {
     client.release();
   }

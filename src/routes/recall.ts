@@ -4,8 +4,10 @@ import { z } from 'zod';
 import { getConfig } from '../config';
 import { query } from '../db/client';
 import { recallDurationHistogram } from '../metrics';
-import { requireTenantAuth } from '../middleware/auth';
+import { requireVaultAuth } from '../middleware/auth';
+import { decryptForVault } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
+import { checkQuota, incrementUsage } from '../services/usage';
 import { withSpan } from '../telemetry';
 
 const recallSchema = z.object({
@@ -15,13 +17,14 @@ const recallSchema = z.object({
 });
 
 export async function registerRecallRoutes(app: FastifyInstance) {
-  app.post('/v1/recall', { preHandler: requireTenantAuth }, async (request) => {
+  app.post('/v1/recall', { preHandler: requireVaultAuth }, async (request) => {
     const body = recallSchema.parse(request.body);
     const config = getConfig();
     const topK = body.top_k ?? config.DEFAULT_RECALL_TOP_K;
+    await checkQuota(request.vault.id, 'searches');
 
     return withSpan('recall.request', {
-      'tenant.id': request.tenant.id,
+      'vault.id': request.vault.id,
       'recall.include_raw': body.include_raw,
       'recall.top_k': topK
     }, async (span) => {
@@ -44,12 +47,12 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         `SELECT id, data, subject, categories, confidence, created_at, updated_at, recall_count, last_recalled,
                 1 - (embedding <=> $2::vector) AS similarity
          FROM memories
-         WHERE tenant_id = $1
+         WHERE vault_id = $1
            AND archived_at IS NULL
            AND embedding IS NOT NULL
          ORDER BY embedding <=> $2::vector
          LIMIT $3`,
-        [request.tenant.id, JSON.stringify(embedding), topK]
+        [request.vault.id, JSON.stringify(embedding), topK]
       );
 
       if (memoriesResult.rowCount) {
@@ -76,18 +79,29 @@ export async function registerRecallRoutes(app: FastifyInstance) {
           `SELECT id, session_id, role, content, created_at,
                   1 - (embedding <=> $2::vector) AS similarity
            FROM raw_chunks
-           WHERE tenant_id = $1
+           WHERE vault_id = $1
              AND embedding IS NOT NULL
            ORDER BY embedding <=> $2::vector
            LIMIT $3`,
-          [request.tenant.id, JSON.stringify(embedding), topK]
+          [request.vault.id, JSON.stringify(embedding), topK]
         );
         rawChunks = rawResult.rows;
       }
 
+      const decryptedMemories = await Promise.all(memoriesResult.rows.map(async (row) => ({
+        ...row,
+        data: await decryptForVault(request.vault, row.data)
+      })));
+      const decryptedRawChunks = await Promise.all(rawChunks.map(async (row) => ({
+        ...row,
+        content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
+      })));
+
+      await incrementUsage(request.vault.id, 'searches');
+
       const durationMs = performance.now() - start;
       recallDurationHistogram.record(durationMs, {
-        tenant_id: request.tenant.id,
+        vault_id: request.vault.id,
         include_raw: String(body.include_raw)
       });
       span.setAttribute('recall.results_returned', memoriesResult.rows.length);
@@ -95,8 +109,8 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       span.setAttribute('recall.duration_ms', durationMs);
 
       return {
-        memories: memoriesResult.rows,
-        raw_chunks: rawChunks
+        memories: decryptedMemories,
+        raw_chunks: decryptedRawChunks
       };
     });
   });

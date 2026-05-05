@@ -31,18 +31,27 @@ export const embeddingDurationHistogram = meter.createHistogram('persistio.embed
 });
 
 export const memoriesTotalGauge = meter.createObservableGauge('persistio.memories.total', {
-  description: 'Total memories per tenant'
+  description: 'Total memories per vault'
+});
+
+meter.createObservableGauge('persistio.extraction_queue_depth', {
+  description: 'Number of unclaimed rows in extraction_queue'
+}).addCallback(async (result: ObservableResultLike) => {
+  const { rows } = await query<{ depth: number }>(
+    'SELECT COUNT(*)::int AS depth FROM extraction_queue WHERE claimed_at IS NULL'
+  );
+  result.observe(rows[0]?.depth ?? 0);
 });
 
 memoriesTotalGauge.addCallback(async (observableResult: ObservableResultLike) => {
-  const result = await query<{ tenant_id: string; total: string }>(
-    `SELECT tenant_id, COUNT(*)::text AS total
+  const result = await query<{ vault_id: string; total: string }>(
+    `SELECT vault_id, COUNT(*)::text AS total
      FROM memories
      WHERE archived_at IS NULL
-     GROUP BY tenant_id`
+     GROUP BY vault_id`
   );
 
   for (const row of result.rows) {
-    observableResult.observe(Number(row.total), { tenant_id: row.tenant_id });
+    observableResult.observe(Number(row.total), { vault_id: row.vault_id });
   }
 });

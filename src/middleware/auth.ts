@@ -4,15 +4,18 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { getConfig } from '../config';
 import { query } from '../db/client';
 
-export interface TenantContext {
+export interface VaultContext {
   id: string;
   name: string;
   settings: Record<string, unknown>;
+  plan_id: string;
+  encrypted_dek: string | null;
+  vault_encryption_enabled: boolean;
 }
 
 declare module 'fastify' {
   interface FastifyRequest {
-    tenant: TenantContext;
+    vault: VaultContext;
   }
 }
 
@@ -35,7 +38,7 @@ function getBearerToken(request: FastifyRequest): string | undefined {
   return match?.[1];
 }
 
-export async function requireTenantAuth(request: FastifyRequest, reply: FastifyReply) {
+export async function requireVaultAuth(request: FastifyRequest, reply: FastifyReply) {
   const rawKey = getBearerToken(request);
 
   if (!rawKey) {
@@ -43,9 +46,9 @@ export async function requireTenantAuth(request: FastifyRequest, reply: FastifyR
   }
 
   const apiKeyHash = hashKey(rawKey);
-  const result = await query<{ id: string; name: string; settings: Record<string, unknown> }>(
-    `SELECT id, name, settings
-     FROM tenants
+  const result = await query<VaultContext>(
+    `SELECT id, name, settings, plan_id, encrypted_dek, vault_encryption_enabled
+     FROM vaults
      WHERE api_key_hash = $1
      LIMIT 1`,
     [apiKeyHash]
@@ -55,7 +58,7 @@ export async function requireTenantAuth(request: FastifyRequest, reply: FastifyR
     return reply.code(401).send({ error: 'Unauthorized' });
   }
 
-  request.tenant = result.rows[0];
+  request.vault = result.rows[0];
 }
 
 export async function requireAdminAuth(request: FastifyRequest, reply: FastifyReply) {

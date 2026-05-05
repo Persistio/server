@@ -1,10 +1,24 @@
 import { z } from 'zod';
 
+const booleanFlag = z.preprocess((value) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    return value === 'true';
+  }
+
+  return false;
+}, z.boolean());
+
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   DATABASE_URL: z.string().min(1),
   PORT: z.coerce.number().int().positive().default(4827),
   ADMIN_API_KEY: z.string().min(1),
+  HEALTH_API_KEY: z.string().default(''),
+  PERSISTIO_MODE: z.enum(['api', 'worker', 'combined']).default('combined'),
   EMBEDDER_PROVIDER: z.enum(['openai', 'ollama']).default('openai'),
   OPENAI_API_KEY: z.string().default(''),
   OPENAI_EMBEDDING_MODEL: z.string().default('text-embedding-3-small'),
@@ -18,13 +32,32 @@ const configSchema = z.object({
   EXTRACTION_BATCH_SIZE: z.coerce.number().int().positive().default(20),
   DEFAULT_TOKEN_BUDGET: z.coerce.number().int().positive().default(2000),
   DEFAULT_RECALL_TOP_K: z.coerce.number().int().positive().default(10),
-  MEMORY_ARCHIVE_TTL_DAYS: z.coerce.number().int().positive().default(90)
+  MEMORY_ARCHIVE_TTL_DAYS: z.coerce.number().int().positive().default(90),
+  ENCRYPTION_ENABLED: booleanFlag,
+  KEY_VAULT_URI: z.string().default(''),
+  KEK_KEY_NAME: z.string().default('')
 }).superRefine((value, ctx) => {
   if (value.EMBEDDER_PROVIDER === 'openai' && !value.OPENAI_API_KEY) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'OPENAI_API_KEY is required when EMBEDDER_PROVIDER=openai',
       path: ['OPENAI_API_KEY']
+    });
+  }
+
+  if (value.ENCRYPTION_ENABLED && !value.KEY_VAULT_URI) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'KEY_VAULT_URI is required when ENCRYPTION_ENABLED=true',
+      path: ['KEY_VAULT_URI']
+    });
+  }
+
+  if (value.ENCRYPTION_ENABLED && !value.KEK_KEY_NAME) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'KEK_KEY_NAME is required when ENCRYPTION_ENABLED=true',
+      path: ['KEK_KEY_NAME']
     });
   }
 });

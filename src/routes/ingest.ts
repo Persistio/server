@@ -1,9 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
-import { query } from '../db/client';
+import { pool } from '../db/client';
 import { ingestChunksCounter } from '../metrics';
-import { requireTenantAuth } from '../middleware/auth';
+import { requireVaultAuth } from '../middleware/auth';
+import { encryptForVault } from '../services/crypto';
+import { checkQuota, incrementUsage } from '../services/usage';
 import { withSpan } from '../telemetry';
 
 const ingestSchema = z.object({
@@ -15,25 +17,49 @@ const ingestSchema = z.object({
 });
 
 export async function registerIngestRoutes(app: FastifyInstance) {
-  app.post('/v1/ingest', { preHandler: requireTenantAuth }, async (request, reply) => {
+  app.post('/v1/ingest', { preHandler: requireVaultAuth }, async (request, reply) => {
     const body = ingestSchema.parse(request.body);
+    await checkQuota(request.vault.id, 'ingest_events');
+
     return withSpan('ingest.request', {
-      'tenant.id': request.tenant.id,
+      'vault.id': request.vault.id,
       'ingest.chunks_count': body.chunks.length,
       'ingest.session_id': body.session_id
     }, async (span) => {
-      const inserted = await Promise.all(body.chunks.map(async (chunk) => {
-        const result = await query<{ id: string; created_at: string }>(
-          `INSERT INTO raw_chunks (tenant_id, session_id, role, content)
-           VALUES ($1, $2, $3, $4)
-           RETURNING id, created_at`,
-          [request.tenant.id, body.session_id, chunk.role, chunk.content]
-        );
-        return result.rows[0];
-      }));
+      const inserted: Array<{ id: string; created_at: string }> = [];
+
+      for (const chunk of body.chunks) {
+        const storedContent = await encryptForVault(request.vault, chunk.content);
+        const client = await pool.connect();
+
+        try {
+          await client.query('BEGIN');
+          const result = await client.query<{ id: string; created_at: string }>(
+            `INSERT INTO raw_chunks (vault_id, session_id, role, content)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, created_at`,
+            [request.vault.id, body.session_id, chunk.role, storedContent]
+          );
+          const insertedChunk = result.rows[0];
+          await client.query(
+            `INSERT INTO extraction_queue (chunk_id, vault_id)
+             VALUES ($1, $2)`,
+            [insertedChunk.id, request.vault.id]
+          );
+          await client.query('COMMIT');
+          inserted.push(insertedChunk);
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+      }
+
+      await incrementUsage(request.vault.id, 'ingest_events');
 
       ingestChunksCounter.add(inserted.length, {
-        tenant_id: request.tenant.id,
+        vault_id: request.vault.id,
         session_id: body.session_id
       });
       span.setAttribute('ingest.accepted', inserted.length);
