@@ -21,6 +21,7 @@ export interface DedupInput {
   subject: string;
   embedding: number[];
   sourceChunks: string[];
+  sourceTimestamp?: string | null;
   salience: number;
   sensitivity: 'low' | 'medium' | 'high';
   predicate: 'preference' | 'fact' | 'plan' | 'relationship' | 'constraint' | 'event' | null;
@@ -96,6 +97,7 @@ export async function deduplicateMemory(
              status = 'active',
              valid_from = COALESCE($8::date, valid_from),
              valid_until = COALESCE($9::date, valid_until),
+             source_timestamp = COALESCE($10::timestamptz, source_timestamp),
              updated_at = now(),
              confidence = confidence + 1
          WHERE id = $1`,
@@ -108,7 +110,8 @@ export async function deduplicateMemory(
           input.predicate,
           input.polarity,
           input.validFrom,
-          input.validUntil
+          input.validUntil,
+          input.sourceTimestamp
         ]
       );
       span.setAttribute('dedup.result', 'updated');
@@ -156,7 +159,8 @@ export async function deduplicateMemory(
              END,
              predicate = COALESCE($9, predicate),
              polarity = $10, status = 'active', valid_from = COALESCE($11::date, valid_from),
-             valid_until = COALESCE($12::date, valid_until), updated_at = now(), confidence = confidence + 1
+             valid_until = COALESCE($12::date, valid_until), source_timestamp = COALESCE($13::timestamptz, source_timestamp),
+             updated_at = now(), confidence = confidence + 1
          WHERE id = $1`,
         [
           bestMatch.id,
@@ -170,7 +174,8 @@ export async function deduplicateMemory(
           input.predicate,
           input.polarity,
           input.validFrom,
-          input.validUntil
+          input.validUntil,
+          input.sourceTimestamp
         ]
       );
       span.setAttribute('dedup.result', 'updated');
@@ -200,7 +205,8 @@ export async function deduplicateMemory(
                END,
                predicate = COALESCE($9, predicate),
                polarity = $10, status = 'active', valid_from = COALESCE($11::date, valid_from),
-               valid_until = COALESCE($12::date, valid_until), updated_at = now(), confidence = confidence + 1
+               valid_until = COALESCE($12::date, valid_until), source_timestamp = COALESCE($13::timestamptz, source_timestamp),
+               updated_at = now(), confidence = confidence + 1
            WHERE id = $1`,
           [
             bestMatch.id,
@@ -214,7 +220,8 @@ export async function deduplicateMemory(
             input.predicate,
             input.polarity,
             input.validFrom,
-            input.validUntil
+            input.validUntil,
+            input.sourceTimestamp
           ]
         );
         span.setAttribute('dedup.result', 'updated');
@@ -306,9 +313,9 @@ async function insertMemory(
   return db.query<{ id: string }>(
     `INSERT INTO memories (
        vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding,
-       source_chunks, score, salience, sensitivity, predicate, polarity, status, valid_from, valid_until
+       source_chunks, score, salience, sensitivity, predicate, polarity, status, valid_from, valid_until, source_timestamp
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[], $9, $10, $11, $12, $13, $14, $15::date, $16::date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[], $9, $10, $11, $12, $13, $14, $15::date, $16::date, $17::date)
      RETURNING id`,
     [
       input.vaultId,
@@ -326,7 +333,8 @@ async function insertMemory(
       input.polarity,
       input.status,
       input.validFrom,
-      input.validUntil
+      input.validUntil,
+      input.sourceTimestamp
     ]
   );
 }

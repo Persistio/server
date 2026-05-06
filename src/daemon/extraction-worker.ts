@@ -152,6 +152,12 @@ async function processBatch(vaultId?: string) {
             threshold: config.EXTRACTION_SCORE_THRESHOLD
           }));
 
+          const sourceTimestampResult = await query<{ source_timestamp: string }>(
+            `SELECT MIN(created_at)::timestamptz::text as source_timestamp FROM raw_chunks WHERE id = ANY($1::uuid[])`,
+            [job.chunkIds]
+          );
+          const sourceTimestamp = sourceTimestampResult.rows[0]?.source_timestamp ?? null;
+
           for (const fact of afterSecretFilter) {
             if (fact.sensitivity === 'restricted') {
               console.warn(JSON.stringify({
@@ -170,6 +176,7 @@ async function processBatch(vaultId?: string) {
               subject: fact.subject,
               embedding,
               sourceChunks: job.chunkIds,
+              sourceTimestamp,
               salience: fact.salience,
               sensitivity: fact.sensitivity,
               predicate: fact.predicate,
