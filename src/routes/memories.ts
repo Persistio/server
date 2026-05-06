@@ -50,7 +50,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
 
     const result = await query<Record<string, unknown>>(
       `SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-              categories, confidence, score, archived_at, created_at, updated_at
+              categories, confidence, score, salience, sensitivity, predicate, polarity, status,
+              valid_from, valid_until, archived_at, created_at, updated_at
        FROM memories
        WHERE ${conditions.join(' AND ')}
        ORDER BY updated_at DESC, created_at DESC
@@ -87,7 +88,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::text[])
        RETURNING id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-                 categories, confidence, score, archived_at, created_at, updated_at`,
+                 categories, confidence, score, salience, sensitivity, predicate, polarity, status,
+                 valid_from, valid_until, archived_at, created_at, updated_at`,
       [
         request.vault.id,
         storedData,
@@ -109,7 +111,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await query<Record<string, unknown>>(
       `SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-              categories, confidence, score, archived_at, created_at, updated_at
+              categories, confidence, score, salience, sensitivity, predicate, polarity, status,
+              valid_from, valid_until, archived_at, created_at, updated_at
        FROM memories
        WHERE vault_id = $1 AND id = $2
        LIMIT 1`,
@@ -200,7 +203,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
            embedding = COALESCE($10::vector, embedding)
        WHERE vault_id = $1 AND id = $2
        RETURNING id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-                 categories, confidence, score, archived_at, created_at, updated_at`,
+                 categories, confidence, score, salience, sensitivity, predicate, polarity, status,
+                 valid_from, valid_until, archived_at, created_at, updated_at`,
       [
         request.vault.id,
         params.id,

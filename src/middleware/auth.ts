@@ -7,6 +7,7 @@ import { query } from '../db/client';
 export interface VaultContext {
   id: string;
   name: string;
+  purpose: string | null;
   settings: Record<string, unknown>;
   plan_id: string;
   encrypted_dek: string | null;
@@ -47,7 +48,7 @@ export async function requireVaultAuth(request: FastifyRequest, reply: FastifyRe
 
   const apiKeyHash = hashKey(rawKey);
   const result = await query<VaultContext>(
-    `SELECT id, name, settings, plan_id, encrypted_dek, vault_encryption_enabled
+    `SELECT id, name, purpose, settings, plan_id, encrypted_dek, vault_encryption_enabled
      FROM vaults
      WHERE api_key_hash = $1
      LIMIT 1`,

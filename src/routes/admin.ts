@@ -7,7 +7,15 @@ import { createApiKey, requireAdminAuth } from '../middleware/auth';
 import { generateAndWrapDek } from '../services/crypto';
 
 const createVaultSchema = z.object({
-  name: z.string().min(1)
+  name: z.string().min(1),
+  purpose: z.string().min(1).max(500).optional()
+});
+
+const updateVaultSchema = z.object({
+  name: z.string().min(1).optional(),
+  purpose: z.string().min(1).max(500).nullable().optional()
+}).refine((value) => value.name !== undefined || value.purpose !== undefined, {
+  message: 'At least one field must be provided'
 });
 
 export async function registerAdminRoutes(app: FastifyInstance) {
@@ -18,12 +26,13 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       ? (await generateAndWrapDek()).encryptedDek
       : null;
 
-    const result = await query<{ id: string; name: string; created_at: string }>(
-      `INSERT INTO vaults (name, api_key_hash, settings, encrypted_dek, vault_encryption_enabled)
-       VALUES ($1, $2, $3::jsonb, $4, $5)
-       RETURNING id, name, created_at`,
+    const result = await query<{ id: string; name: string; purpose: string | null; created_at: string }>(
+      `INSERT INTO vaults (name, purpose, api_key_hash, settings, encrypted_dek, vault_encryption_enabled)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+       RETURNING id, name, purpose, created_at`,
       [
         body.name,
+        body.purpose ?? null,
         apiKey.hash,
         JSON.stringify({
           embedding_dimensions: getConfiguredEmbeddingDimensions()
@@ -35,6 +44,8 @@ export async function registerAdminRoutes(app: FastifyInstance) {
 
     return reply.code(201).send({
       id: result.rows[0].id,
+      name: result.rows[0].name,
+      purpose: result.rows[0].purpose,
       api_key: apiKey.rawKey
     });
   });
@@ -48,6 +59,28 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     );
     if (!result.rowCount) return reply.code(404).send({ error: 'Vault not found' });
     return reply.code(200).send({ id: result.rows[0].id, api_key: apiKey.rawKey });
+  });
+
+  app.patch('/admin/vaults/:id', { preHandler: requireAdminAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = updateVaultSchema.parse(request.body);
+    const result = await query(
+      `UPDATE vaults
+       SET name = COALESCE($2, name),
+           purpose = CASE
+             WHEN $3::boolean THEN $4
+             ELSE purpose
+           END
+       WHERE id = $1
+       RETURNING id, name, purpose, created_at, settings, plan_id, account_id, vault_encryption_enabled`,
+      [id, body.name ?? null, body.purpose !== undefined, body.purpose ?? null]
+    );
+
+    if (!result.rowCount) {
+      return reply.code(404).send({ error: 'Vault not found' });
+    }
+
+    return result.rows[0];
   });
 
   app.delete('/admin/vaults/:id', { preHandler: requireAdminAuth }, async (request, reply) => {
@@ -68,7 +101,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
 
   app.get('/admin/vaults', { preHandler: requireAdminAuth }, async () => {
     const result = await query(
-      `SELECT id, name, created_at, settings, plan_id, account_id, vault_encryption_enabled
+      `SELECT id, name, purpose, created_at, settings, plan_id, account_id, vault_encryption_enabled
        FROM vaults
        ORDER BY created_at DESC`
     );

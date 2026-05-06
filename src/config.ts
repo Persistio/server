@@ -33,6 +33,7 @@ const configSchema = z.object({
   EXTRACTION_INTERVAL_MS: z.coerce.number().int().positive().default(30000),
   EXTRACTION_BATCH_SIZE: z.coerce.number().int().positive().default(20),
   EXTRACTION_SCORE_THRESHOLD: z.coerce.number().int().min(1).max(10).default(5),
+  SEGMENTATION_THRESHOLD: z.coerce.number().min(0).max(1).default(0.75),
   DEFAULT_TOKEN_BUDGET: z.coerce.number().int().positive().default(2000),
   DEFAULT_RECALL_TOP_K: z.coerce.number().int().positive().default(10),
   MEMORY_ARCHIVE_TTL_DAYS: z.coerce.number().int().positive().default(90),

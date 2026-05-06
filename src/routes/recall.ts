@@ -38,13 +38,22 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         subject: string;
         categories: string[];
         confidence: number;
+        score: number;
+        salience: string;
+        sensitivity: string;
+        predicate: string | null;
+        polarity: string;
+        status: string;
+        valid_from: string | null;
+        valid_until: string | null;
         similarity: number;
         created_at: string;
         updated_at: string;
         recall_count: number;
         last_recalled: string | null;
       }>(
-        `SELECT id, data, subject, categories, confidence, created_at, updated_at, recall_count, last_recalled,
+        `SELECT id, data, subject, categories, confidence, score, salience, sensitivity, predicate, polarity,
+                status, valid_from, valid_until, created_at, updated_at, recall_count, last_recalled,
                 1 - (embedding <=> $2::vector) AS similarity
          FROM memories
          WHERE vault_id = $1
