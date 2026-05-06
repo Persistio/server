@@ -15,7 +15,8 @@ const ingestSchema = z.object({
   session_id: z.string().min(1),
   chunks: z.array(z.object({
     role: z.enum(['user', 'assistant', 'tool']),
-    content: z.string().min(1)
+    content: z.string().min(1),
+    timestamp: z.string().datetime().optional()
   })).min(1)
 });
 
@@ -50,10 +51,10 @@ export async function registerIngestRoutes(app: FastifyInstance) {
         await client.query('BEGIN');
         for (const { chunk, storedContent, embedding } of prepared) {
           const result = await client.query<{ id: string; created_at: string }>(
-            `INSERT INTO raw_chunks (vault_id, session_id, role, content, embedding)
-             VALUES ($1, $2, $3, $4, $5::vector)
+            `INSERT INTO raw_chunks (vault_id, session_id, role, content, embedding, created_at)
+             VALUES ($1, $2, $3, $4, $5::vector, COALESCE($6::timestamptz, now()))
              RETURNING id, created_at`,
-            [request.vault.id, body.session_id, chunk.role, storedContent, JSON.stringify(embedding)]
+            [request.vault.id, body.session_id, chunk.role, storedContent, JSON.stringify(embedding), chunk.timestamp ?? null]
           );
           const insertedChunk = result.rows[0];
           inserted.push(insertedChunk);
