@@ -1,13 +1,14 @@
 {
   "name": "@persistio/server",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "private": true,
   "license": "BUSL-1.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/",
-    "start": "node --require ./dist/preload.js dist/index.js"
+    "start": "node --require ./dist/preload.js dist/index.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "@azure/identity": "^4.11.0",
@@ -20,6 +21,7 @@
     "@opentelemetry/sdk-node": "^0.52.0",
     "fastify": "^5.0.0",
     "openai": "^4.0.0",
+    "p-limit": "^5.0.0",
     "pg": "^8.0.0",
     "pgvector": "^0.2.0",
     "zod": "^3.0.0"
@@ -27,6 +29,7 @@
   "devDependencies": {
     "@types/pg": "^8.0.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
   }
 }

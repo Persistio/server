@@ -10,6 +10,7 @@ import {
   isVaultEncryptionActive,
   type VaultEncryptionContext
 } from './crypto';
+import { normaliseSubject, resolveCanonical } from './entity-resolver';
 import { ExtractorService } from './extractor';
 import { canCreateMemory, checkQuota, incrementUsage } from './usage';
 import { withSpan } from '../telemetry';
@@ -21,14 +22,17 @@ export interface DedupInput {
   subject: string;
   embedding: number[];
   sourceChunks: string[];
-  sourceTimestamp?: string | null;
   salience: number;
   sensitivity: 'low' | 'medium' | 'high';
-  predicate: 'preference' | 'fact' | 'plan' | 'relationship' | 'constraint' | 'event' | null;
+  type: 'user_preference' | 'user_rule' | 'task_pattern' | 'workflow' | 'project' | 'constraint' | 'decision' | 'system_fact' | 'domain_knowledge' | null;
+  scope: 'global' | 'project' | 'task' | 'session';
   polarity: 'positive' | 'negative' | 'neutral';
-  status: 'active' | 'superseded' | 'contradicted' | 'needs_review';
+  status: 'active' | 'candidate' | 'superseded' | 'contradicted' | 'needs_review';
+  volatility: 'very_low' | 'low' | 'medium' | 'high';
+  evidence?: string | null;
   validFrom: string | null;
   validUntil: string | null;
+  sourceSegmentId?: string | null;
 }
 
 interface MemoryRow {
@@ -60,6 +64,8 @@ export async function deduplicateMemory(
     'memory.source_chunks_count': input.sourceChunks.length
   }, async (span) => {
     const hash = crypto.createHash('md5').update(input.fact).digest('hex');
+    const normalisedSubject = normaliseSubject(input.subject);
+    const canonicalSubject = await resolveCanonical(input.vaultId, normalisedSubject) ?? normalisedSubject;
     const vaultResult = await db.query<VaultEncryptionContext>(
       `SELECT id, encrypted_dek, vault_encryption_enabled
        FROM vaults
@@ -68,6 +74,24 @@ export async function deduplicateMemory(
       [input.vaultId]
     );
     const vault = vaultResult.rows[0];
+
+    if (input.status === 'candidate') {
+      if (!(await canCreateMemory(input.vaultId))) {
+        span.setAttribute('dedup.result', 'skipped');
+        span.setAttribute('dedup.reason', 'memories_max');
+        return { action: 'skipped' };
+      }
+
+      await checkQuota(input.vaultId, 'memory_adds');
+      const inserted = await insertMemory(db, vault, input, hash, canonicalSubject);
+      await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
+      await incrementUsage(input.vaultId, 'memory_adds');
+      span.setAttribute('dedup.result', 'inserted');
+      return {
+        action: 'inserted',
+        memoryId: inserted.rows[0].id
+      };
+    }
 
     const exactMatch = await db.query<{ id: string }>(
       `SELECT id
@@ -92,14 +116,15 @@ export async function deduplicateMemory(
                WHEN $5 = 'medium'     OR sensitivity = 'medium'     THEN 'medium'
                ELSE 'low'
              END,
-             predicate = COALESCE($6, predicate),
-             polarity = $7,
+             type = COALESCE($6, type),
+             scope = COALESCE($7, scope),
+             polarity = $8,
              status = 'active',
-             valid_from = COALESCE($8::date, valid_from),
-             valid_until = COALESCE($9::date, valid_until),
-             source_timestamp = COALESCE($10::timestamptz, source_timestamp),
-             updated_at = now(),
-             confidence = confidence + 1
+             volatility = COALESCE($9::memory_volatility, volatility),
+             evidence = COALESCE($10::jsonb, evidence),
+             valid_from = COALESCE($11::date, valid_from),
+             valid_until = COALESCE($12::date, valid_until),
+             updated_at = now()
          WHERE id = $1`,
         [
           exactMatch.rows[0].id,
@@ -107,13 +132,16 @@ export async function deduplicateMemory(
           input.score,
           input.salience,
           input.sensitivity,
-          input.predicate,
+          input.type,
+          input.scope,
           input.polarity,
+          input.volatility,
+          input.evidence ? JSON.stringify({ summary: input.evidence }) : null,
           input.validFrom,
-          input.validUntil,
-          input.sourceTimestamp
+          input.validUntil
         ]
       );
+      await syncEmbeddingRecord(db, exactMatch.rows[0].id, input.embedding);
       span.setAttribute('dedup.result', 'updated');
       return {
         action: 'updated',
@@ -122,8 +150,8 @@ export async function deduplicateMemory(
     }
 
     const subjectMatchTarget = isVaultEncryptionActive(vault) && vault.encrypted_dek
-      ? computeSubjectHmac(input.subject, await unwrapVaultDek(vault))
-      : input.subject;
+      ? computeSubjectHmac(canonicalSubject, await unwrapVaultDek(vault))
+      : canonicalSubject;
     const subjectMatchColumn = isVaultEncryptionActive(vault) ? 'm.subject_hmac' : 'm.subject';
     const subjectMatches = await db.query<(MemoryRow & { similarity: number })>(
       `SELECT m.id, m.data, m.confidence, v.encrypted_dek, v.vault_encryption_enabled,
@@ -157,10 +185,14 @@ export async function deduplicateMemory(
                WHEN $8 = 'medium'     OR sensitivity = 'medium'     THEN 'medium'
                ELSE 'low'
              END,
-             predicate = COALESCE($9, predicate),
-             polarity = $10, status = 'active', valid_from = COALESCE($11::date, valid_from),
-             valid_until = COALESCE($12::date, valid_until), source_timestamp = COALESCE($13::timestamptz, source_timestamp),
-             updated_at = now(), confidence = confidence + 1
+             type = COALESCE($9, type),
+             scope = COALESCE($10, scope),
+             polarity = $11, status = 'active',
+             volatility = COALESCE($12::memory_volatility, volatility),
+             evidence = COALESCE($13::jsonb, evidence),
+             valid_from = COALESCE($14::date, valid_from),
+             valid_until = COALESCE($15::date, valid_until),
+             updated_at = now()
          WHERE id = $1`,
         [
           bestMatch.id,
@@ -171,13 +203,16 @@ export async function deduplicateMemory(
           input.score,
           input.salience,
           input.sensitivity,
-          input.predicate,
+          input.type,
+          input.scope,
           input.polarity,
+          input.volatility,
+          input.evidence ? JSON.stringify({ summary: input.evidence }) : null,
           input.validFrom,
-          input.validUntil,
-          input.sourceTimestamp
+          input.validUntil
         ]
       );
+      await syncEmbeddingRecord(db, bestMatch.id, input.embedding);
       span.setAttribute('dedup.result', 'updated');
       return { action: 'updated', memoryId: bestMatch.id };
     }
@@ -203,10 +238,14 @@ export async function deduplicateMemory(
                  WHEN $8 = 'medium'     OR sensitivity = 'medium'     THEN 'medium'
                  ELSE 'low'
                END,
-               predicate = COALESCE($9, predicate),
-               polarity = $10, status = 'active', valid_from = COALESCE($11::date, valid_from),
-               valid_until = COALESCE($12::date, valid_until), source_timestamp = COALESCE($13::timestamptz, source_timestamp),
-               updated_at = now(), confidence = confidence + 1
+               type = COALESCE($9, type),
+               scope = COALESCE($10, scope),
+               polarity = $11, status = 'active',
+               volatility = COALESCE($12::memory_volatility, volatility),
+               evidence = COALESCE($13::jsonb, evidence),
+               valid_from = COALESCE($14::date, valid_from),
+               valid_until = COALESCE($15::date, valid_until),
+               updated_at = now()
            WHERE id = $1`,
           [
             bestMatch.id,
@@ -217,13 +256,16 @@ export async function deduplicateMemory(
             input.score,
             input.salience,
             input.sensitivity,
-            input.predicate,
+            input.type,
+            input.scope,
             input.polarity,
+            input.volatility,
+            input.evidence ? JSON.stringify({ summary: input.evidence }) : null,
             input.validFrom,
-            input.validUntil,
-            input.sourceTimestamp
+            input.validUntil
           ]
         );
+        await syncEmbeddingRecord(db, bestMatch.id, input.embedding);
         span.setAttribute('dedup.result', 'updated');
         return { action: 'updated', memoryId: bestMatch.id };
       }
@@ -261,7 +303,8 @@ export async function deduplicateMemory(
       }
 
       await checkQuota(input.vaultId, 'memory_adds');
-      const inserted = await insertMemory(db, bestMatchVault, input, hash);
+      const inserted = await insertMemory(db, bestMatchVault, input, hash, canonicalSubject);
+      await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
       await incrementUsage(input.vaultId, 'memory_adds');
       span.setAttribute('dedup.result', 'inserted');
       return { action: 'inserted', memoryId: inserted.rows[0].id };
@@ -274,7 +317,8 @@ export async function deduplicateMemory(
     }
 
     await checkQuota(input.vaultId, 'memory_adds');
-    const inserted = await insertMemory(db, vault, input, hash);
+    const inserted = await insertMemory(db, vault, input, hash, canonicalSubject);
+    await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
     await incrementUsage(input.vaultId, 'memory_adds');
 
     span.setAttribute('dedup.result', 'inserted');
@@ -306,21 +350,22 @@ async function insertMemory(
   db: Queryable,
   vault: VaultEncryptionContext,
   input: DedupInput,
-  hash: string
+  hash: string,
+  canonicalSubject: string
 ) {
   const storedFact = await encryptForVault(vault, input.fact);
-  const encryptedSubject = await encryptSubjectForVault(vault, input.subject);
+  const encryptedSubject = await encryptSubjectForVault(vault, canonicalSubject);
   return db.query<{ id: string }>(
-    `INSERT INTO memories (
+     `INSERT INTO memories (
        vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding,
-       source_chunks, score, salience, sensitivity, predicate, polarity, status, valid_from, valid_until, source_timestamp
+       source_chunks, score, salience, sensitivity, type, scope, polarity, status, volatility, evidence, valid_from, valid_until, source_segment_id
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[], $9, $10, $11, $12, $13, $14, $15::date, $16::date, $17::date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::uuid[], $9, $10, $11, $12, $13, $14, $15, $16::memory_volatility, $17::jsonb, $18::date, $19::date, $20)
      RETURNING id`,
     [
       input.vaultId,
       storedFact,
-      isVaultEncryptionActive(vault) ? '' : input.subject,
+      isVaultEncryptionActive(vault) ? '' : canonicalSubject,
       encryptedSubject?.encrypted ?? null,
       encryptedSubject?.hmac ?? null,
       hash,
@@ -329,12 +374,25 @@ async function insertMemory(
       input.score,
       input.salience,
       input.sensitivity,
-      input.predicate,
+      input.type,
+      input.scope,
       input.polarity,
       input.status,
+      input.volatility,
+      input.evidence ? JSON.stringify({ summary: input.evidence }) : null,
       input.validFrom,
       input.validUntil,
-      input.sourceTimestamp
+      input.sourceSegmentId ?? null
     ]
+  );
+}
+
+async function syncEmbeddingRecord(db: Queryable, memoryId: string, embedding: number[]) {
+  await db.query(
+    `INSERT INTO memory_embeddings (memory_id, embedding, embedded_at)
+     VALUES ($1, $2::vector, now())
+     ON CONFLICT (memory_id)
+     DO UPDATE SET embedding = EXCLUDED.embedding, embedded_at = now()`,
+    [memoryId, JSON.stringify(embedding)]
   );
 }

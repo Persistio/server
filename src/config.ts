@@ -28,15 +28,35 @@ const configSchema = z.object({
   EXTRACTOR_API_KEY: z.string().default(''),
   EXTRACTOR_MODEL: z.string().default('gpt-4o-mini'),
   EXTRACTOR_PROMPT_FILE: z.string().default(''),
+  CURATOR_AUTO_RUN: booleanFlag,
+  CURATOR_BASE_URL: z.string().default(''),
+  CURATOR_API_KEY: z.string().default(''),
+  CURATOR_MODEL: z.string().default('claude-sonnet-4-5'),
+  CURATOR_PROMPT_FILE: z.string().default('prompts/curator.txt'),
   PROMPTS_DIR: z.string().default('/prompts'),
   APPLICATIONINSIGHTS_CONNECTION_STRING: z.string().default(''),
   EXTRACTION_INTERVAL_MS: z.coerce.number().int().positive().default(30000),
   EXTRACTION_BATCH_SIZE: z.coerce.number().int().positive().default(20),
+  CURATION_INTERVAL_MS: z.coerce.number().int().positive().default(2000),
+  CURATION_BATCH_SIZE: z.coerce.number().int().positive().default(5),
+  WORKER_CONCURRENCY: z.coerce.number().int().positive().max(20).default(4),
+  ARBITRATION_BATCH_SIZE: z.coerce.number().int().positive().default(15),
+  PG_POOL_MAX: z.coerce.number().int().positive().default(20),
   EXTRACTION_SCORE_THRESHOLD: z.coerce.number().int().min(1).max(10).default(5),
   SEGMENTATION_THRESHOLD: z.coerce.number().min(0).max(1).default(0.75),
   DEFAULT_TOKEN_BUDGET: z.coerce.number().int().positive().default(2000),
   DEFAULT_RECALL_TOP_K: z.coerce.number().int().positive().default(10),
   MEMORY_ARCHIVE_TTL_DAYS: z.coerce.number().int().positive().default(90),
+  CONTRADICTION_SCAN_ENABLED: booleanFlag,
+  CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH: z.coerce.number().int().positive().default(20),
+  CONTRADICTION_SCAN_MIN_SIMILARITY: z.coerce.number().min(0).max(1).default(0.70),
+  CONFIDENCE_DECAY_INTERVAL_DAYS: z.coerce.number().int().positive().default(30),
+  CONFIDENCE_DECAY_AUTO_ARCHIVE_SALIENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.3),
+  SUBJECT_INJECTION_TOP_N: z.coerce.number().int().positive().default(10),
+  SUBJECT_INJECTION_RECENT_N: z.coerce.number().int().positive().default(10),
+  SUBJECT_TEXT_MATCH_DISTANCE: z.coerce.number().int().min(0).default(2),
+  SUBJECT_EMBED_HIGH_THRESHOLD: z.coerce.number().min(0).max(1).default(0.92),
+  SUBJECT_EMBED_LOW_THRESHOLD: z.coerce.number().min(0).max(1).default(0.80),
   ENCRYPTION_ENABLED: booleanFlag,
   KEY_VAULT_URI: z.string().default(''),
   KEK_KEY_NAME: z.string().default('')
@@ -62,6 +82,22 @@ const configSchema = z.object({
       code: z.ZodIssueCode.custom,
       message: 'KEK_KEY_NAME is required when ENCRYPTION_ENABLED=true',
       path: ['KEK_KEY_NAME']
+    });
+  }
+
+  if (value.CURATOR_AUTO_RUN && !value.CURATOR_BASE_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'CURATOR_BASE_URL is required when CURATOR_AUTO_RUN=true',
+      path: ['CURATOR_BASE_URL']
+    });
+  }
+
+  if (value.CURATOR_AUTO_RUN && !value.CURATOR_API_KEY) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'CURATOR_API_KEY is required when CURATOR_AUTO_RUN=true',
+      path: ['CURATOR_API_KEY']
     });
   }
 });

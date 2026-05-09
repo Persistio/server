@@ -58,16 +58,17 @@ class InMemoryJobStore implements JobStore {
 
 async function main() {
   const config = getConfig();
-  const isApiMode = config.PERSISTIO_MODE === 'api';
-  const isWorkerMode = config.PERSISTIO_MODE === 'worker';
   const shouldStartWorker = config.PERSISTIO_MODE !== 'api';
+  const shouldStartCurationWorker = shouldStartWorker && config.CURATOR_AUTO_RUN;
   const shouldRegisterFullApi = config.PERSISTIO_MODE !== 'worker';
 
   if (config.ENCRYPTION_ENABLED) {
     await initCryptoClient();
   }
 
-  await runMigrations();
+  if (shouldRegisterFullApi) {
+    await runMigrations();
+  }
 
   const app = Fastify({
     logger: {
@@ -93,6 +94,11 @@ async function main() {
       execArgv: ['--require', path.resolve(__dirname, 'preload.js')]
     })
     : undefined;
+  const curationWorker = shouldStartCurationWorker
+    ? new Worker(path.resolve(__dirname, 'daemon', 'curation-worker.js'), {
+      execArgv: ['--require', path.resolve(__dirname, 'preload.js')]
+    })
+    : undefined;
 
   worker?.on('message', (message: { type: string; jobId?: string; status?: JobRecord['status']; error?: string }) => {
     if (message.type === 'job-status' && message.jobId && message.status) {
@@ -107,6 +113,16 @@ async function main() {
   worker?.on('exit', (code) => {
     if (code !== 0) {
       app.log.error({ code }, 'Extraction worker exited unexpectedly');
+    }
+  });
+
+  curationWorker?.on('error', (error) => {
+    app.log.error(error, 'Curation worker failed');
+  });
+
+  curationWorker?.on('exit', (code) => {
+    if (code !== 0) {
+      app.log.error({ code }, 'Curation worker exited unexpectedly');
     }
   });
 
@@ -136,6 +152,7 @@ async function main() {
   const shutdown = async () => {
     await app.close();
     await closePool();
+    await curationWorker?.terminate();
     await worker?.terminate();
     await shutdownAzureMonitor();
   };

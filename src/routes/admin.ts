@@ -8,7 +8,8 @@ import { generateAndWrapDek } from '../services/crypto';
 
 const createVaultSchema = z.object({
   name: z.string().min(1),
-  purpose: z.string().min(1).max(500).optional()
+  purpose: z.string().min(1).max(500).optional(),
+  plan: z.enum(['free', 'starter', 'pro']).optional()
 });
 
 const updateVaultSchema = z.object({
@@ -26,13 +27,14 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       ? (await generateAndWrapDek()).encryptedDek
       : null;
 
-    const result = await query<{ id: string; name: string; purpose: string | null; created_at: string }>(
-      `INSERT INTO vaults (name, purpose, api_key_hash, settings, encrypted_dek, vault_encryption_enabled)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
-       RETURNING id, name, purpose, created_at`,
+    const result = await query<{ id: string; name: string; purpose: string | null; plan_id: string; created_at: string }>(
+      `INSERT INTO vaults (name, purpose, plan_id, api_key_hash, settings, encrypted_dek, vault_encryption_enabled)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+       RETURNING id, name, purpose, plan_id, created_at`,
       [
         body.name,
         body.purpose ?? null,
+        body.plan ?? 'free',
         apiKey.hash,
         JSON.stringify({
           embedding_dimensions: getConfiguredEmbeddingDimensions()
@@ -46,6 +48,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       id: result.rows[0].id,
       name: result.rows[0].name,
       purpose: result.rows[0].purpose,
+      plan: result.rows[0].plan_id,
       api_key: apiKey.rawKey
     });
   });

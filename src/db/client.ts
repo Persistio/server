@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Pool, type QueryResultRow } from 'pg';
+import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import pgvector from 'pgvector/pg';
 
 import { getConfig } from '../config';
@@ -8,11 +8,30 @@ import { getConfig } from '../config';
 const config = getConfig();
 
 export const pool = new Pool({
-  connectionString: config.DATABASE_URL
+  connectionString: config.DATABASE_URL,
+  max: config.PG_POOL_MAX
 });
 
 export async function query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]) {
   return pool.query<T>(text, values);
+}
+
+export async function withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    try {
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
 }
 
 export async function runMigrations() {

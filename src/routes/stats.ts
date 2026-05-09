@@ -38,17 +38,46 @@ export async function registerStatsRoutes(app: FastifyInstance) {
       [request.vault.id, currentPeriod]
     );
 
-    const memoryResult = await query<{ active: string; archived: string }>(
+    const memoryResult = await query<{
+      active: string;
+      candidate: string;
+      needs_review: string;
+      contradicted: string;
+      superseded: string;
+      archived: string;
+    }>(
       `SELECT
-         COUNT(*) FILTER (WHERE archived_at IS NULL)::text AS active,
+         COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'active')::text AS active,
+         COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'candidate')::text AS candidate,
+         COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'needs_review')::text AS needs_review,
+         COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'contradicted')::text AS contradicted,
+         COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'superseded')::text AS superseded,
          COUNT(*) FILTER (WHERE archived_at IS NOT NULL)::text AS archived
        FROM memories
        WHERE vault_id = $1`,
       [request.vault.id]
     );
 
+    const aliasResult = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+       FROM entity_aliases
+       WHERE vault_id = $1`,
+      [request.vault.id]
+    );
+
+    const contradictionResult = await query<{ last_run: string | null; arbitrations_this_week: string }>(
+      `SELECT
+         MAX(created_at)::timestamptz::text AS last_run,
+         COUNT(*) FILTER (WHERE created_at >= date_trunc('week', now()))::text AS arbitrations_this_week
+       FROM contradiction_scan_log
+       WHERE vault_id = $1`,
+      [request.vault.id]
+    );
+
     const usage = usageResult.rows[0];
     const counts = memoryResult.rows[0];
+    const aliases = aliasResult.rows[0];
+    const contradictionScan = contradictionResult.rows[0];
 
     return {
       vault_id: request.vault.id,
@@ -56,8 +85,17 @@ export async function registerStatsRoutes(app: FastifyInstance) {
       period: usage.period ?? currentPeriod,
       memories: {
         active: Number(counts.active),
+        candidate: Number(counts.candidate),
+        needs_review: Number(counts.needs_review),
+        contradicted: Number(counts.contradicted),
+        superseded: Number(counts.superseded),
         archived: Number(counts.archived),
         limit: usage.limits.memories_max ?? null
+      },
+      entity_aliases: Number(aliases.count),
+      contradiction_scan: {
+        last_run: contradictionScan.last_run,
+        arbitrations_this_week: Number(contradictionScan.arbitrations_this_week)
       },
       usage: {
         ingest_events: {
