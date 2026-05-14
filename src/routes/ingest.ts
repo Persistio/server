@@ -7,7 +7,7 @@ import { ingestChunksCounter } from '../metrics';
 import { requireVaultAuth } from '../middleware/auth';
 import { encryptForVault } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
-import { checkQuota, incrementUsage } from '../services/usage';
+import { applyRateLimitHeaders, consumeApiQuota } from '../services/usage';
 import { withSpan } from '../telemetry';
 import { cosineSimilarity } from '../utils/math';
 
@@ -23,7 +23,8 @@ const ingestSchema = z.object({
 export async function registerIngestRoutes(app: FastifyInstance) {
   app.post('/v1/ingest', { preHandler: requireVaultAuth }, async (request, reply) => {
     const body = ingestSchema.parse(request.body);
-    await checkQuota(request.vault.id, 'ingest_events');
+    const rateLimit = await consumeApiQuota(request.vault.id, 'ingest_events');
+    applyRateLimitHeaders(reply, rateLimit);
 
     return withSpan('ingest.request', {
       'vault.id': request.vault.id,
@@ -94,8 +95,6 @@ export async function registerIngestRoutes(app: FastifyInstance) {
       } finally {
         client.release();
       }
-
-      await incrementUsage(request.vault.id, 'ingest_events');
 
       ingestChunksCounter.add(inserted.length, {
         vault_id: request.vault.id,

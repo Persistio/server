@@ -4,6 +4,7 @@ import type { PoolClient } from 'pg';
 
 import { getConfig } from '../config';
 import { closePool, query, withTransaction } from '../db/client';
+import { CircuitBreakerOpenError } from '../services/ai-resilience';
 import {
   decryptForVault,
   encryptForVault,
@@ -13,7 +14,7 @@ import {
   type VaultEncryptionContext
 } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
-import { CuratorService, type CuratorMemory, type CuratorResult, type EdgeType, type MemoryType } from '../services/curator';
+import { CuratorService, type CuratorAliasMaps, type CuratorMemory, type CuratorResult, type EdgeType, type MemoryType } from '../services/curator';
 import { getSpanAttributes } from '../telemetry';
 
 interface CurationQueueRow {
@@ -62,6 +63,7 @@ const curator = new CuratorService();
 const embedder = getEmbedder();
 const workerId = crypto.randomUUID();
 const MAX_CURATION_RETRIES = Number(process.env.MAX_CURATION_RETRIES ?? 5);
+const AUTO_PROMOTE_DUPLICATE_SIMILARITY = 0.90;
 
 async function processBatch() {
   await query(
@@ -128,10 +130,27 @@ async function processBatch() {
         continue;
       }
 
-      const { result, rawResponse } = await curator.curate(job.candidates, job.activeMemories, job.conversation);
-      await applyActions(job, result, rawResponse);
+      const { result, aliasMaps, rawResponse } = await curator.curate(job.candidates, job.activeMemories, job.conversation, job.vault.id);
+      await applyActions(job, result, aliasMaps, rawResponse);
       await query(`DELETE FROM curation_queue WHERE id = $1`, [job.queueId]);
     } catch (error) {
+      if (error instanceof CircuitBreakerOpenError) {
+        console.warn(JSON.stringify({
+          level: 40,
+          msg: 'skipping curation job while circuit breaker is open',
+          queue_id: row.queue_id,
+          retry_after_ms: error.retryAfterMs
+        }));
+        await query(
+          `UPDATE curation_queue
+           SET last_error = $2,
+               claimed_at = NULL,
+               claimed_by = NULL
+           WHERE id = $1`,
+          [row.queue_id, error.message]
+        );
+        continue;
+      }
       const lastError = error instanceof Error ? error.message : 'Unknown curation error';
       console.error(getSpanAttributes({ error, queueId: row.queue_id }), 'Curation job failed');
       await query(
@@ -257,7 +276,12 @@ async function decryptMemory(vault: VaultRow, memory: MemoryRow): Promise<Curato
   };
 }
 
-async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawResponse: unknown): Promise<void> {
+async function applyActions(
+  job: LoadedCurationJob,
+  actions: CuratorResult,
+  aliasMaps: CuratorAliasMaps,
+  rawResponse: unknown
+): Promise<void> {
   const capCuratorText = (value: string | null | undefined): string | undefined => value ? value.slice(0, 500) : undefined;
   const knownById = new Map<string, CuratorMemory>();
   for (const memory of [...job.candidates, ...job.activeMemories]) {
@@ -331,13 +355,26 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
     }
 
     for (const action of actions.nodes_to_update) {
+      const resolvedId = resolveAlias(action.id, aliasMaps);
+      const existing = knownById.get(resolvedId);
+      if (!existing) {
+        console.warn(`Skipping curator update with unknown alias or memory id: id=${action.id}`);
+        await insertActionLog(client, {
+          vaultId: job.vault.id,
+          vault: job.vault,
+          segmentId: job.segmentId,
+          actionType: 'update',
+          newValue: action.statement,
+          rawResponse,
+          applied: false,
+          error: `Curator referenced memory outside curation context: ${action.id}`
+        });
+        continue;
+      }
+
       try {
-        const existing = knownById.get(action.id);
-        if (!existing) {
-          throw new Error(`Memory ${action.id} not found in curation context`);
-        }
         await updateMemoryNode(client, job.vault, {
-          id: action.id,
+          id: resolvedId,
           fact: action.statement,
           subject: action.subject ?? existing.subject,
           type: action.type ?? existing.type ?? 'system_fact',
@@ -350,7 +387,7 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
           evidence: capCuratorText(action.reason) ?? existing.evidence ?? null,
           parentId: existing.parent_id
         });
-        knownById.set(action.id, {
+        knownById.set(resolvedId, {
           ...existing,
           data: action.statement,
           subject: action.subject ?? existing.subject,
@@ -360,16 +397,16 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
           volatility: action.volatility ?? existing.volatility,
           evidence: capCuratorText(action.reason) ?? existing.evidence ?? null
         });
-        if (job.candidateIds.has(action.id)) {
-          touchedCandidates.add(action.id);
+        if (job.candidateIds.has(resolvedId)) {
+          touchedCandidates.add(resolvedId);
         }
         await insertActionLog(client, {
           vaultId: job.vault.id,
           vault: job.vault,
           segmentId: job.segmentId,
           actionType: 'update',
-          memoryId: action.id,
-          newMemoryId: action.id,
+          memoryId: resolvedId,
+          newMemoryId: resolvedId,
           subject: action.subject ?? existing.subject,
           oldValue: existing.data,
           newValue: action.statement,
@@ -382,9 +419,9 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
           vault: job.vault,
           segmentId: job.segmentId,
           actionType: 'update',
-          memoryId: action.id,
-          subject: knownById.get(action.id)?.subject,
-          oldValue: knownById.get(action.id)?.data,
+          memoryId: knownById.has(resolvedId) ? resolvedId : undefined,
+          subject: knownById.has(resolvedId) ? knownById.get(resolvedId)?.subject : action.subject,
+          oldValue: knownById.has(resolvedId) ? knownById.get(resolvedId)?.data : undefined,
           newValue: action.statement,
           rawResponse,
           applied: false,
@@ -431,21 +468,33 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
     }
 
     for (const action of actions.nodes_to_archive) {
+      const resolvedId = resolveAlias(action.id, aliasMaps);
+      const existing = knownById.get(resolvedId);
+      if (!existing) {
+        console.warn(`Skipping curator archive with unknown alias or memory id: id=${action.id}`);
+        await insertActionLog(client, {
+          vaultId: job.vault.id,
+          vault: job.vault,
+          segmentId: job.segmentId,
+          actionType: 'delete',
+          rawResponse,
+          applied: false,
+          error: `Curator referenced memory outside curation context: ${action.id}`
+        });
+        continue;
+      }
+
       try {
-        const existing = knownById.get(action.id);
-        if (!existing) {
-          throw new Error(`Memory ${action.id} not found in curation context`);
-        }
-        await archiveMemory(client, action.id, job.vault.id);
-        if (job.candidateIds.has(action.id)) {
-          touchedCandidates.add(action.id);
+        await archiveMemory(client, resolvedId, job.vault.id);
+        if (job.candidateIds.has(resolvedId)) {
+          touchedCandidates.add(resolvedId);
         }
         await insertActionLog(client, {
           vaultId: job.vault.id,
           vault: job.vault,
           segmentId: job.segmentId,
           actionType: 'delete',
-          memoryId: action.id,
+          memoryId: resolvedId,
           subject: existing.subject,
           oldValue: existing.data,
           newValue: capCuratorText(action.reason),
@@ -458,9 +507,9 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
           vault: job.vault,
           segmentId: job.segmentId,
           actionType: 'delete',
-          memoryId: action.id,
-          subject: knownById.get(action.id)?.subject,
-          oldValue: knownById.get(action.id)?.data,
+          memoryId: knownById.has(resolvedId) ? resolvedId : undefined,
+          subject: knownById.has(resolvedId) ? knownById.get(resolvedId)?.subject : undefined,
+          oldValue: knownById.has(resolvedId) ? knownById.get(resolvedId)?.data : undefined,
           newValue: capCuratorText(action.reason),
           rawResponse,
           applied: false,
@@ -470,19 +519,31 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
     }
 
     for (const action of actions.discarded_candidates) {
-      try {
-        const existing = knownById.get(action.id);
-        if (!existing) {
-          throw new Error(`Candidate ${action.id} not found in curation context`);
-        }
-        await archiveMemory(client, action.id, job.vault.id);
-        touchedCandidates.add(action.id);
+      const resolvedId = resolveAlias(action.id, aliasMaps);
+      const existing = knownById.get(resolvedId);
+      if (!existing) {
+        console.warn(`Skipping curator discard with unknown alias or memory id: id=${action.id}`);
         await insertActionLog(client, {
           vaultId: job.vault.id,
           vault: job.vault,
           segmentId: job.segmentId,
           actionType: 'delete',
-          memoryId: action.id,
+          rawResponse,
+          applied: false,
+          error: `Curator referenced memory outside curation context: ${action.id}`
+        });
+        continue;
+      }
+
+      try {
+        await archiveMemory(client, resolvedId, job.vault.id);
+        touchedCandidates.add(resolvedId);
+        await insertActionLog(client, {
+          vaultId: job.vault.id,
+          vault: job.vault,
+          segmentId: job.segmentId,
+          actionType: 'delete',
+          memoryId: resolvedId,
           subject: existing.subject,
           oldValue: existing.data,
           newValue: capCuratorText(action.reason),
@@ -495,15 +556,34 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
           vault: job.vault,
           segmentId: job.segmentId,
           actionType: 'delete',
-          memoryId: action.id,
-          subject: knownById.get(action.id)?.subject,
-          oldValue: knownById.get(action.id)?.data,
+          memoryId: knownById.has(resolvedId) ? resolvedId : undefined,
+          subject: knownById.has(resolvedId) ? knownById.get(resolvedId)?.subject : undefined,
+          oldValue: knownById.has(resolvedId) ? knownById.get(resolvedId)?.data : undefined,
           newValue: capCuratorText(action.reason),
           rawResponse,
           applied: false,
           error: error instanceof Error ? error.message : String(error)
         });
       }
+    }
+
+    const duplicateResult = await archiveDuplicatePromotionCandidates(client, job, Array.from(touchedCandidates));
+    for (const duplicate of duplicateResult) {
+      touchedCandidates.add(duplicate.candidate_id);
+      const memory = knownById.get(duplicate.candidate_id);
+      await insertActionLog(client, {
+        vaultId: job.vault.id,
+        vault: job.vault,
+        segmentId: job.segmentId,
+        actionType: 'archive_duplicate',
+        memoryId: duplicate.candidate_id,
+        newMemoryId: duplicate.active_id,
+        subject: memory?.subject,
+        oldValue: memory?.data,
+        newValue: `duplicate of active memory ${duplicate.active_id} (${duplicate.similarity.toFixed(3)} similarity)`,
+        rawResponse,
+        applied: true
+      });
     }
 
     const promoteResult = await client.query<{ id: string }>(
@@ -535,6 +615,84 @@ async function applyActions(job: LoadedCurationJob, actions: CuratorResult, rawR
       });
     }
   });
+}
+
+async function archiveDuplicatePromotionCandidates(
+  client: PoolClient,
+  job: LoadedCurationJob,
+  touchedCandidateIds: string[]
+): Promise<Array<{ candidate_id: string; active_id: string; similarity: number }>> {
+  const duplicates = await client.query<{ candidate_id: string; active_id: string; similarity: number }>(
+    `WITH duplicate_candidates AS (
+       SELECT DISTINCT ON (candidate.id)
+              candidate.id AS candidate_id,
+              active.id AS active_id,
+              1 - (candidate_embedding.embedding <=> active_embedding.embedding) AS similarity
+       FROM memories candidate
+       JOIN memory_embeddings candidate_embedding
+         ON candidate_embedding.memory_id = candidate.id
+       JOIN memories active
+         ON active.vault_id = candidate.vault_id
+        AND active.id <> candidate.id
+        AND active.status = 'active'
+        AND active.archived_at IS NULL
+        AND (
+          (
+            candidate.subject <> ''
+            AND active.subject = candidate.subject
+          )
+          OR (
+            candidate.subject_hmac IS NOT NULL
+            AND active.subject_hmac = candidate.subject_hmac
+          )
+        )
+       JOIN memory_embeddings active_embedding
+         ON active_embedding.memory_id = active.id
+       WHERE candidate.vault_id = $1
+         AND candidate.source_segment_id = $2
+         AND candidate.archived_at IS NULL
+         AND candidate.status = 'candidate'
+         AND NOT (candidate.id = ANY($3::uuid[]))
+         AND 1 - (candidate_embedding.embedding <=> active_embedding.embedding) >= $4
+       ORDER BY candidate.id, candidate_embedding.embedding <=> active_embedding.embedding
+     ),
+     archived AS (
+       UPDATE memories candidate
+       SET archived_at = now(),
+           status = 'superseded',
+           updated_at = now()
+       FROM duplicate_candidates duplicate
+       WHERE candidate.id = duplicate.candidate_id
+       RETURNING candidate.id AS candidate_id, duplicate.active_id, candidate.source_chunks, duplicate.similarity
+     ),
+     merged_source_chunks AS (
+       SELECT active_id, array_agg(DISTINCT chunk_id) AS source_chunks
+       FROM archived, unnest(source_chunks) AS chunk_id
+       GROUP BY active_id
+     ),
+     updated_active AS (
+       UPDATE memories active
+       SET source_chunks = (
+             SELECT array_agg(DISTINCT chunk_id)
+             FROM unnest(array_cat(active.source_chunks, merged.source_chunks)) AS chunk_id
+           ),
+           updated_at = now()
+       FROM merged_source_chunks merged
+       WHERE active.id = merged.active_id
+       RETURNING active.id
+     )
+     SELECT archived.candidate_id, archived.active_id, archived.similarity
+     FROM archived
+     JOIN updated_active
+       ON updated_active.id = archived.active_id`,
+    [job.vault.id, job.segmentId, touchedCandidateIds, AUTO_PROMOTE_DUPLICATE_SIMILARITY]
+  );
+
+  return duplicates.rows;
+}
+
+function resolveAlias(id: string, aliasMaps: CuratorAliasMaps): string {
+  return aliasMaps.aliasToId.get(id) ?? id;
 }
 
 async function insertActiveMemory(
@@ -624,6 +782,9 @@ async function updateMemoryNode(
          confidence = $12,
          sensitivity = $13,
          polarity = $14,
+         -- Curator updates are authoritative curation decisions, including
+         -- candidate edits, so updated nodes must become recallable.
+         status = 'active',
          volatility = $15::memory_volatility,
          evidence = $16::jsonb,
          parent_id = $17,
@@ -703,7 +864,7 @@ async function insertActionLog(
     vaultId: string;
     vault: VaultEncryptionContext;
     segmentId: string;
-    actionType: 'create' | 'update' | 'delete' | 'promote';
+    actionType: 'create' | 'update' | 'delete' | 'promote' | 'archive_duplicate';
     memoryId?: string;
     newMemoryId?: string;
     subject?: string;

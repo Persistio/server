@@ -68,9 +68,15 @@ The full OpenAPI description is in [`openapi.yaml`](https://github.com/chriscove
 | `OPENAI_EMBEDDING_MODEL` | OpenAI embedding model | `text-embedding-3-small` |
 | `OLLAMA_BASE_URL` | Ollama base URL | `http://ollama:11434` |
 | `OLLAMA_EMBEDDING_MODEL` | Ollama embedding model | `nomic-embed-text` |
-| `EXTRACTOR_BASE_URL` | OpenAI-compatible base URL for fact extraction | `https://api.openai.com/v1` |
-| `EXTRACTOR_API_KEY` | API key for the extractor model | — |
-| `EXTRACTOR_MODEL` | Chat model used for fact extraction | `gpt-4o-mini` |
+| `EXTRACTOR_BASE_URL` | Legacy OpenAI-compatible base URL used by extraction and escalation when role-specific URLs are unset | `https://api.openai.com/v1` |
+| `EXTRACTOR_API_KEY` | Legacy API key used by extraction and escalation when role-specific keys are unset | — |
+| `EXTRACTOR_MODEL` | Legacy chat model used by extraction and escalation when role-specific models are unset | `gpt-4o-mini` |
+| `EXTRACTION_BASE_URL` | Optional OpenAI-compatible base URL for routine extraction/session-context calls | `EXTRACTOR_BASE_URL` |
+| `EXTRACTION_API_KEY` | Optional API key for routine extraction/session-context calls | `EXTRACTOR_API_KEY` |
+| `EXTRACTION_MODEL` | Optional model for routine extraction/session-context calls, for example Gemini Flash | `EXTRACTOR_MODEL` |
+| `ESCALATION_BASE_URL` | Optional OpenAI-compatible base URL for arbitration/entity-resolution escalation calls | `EXTRACTOR_BASE_URL` |
+| `ESCALATION_API_KEY` | Optional API key for arbitration/entity-resolution escalation calls | `EXTRACTOR_API_KEY` |
+| `ESCALATION_MODEL` | Optional model for arbitration/entity-resolution escalation calls, for example Claude Sonnet | `EXTRACTOR_MODEL` |
 | `EXTRACTION_INTERVAL_MS` | Worker polling interval (ms) | `30000` |
 | `EXTRACTION_BATCH_SIZE` | Max chunks processed per extraction cycle | `20` |
 | `MEMORY_ARCHIVE_TTL_DAYS` | Days before stale memories are archived | `90` |
@@ -79,6 +85,10 @@ The full OpenAPI description is in [`openapi.yaml`](https://github.com/chriscove
 | `ENCRYPTION_ENABLED` | Enable envelope encryption for memory subjects | `false` |
 | `KEY_VAULT_URI` | Key vault URI (required when `ENCRYPTION_ENABLED=true`) | `""` |
 | `KEK_KEY_NAME` | Key encryption key name in the vault | `""` |
+
+When switching a role to a different provider, set that role's `*_BASE_URL`, `*_API_KEY`, and `*_MODEL` together. Per-field fallback is supported for compatibility, but mixed provider settings are easy to misconfigure.
+
+Vault `gemini_rpm` / `gemini_tpm` limits apply only to extractor roles resolved to Gemini models or Google AI endpoints. Mixed setups such as Gemini extraction plus non-Gemini escalation debit Gemini quota for extraction only. Extractor circuit-breaker logs now use role-specific service names: `extractor.extraction` and `extractor.escalation`.
 
 ## TLS / HTTPS
 

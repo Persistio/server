@@ -1,7 +1,9 @@
 import OpenAI from 'openai';
 
-import { getConfig } from '../config';
+import { getConfig, type AppConfig } from '../config';
+import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
 import { PromptLoader } from './prompt-loader';
+import { consumeGeminiQuota, settleGeminiUsage } from './usage';
 import { sanitizePromptData } from '../utils/sanitize';
 
 export interface ExtractedFact {
@@ -57,13 +59,88 @@ Rules:
 - Output ONLY valid JSON with this schema:
 [{"fact":"...","subject":"...","score":7,"salience":0.65,"sensitivity":"low","type":"user_preference","scope":"global","polarity":"neutral","status":"active","volatility":"low","evidence":"User explicitly asked for concise responses.","valid_from":null,"valid_until":null}]`;
 
-type ConflictResolution = 'supersede_old' | 'needs_review' | 'merge' | 'discard_new';
+export type ConflictResolution = 'supersede_old' | 'needs_review' | 'merge' | 'discard_new';
 type MemorySensitivity = ExtractedFact['sensitivity'];
 type MemoryType = NonNullable<ExtractedFact['type']>;
 type MemoryScope = ExtractedFact['scope'];
 type MemoryPolarity = ExtractedFact['polarity'];
 type MemoryStatus = ExtractedFact['status'];
 type MemoryVolatility = ExtractedFact['volatility'];
+type ModelRole = 'extraction' | 'escalation';
+
+interface RoleClient {
+  client: OpenAI;
+  model: string;
+  usesGeminiQuota: boolean;
+}
+
+type ExtractorRoleConfigKeys =
+  | 'EXTRACTOR_BASE_URL'
+  | 'EXTRACTOR_API_KEY'
+  | 'EXTRACTOR_MODEL'
+  | 'EXTRACTION_BASE_URL'
+  | 'EXTRACTION_API_KEY'
+  | 'EXTRACTION_MODEL'
+  | 'ESCALATION_BASE_URL'
+  | 'ESCALATION_API_KEY'
+  | 'ESCALATION_MODEL';
+
+export interface ResolvedExtractorRoleConfig {
+  extraction: {
+    baseURL: string;
+    apiKey: string;
+    model: string;
+    usesGeminiQuota: boolean;
+  };
+  escalation: {
+    baseURL: string;
+    apiKey: string;
+    model: string;
+    usesGeminiQuota: boolean;
+  };
+}
+
+/** @internal */
+export function resolveExtractorRoleConfig(
+  config: Pick<AppConfig, ExtractorRoleConfigKeys>
+): ResolvedExtractorRoleConfig {
+  const extraction = {
+    baseURL: config.EXTRACTION_BASE_URL || config.EXTRACTOR_BASE_URL,
+    apiKey: config.EXTRACTION_API_KEY || config.EXTRACTOR_API_KEY,
+    model: config.EXTRACTION_MODEL || config.EXTRACTOR_MODEL
+  };
+  const escalation = {
+    baseURL: config.ESCALATION_BASE_URL || config.EXTRACTOR_BASE_URL,
+    apiKey: config.ESCALATION_API_KEY || config.EXTRACTOR_API_KEY,
+    model: config.ESCALATION_MODEL || config.EXTRACTOR_MODEL
+  };
+
+  return {
+    extraction: {
+      ...extraction,
+      usesGeminiQuota: shouldApplyGeminiQuota(extraction)
+    },
+    escalation: {
+      ...escalation,
+      usesGeminiQuota: shouldApplyGeminiQuota(escalation)
+    }
+  };
+}
+
+/** @internal */
+export function shouldApplyGeminiQuota(input: { baseURL: string; model: string }): boolean {
+  const model = input.model.toLowerCase();
+  if (model.startsWith('gemini-') || model.includes('/gemini-')) {
+    return true;
+  }
+
+  try {
+    const hostname = new URL(input.baseURL).hostname.toLowerCase();
+    return hostname === 'generativelanguage.googleapis.com' || hostname.endsWith('aiplatform.googleapis.com');
+  } catch {
+    return false;
+  }
+}
 
 const SENSITIVITIES: MemorySensitivity[] = ['low', 'medium', 'high', 'restricted'];
 const MEMORY_TYPES: MemoryType[] = ['user_preference', 'user_rule', 'task_pattern', 'workflow', 'project', 'constraint', 'decision', 'system_fact', 'domain_knowledge'];
@@ -73,17 +150,36 @@ const STATUSES: MemoryStatus[] = ['active', 'superseded', 'contradicted', 'needs
 const VOLATILITIES: MemoryVolatility[] = ['very_low', 'low', 'medium', 'high'];
 
 export class ExtractorService {
-  private readonly client: OpenAI;
-  private readonly model: string;
+  // Breakers are keyed by model role, not per-vault state. A bad provider key for a role
+  // affects every vault using that role, so opening the breaker process-wide is correct.
+  private static readonly circuitBreakers: Record<ModelRole, ServiceCircuitBreaker> = {
+    extraction: new ServiceCircuitBreaker('extractor.extraction'),
+    escalation: new ServiceCircuitBreaker('extractor.escalation')
+  };
+  private readonly roles: Record<ModelRole, RoleClient>;
   private readonly promptLoader: PromptLoader;
 
   constructor() {
     const config = getConfig();
-    this.client = new OpenAI({
-      apiKey: config.EXTRACTOR_API_KEY,
-      baseURL: config.EXTRACTOR_BASE_URL
-    });
-    this.model = config.EXTRACTOR_MODEL;
+    const roleConfig = resolveExtractorRoleConfig(config);
+    this.roles = {
+      extraction: {
+        client: new OpenAI({
+          apiKey: roleConfig.extraction.apiKey,
+          baseURL: roleConfig.extraction.baseURL
+        }),
+        model: roleConfig.extraction.model,
+        usesGeminiQuota: roleConfig.extraction.usesGeminiQuota
+      },
+      escalation: {
+        client: new OpenAI({
+          apiKey: roleConfig.escalation.apiKey,
+          baseURL: roleConfig.escalation.baseURL
+        }),
+        model: roleConfig.escalation.model,
+        usesGeminiQuota: roleConfig.escalation.usesGeminiQuota
+      }
+    };
     this.promptLoader = new PromptLoader({
       promptFile: config.EXTRACTOR_PROMPT_FILE,
       promptsDir: config.PROMPTS_DIR,
@@ -92,9 +188,9 @@ export class ExtractorService {
     });
   }
 
-  async arbitrateConflict(existingFact: string, newFact: string): Promise<ConflictResolution> {
-    const response = await this.client.chat.completions.create({
-      model: this.model,
+  async arbitrateConflict(existingFact: string, newFact: string, vaultId?: string): Promise<ConflictResolution> {
+    const response = await this.createChatCompletion({
+      model: this.roles.escalation.model,
       temperature: 0,
       messages: [
         {
@@ -106,14 +202,15 @@ export class ExtractorService {
           content: `Existing fact: "${existingFact}"\n\nNew fact: "${newFact}"\n\nWhat should we do?`
         }
       ]
-    });
+    }, vaultId, 'escalation');
 
     const usage = response.usage;
     if (usage) {
       console.log(JSON.stringify({
         level: 30,
         msg: 'arbitration token usage',
-        model: this.model,
+        model: this.roles.escalation.model,
+        model_role: 'escalation',
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens
@@ -128,18 +225,19 @@ export class ExtractorService {
   }
 
   async arbitrateConflictsBatch(
-    pairs: Array<{ id: string; existingFact: string; newFact: string }>
+    pairs: Array<{ id: string; existingFact: string; newFact: string }>,
+    vaultId?: string
   ): Promise<Map<string, ConflictResolution>> {
     if (pairs.length === 0) return new Map();
     if (pairs.length === 1) {
-      const result = await this.arbitrateConflict(pairs[0].existingFact, pairs[0].newFact);
+      const result = await this.arbitrateConflict(pairs[0].existingFact, pairs[0].newFact, vaultId);
       return new Map([[pairs[0].id, result]]);
     }
     const prompt = pairs.map((p, i) =>
       `[${i + 1}]\nEXISTING: ${sanitizePromptData(p.existingFact)}\nNEW: ${sanitizePromptData(p.newFact)}`
     ).join('\n\n');
-    const response = await this.client.chat.completions.create({
-      model: this.model,
+    const response = await this.createChatCompletion({
+      model: this.roles.escalation.model,
       temperature: 0,
       messages: [
         {
@@ -148,10 +246,10 @@ export class ExtractorService {
         },
         { role: 'user', content: prompt }
       ]
-    });
+    }, vaultId, 'escalation');
     const usage = response.usage;
     if (usage) {
-      console.log(JSON.stringify({ level: 30, msg: 'batch arbitration token usage', model: this.model, prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, total_tokens: usage.total_tokens, pairs_count: pairs.length }));
+      console.log(JSON.stringify({ level: 30, msg: 'batch arbitration token usage', model: this.roles.escalation.model, model_role: 'escalation', prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, total_tokens: usage.total_tokens, pairs_count: pairs.length }));
     }
     const raw = response.choices[0]?.message?.content ?? '[]';
     const content = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
@@ -171,11 +269,11 @@ export class ExtractorService {
     return result;
   }
 
-  async arbitrateSubject(existingCanonical: string, newSubject: string): Promise<'use_existing' | 'new_canonical'> {
+  async arbitrateSubject(existingCanonical: string, newSubject: string, vaultId?: string): Promise<'use_existing' | 'new_canonical'> {
     const sanitizedExistingCanonical = sanitizePromptData(existingCanonical);
     const sanitizedNewSubject = sanitizePromptData(newSubject);
-    const response = await this.client.chat.completions.create({
-      model: this.model,
+    const response = await this.createChatCompletion({
+      model: this.roles.escalation.model,
       temperature: 0,
       messages: [
         {
@@ -187,14 +285,15 @@ export class ExtractorService {
           content: `Existing canonical: "${sanitizedExistingCanonical}"\n\nNew subject: "${sanitizedNewSubject}"\n\nAre these the same entity?`
         }
       ]
-    });
+    }, vaultId, 'escalation');
 
     const usage = response.usage;
     if (usage) {
       console.log(JSON.stringify({
         level: 30,
         msg: 'arbitrate subject token usage',
-        model: this.model,
+        model: this.roles.escalation.model,
+        model_role: 'escalation',
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens
@@ -205,9 +304,9 @@ export class ExtractorService {
     return raw.includes('USE_EXISTING') ? 'use_existing' : 'new_canonical';
   }
 
-  async extractSessionContext(conversation: string, promptHeader?: string): Promise<string | null> {
-    const response = await this.client.chat.completions.create({
-      model: this.model,
+  async extractSessionContext(conversation: string, promptHeader?: string, vaultId?: string): Promise<string | null> {
+    const response = await this.createChatCompletion({
+      model: this.roles.extraction.model,
       temperature: 0,
       messages: [
         {
@@ -219,14 +318,15 @@ export class ExtractorService {
           content: [promptHeader, conversation].filter(Boolean).join('\n\n')
         }
       ]
-    });
+    }, vaultId, 'extraction');
 
     const usage = response.usage;
     if (usage) {
       console.log(JSON.stringify({
         level: 30,
         msg: 'session context token usage',
-        model: this.model,
+        model: this.roles.extraction.model,
+        model_role: 'extraction',
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens
@@ -237,9 +337,9 @@ export class ExtractorService {
     return content ? content.replace(/\s+/g, ' ') : null;
   }
 
-  async extractSessionAliases(conversation: string): Promise<ExtractedAlias[]> {
-    const response = await this.client.chat.completions.create({
-      model: this.model,
+  async extractSessionAliases(conversation: string, vaultId?: string): Promise<ExtractedAlias[]> {
+    const response = await this.createChatCompletion({
+      model: this.roles.extraction.model,
       temperature: 0,
       messages: [
         {
@@ -251,14 +351,15 @@ export class ExtractorService {
           content: conversation
         }
       ]
-    });
+    }, vaultId, 'extraction');
 
     const usage = response.usage;
     if (usage) {
       console.log(JSON.stringify({
         level: 30,
         msg: 'session alias token usage',
-        model: this.model,
+        model: this.roles.extraction.model,
+        model_role: 'extraction',
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens
@@ -296,9 +397,9 @@ export class ExtractorService {
       });
   }
 
-  async extractFacts(conversation: string, promptHeader?: string): Promise<ExtractedFact[]> {
-    const response = await this.client.chat.completions.create({
-      model: this.model,
+  async extractFacts(conversation: string, promptHeader?: string, vaultId?: string): Promise<ExtractedFact[]> {
+    const response = await this.createChatCompletion({
+      model: this.roles.extraction.model,
       temperature: 0,
       messages: [
         {
@@ -310,14 +411,15 @@ export class ExtractorService {
           content: [promptHeader, conversation].filter(Boolean).join('\n\n')
         }
       ]
-    });
+    }, vaultId, 'extraction');
 
     const usage = response.usage;
     if (usage) {
       console.log(JSON.stringify({
         level: 30,
         msg: 'extractor token usage',
-        model: this.model,
+        model: this.roles.extraction.model,
+        model_role: 'extraction',
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens
@@ -390,4 +492,66 @@ export class ExtractorService {
       }))
       .filter((item) => item.fact && item.subject);
   }
+
+  private async createChatCompletion(
+    input: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+    vaultId?: string,
+    role: ModelRole = 'extraction'
+  ) {
+    const roleClient = this.roles[role];
+    const circuitBreaker = ExtractorService.circuitBreakers[role];
+    circuitBreaker.beforeRequest();
+    const estimatedTokens = estimateChatTokens(input.messages);
+
+    try {
+      if (vaultId && roleClient.usesGeminiQuota) {
+        // TODO: This reserves request/token quota before the API call. If the call later fails
+        // with a retriable non-auth, non-rate-limit error, there is no refund path yet. Fixing
+        // that would require tracking and reconciling pre-call quota reservations.
+        await consumeGeminiQuota(vaultId, estimatedTokens);
+      }
+
+      const response = await roleClient.client.chat.completions.create(input);
+      if (vaultId && roleClient.usesGeminiQuota && response.usage?.total_tokens) {
+        try {
+          await settleGeminiUsage(vaultId, estimatedTokens, response.usage.total_tokens);
+        } catch (error) {
+          console.warn(JSON.stringify({
+            level: 40,
+            msg: 'settle_gemini_usage_overage',
+            service: `extractor.${role}`,
+            vaultId,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
+      }
+      circuitBreaker.onSuccess();
+      return response;
+    } catch (error) {
+      const breakerResult = circuitBreaker.onFailure(error);
+      if (breakerResult.opened && isAuthFailureError(error)) {
+        console.warn(JSON.stringify({
+          level: 40,
+          msg: 'circuit_breaker_open',
+          service: `extractor.${role}`,
+          next_probe_at: breakerResult.nextProbeAt ? new Date(breakerResult.nextProbeAt).toISOString() : null
+        }));
+      }
+
+      if (error instanceof CircuitBreakerOpenError) {
+        console.warn(JSON.stringify({
+          level: 40,
+          msg: 'circuit_breaker_open',
+          service: `extractor.${role}`,
+          retry_after_ms: error.retryAfterMs
+        }));
+      }
+      throw error;
+    }
+  }
+}
+
+function estimateChatTokens(messages: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming['messages']): number {
+  const serialized = JSON.stringify(messages);
+  return Math.max(256, Math.ceil(serialized.length / 4));
 }

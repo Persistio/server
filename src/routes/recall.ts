@@ -7,7 +7,7 @@ import { recallDurationHistogram } from '../metrics';
 import { requireVaultAuth } from '../middleware/auth';
 import { decryptForVault } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
-import { checkQuota, incrementUsage } from '../services/usage';
+import { applyRateLimitHeaders, consumeApiQuota } from '../services/usage';
 import { withSpan } from '../telemetry';
 
 const recallSchema = z.object({
@@ -157,12 +157,13 @@ function buildRecallBundle(memories: RecallMemory[]): RecallBundleResponse {
 }
 
 export async function registerRecallRoutes(app: FastifyInstance) {
-  app.post('/v1/recall', { preHandler: requireVaultAuth }, async (request) => {
+  app.post('/v1/recall', { preHandler: requireVaultAuth }, async (request, reply) => {
     const body = recallSchema.parse(request.body);
     const qs = recallQuerySchema.parse(request.query);
     const config = getConfig();
     const topK = body.top_k ?? config.DEFAULT_RECALL_TOP_K;
-    await checkQuota(request.vault.id, 'searches');
+    const rateLimit = await consumeApiQuota(request.vault.id, 'searches');
+    applyRateLimitHeaders(reply, rateLimit);
 
     return withSpan('recall.request', {
       'vault.id': request.vault.id,
@@ -199,7 +200,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
          JOIN memory_embeddings me ON me.memory_id = m.id
          WHERE m.vault_id = $1
            AND m.archived_at IS NULL
-           AND m.status <> 'candidate'
+           AND m.status = 'active'
          ORDER BY me.embedding <=> $2::vector
          LIMIT $3`,
         [request.vault.id, JSON.stringify(embedding), topK]
@@ -267,8 +268,6 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         ...row,
         content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
       })));
-
-      await incrementUsage(request.vault.id, 'searches');
 
       const durationMs = performance.now() - start;
       recallDurationHistogram.record(durationMs, {

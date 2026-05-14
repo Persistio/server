@@ -1,7 +1,9 @@
 import OpenAI from 'openai';
 
 import { getConfig } from '../config';
+import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
 import { PromptLoader } from './prompt-loader';
+import { consumeGeminiQuota, settleGeminiUsage } from './usage';
 import { sanitizePromptData, scrubMemoryForCurator } from '../utils/sanitize';
 
 export type MemoryType = 'user_preference' | 'user_rule' | 'task_pattern' | 'workflow' | 'project' | 'constraint' | 'decision' | 'system_fact' | 'domain_knowledge';
@@ -74,9 +76,33 @@ export interface CuratorResult {
   discarded_candidates: CuratorDiscardCandidateAction[];
 }
 
-const HARDCODED_PROMPT = `You are a memory curator. Build a behavioral memory graph and respond only with JSON using the nodes_to_create, nodes_to_update, edges_to_create, nodes_to_archive, and discarded_candidates schema.`;
+export interface CuratorAliasMaps {
+  aliasToId: Map<string, string>;
+  idToAlias: Map<string, string>;
+}
 
-function formatMemories(title: string, memories: CuratorMemory[]): string {
+const HARDCODED_PROMPT = `You are a memory curator. Build a behavioral memory graph and respond only with JSON using the nodes_to_create, nodes_to_update, edges_to_create, nodes_to_archive, and discarded_candidates schema. For every memory id field, use the provided short aliases instead of raw UUIDs: existing active memories are M1, M2, ... and candidate memories are C1, C2, ....`;
+
+function buildAliasMaps(candidates: CuratorMemory[], activeMemories: CuratorMemory[]): CuratorAliasMaps {
+  const aliasToId = new Map<string, string>();
+  const idToAlias = new Map<string, string>();
+
+  activeMemories.forEach((memory, index) => {
+    const alias = `M${index + 1}`;
+    aliasToId.set(alias, memory.id);
+    idToAlias.set(memory.id, alias);
+  });
+
+  candidates.forEach((memory, index) => {
+    const alias = `C${index + 1}`;
+    aliasToId.set(alias, memory.id);
+    idToAlias.set(memory.id, alias);
+  });
+
+  return { aliasToId, idToAlias };
+}
+
+function formatMemories(title: string, memories: CuratorMemory[], aliasMaps: CuratorAliasMaps): string {
   if (memories.length === 0) {
     return `${title}\nNone`;
   }
@@ -84,7 +110,7 @@ function formatMemories(title: string, memories: CuratorMemory[]): string {
   return [
     title,
     ...memories.map((memory) => [
-      `ID: ${memory.id}`,
+      `ID: ${aliasMaps.idToAlias.get(memory.id) ?? memory.id}`,
       `Subject: ${sanitizePromptData(memory.subject)}`,
       `Type: ${memory.type ?? 'null'}`,
       `Statement: ${scrubMemoryForCurator(memory.data)}`,
@@ -94,7 +120,7 @@ function formatMemories(title: string, memories: CuratorMemory[]): string {
       `Polarity: ${memory.polarity}`,
       `Volatility: ${memory.volatility}`,
       `Evidence: ${sanitizePromptData(memory.evidence ?? '')}`,
-      `Parent ID: ${memory.parent_id ?? 'null'}`
+      `Parent ID: ${memory.parent_id ? aliasMaps.idToAlias.get(memory.parent_id) ?? '(parent not in context)' : 'null'}`
     ].join('\n'))
   ].join('\n\n');
 }
@@ -116,6 +142,9 @@ function formatConversation(conversation: string | null): string {
 }
 
 export class CuratorService {
+  // This breaker is keyed to the shared curator API key, not per-vault state. A bad key
+  // affects every vault using this service, so opening the breaker process-wide is correct.
+  private static readonly circuitBreaker = new ServiceCircuitBreaker('curator');
   private readonly client: OpenAI;
   private readonly model: string;
   private readonly promptLoader: PromptLoader;
@@ -138,9 +167,11 @@ export class CuratorService {
   async curate(
     candidates: CuratorMemory[],
     activeMemories: CuratorMemory[],
-    rawConversation: string | null
-  ): Promise<{ result: CuratorResult; rawResponse: unknown }> {
-    const response = await this.client.chat.completions.create({
+    rawConversation: string | null,
+    vaultId?: string
+  ): Promise<{ result: CuratorResult; aliasMaps: CuratorAliasMaps; rawResponse: unknown }> {
+    const aliasMaps = buildAliasMaps(candidates, activeMemories);
+    const response = await this.createChatCompletion({
       model: this.model,
       temperature: 0,
       messages: [
@@ -148,13 +179,13 @@ export class CuratorService {
         {
           role: 'user',
           content: [
-            { type: 'text', text: formatMemories('Part 1: Candidate memories', candidates) },
-            { type: 'text', text: formatMemories('Part 2: Existing active memories for matched subjects', activeMemories) },
+            { type: 'text', text: formatMemories('Part 1: Candidate memories', candidates, aliasMaps) },
+            { type: 'text', text: formatMemories('Part 2: Existing active memories for matched subjects', activeMemories, aliasMaps) },
             { type: 'text', text: formatConversation(rawConversation) }
           ]
         }
       ]
-    });
+    }, vaultId);
 
     const rawText = response.choices[0]?.message?.content?.trim();
     if (!rawText) {
@@ -171,11 +202,66 @@ export class CuratorService {
 
     return {
       result: parseCuratorResult(parsed),
+      aliasMaps,
       rawResponse: {
         request: { model: this.model },
         response
       }
     };
+  }
+
+  private async createChatCompletion(
+    input: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+    vaultId?: string
+  ) {
+    CuratorService.circuitBreaker.beforeRequest();
+    const estimatedTokens = Math.max(256, Math.ceil(JSON.stringify(input.messages).length / 4));
+
+    try {
+      if (vaultId) {
+        // TODO: This reserves request/token quota before the API call. If the call later fails
+        // with a retriable non-auth, non-rate-limit error, there is no refund path yet. Fixing
+        // that would require tracking and reconciling pre-call quota reservations.
+        await consumeGeminiQuota(vaultId, estimatedTokens);
+      }
+
+      const response = await this.client.chat.completions.create(input);
+      if (vaultId && response.usage?.total_tokens) {
+        try {
+          await settleGeminiUsage(vaultId, estimatedTokens, response.usage.total_tokens);
+        } catch (error) {
+          console.warn(JSON.stringify({
+            level: 40,
+            msg: 'settle_gemini_usage_overage',
+            service: 'curator',
+            vaultId,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
+      }
+      CuratorService.circuitBreaker.onSuccess();
+      return response;
+    } catch (error) {
+      const breakerResult = CuratorService.circuitBreaker.onFailure(error);
+      if (breakerResult.opened && isAuthFailureError(error)) {
+        console.warn(JSON.stringify({
+          level: 40,
+          msg: 'circuit_breaker_open',
+          service: 'curator',
+          next_probe_at: breakerResult.nextProbeAt ? new Date(breakerResult.nextProbeAt).toISOString() : null
+        }));
+      }
+
+      if (error instanceof CircuitBreakerOpenError) {
+        console.warn(JSON.stringify({
+          level: 40,
+          msg: 'circuit_breaker_open',
+          service: 'curator',
+          retry_after_ms: error.retryAfterMs
+        }));
+      }
+      throw error;
+    }
   }
 }
 

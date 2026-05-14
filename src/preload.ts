@@ -1,13 +1,12 @@
 // IMPORTANT: This file must have no imports before useAzureMonitor() is called.
 // It is loaded via node --require before the application entrypoints.
-import { useAzureMonitor } from '@azure/monitor-opentelemetry';
+import { useAzureMonitor } from './azure-monitor';
 
 const connectionString = process.env.APPLICATIONINSIGHTS_CONNECTION_STRING;
 
 if (connectionString) {
   useAzureMonitor({
     azureMonitorExporterOptions: { connectionString },
-    enableLiveMetrics: true,
     instrumentationOptions: {
       http: { enabled: true },
       azureSdk: { enabled: true },

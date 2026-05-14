@@ -1,14 +1,3 @@
-declare module '@azure/monitor-opentelemetry' {
-  export interface AzureMonitorOpenTelemetryOptions {
-    azureMonitorExporterOptions?: { connectionString?: string };
-    enableLiveMetrics?: boolean;
-    instrumentationOptions?: Record<string, { enabled: boolean }>;
-  }
-
-  export function useAzureMonitor(options?: AzureMonitorOpenTelemetryOptions): void;
-  export function shutdownAzureMonitor(): Promise<void>;
-}
-
 declare module '@opentelemetry/api' {
   export interface Span {
     setAttribute(key: string, value: string | number | boolean): void;

@@ -7,7 +7,7 @@ import { query } from '../db/client';
 import { requireVaultAuth } from '../middleware/auth';
 import { decryptForVault, encryptForVault, encryptSubjectForVault, isVaultEncryptionActive } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
-import { canCreateMemory, incrementUsage } from '../services/usage';
+import { enforceMemoryCreationLimit } from '../services/usage';
 
 const listQuerySchema = z.object({
   archived: z.enum(['true', 'false']).optional().default('false'),
@@ -110,10 +110,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
 
   app.post('/v1/memories', { preHandler: requireVaultAuth }, async (request, reply) => {
     const body = createMemorySchema.parse(request.body);
-    const canWrite = await canCreateMemory(request.vault.id);
-    if (!canWrite) {
-      return reply.code(429).send({ error: 'memories_max quota exceeded' });
-    }
+    await enforceMemoryCreationLimit(request.vault.id);
 
     const embedder = getEmbedder();
     const embedding = await embedder.embed(body.data);
@@ -165,8 +162,6 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
        DO UPDATE SET embedding = EXCLUDED.embedding, embedded_at = now()`,
       [result.rows[0].id, JSON.stringify(embedding)]
     );
-
-    await incrementUsage(request.vault.id, 'memory_adds');
 
     return reply.code(201).send(await decryptMemoryRow(request.vault, result.rows[0]));
   });

@@ -25,6 +25,10 @@ export const extractionLagHistogram = meter.createHistogram('persistio.extractio
   unit: 'ms'
 });
 
+export const extractionCandidatesCounter = meter.createCounter('persistio.extraction.candidates.total', {
+  description: 'Memory candidates accepted or dropped during extraction'
+});
+
 export const embeddingDurationHistogram = meter.createHistogram('persistio.embedding.duration', {
   description: 'Embedding call latency',
   unit: 'ms'

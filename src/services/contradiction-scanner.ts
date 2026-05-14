@@ -93,7 +93,7 @@ export async function scanForContradictions(
       }
 
       seenPairs.add(pairKey);
-      const decision = await extractor.arbitrateConflict(candidateFact, currentFact);
+      const decision = await extractor.arbitrateConflict(candidateFact, currentFact, vaultId);
       const safeDecision: ConflictDecision = VALID_DECISIONS.includes(decision) ? decision : 'needs_review';
       await withTransaction(async (client) => {
         await applyDecision(client, vaultId, current.memory_id, candidate.memory_id, safeDecision);

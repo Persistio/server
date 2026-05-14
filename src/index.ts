@@ -3,8 +3,8 @@ import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 
 import Fastify from 'fastify';
-import { shutdownAzureMonitor } from '@azure/monitor-opentelemetry';
 
+import { shutdownAzureMonitor } from './azure-monitor';
 import { getConfig } from './config';
 import { closePool, runMigrations } from './db/client';
 import { httpRequestDurationHistogram } from './metrics';
@@ -17,6 +17,7 @@ import { registerMemoryRoutes } from './routes/memories';
 import { registerRecallRoutes } from './routes/recall';
 import { registerStatsRoutes } from './routes/stats';
 import { initCryptoClient } from './services/crypto';
+import { QuotaExceededError, applyRateLimitHeaders } from './services/usage';
 import { getSpanAttributes } from './telemetry';
 
 class InMemoryJobStore implements JobStore {
@@ -86,6 +87,16 @@ async function main() {
       route,
       status_code: String(reply.statusCode)
     });
+  });
+
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof QuotaExceededError) {
+      applyRateLimitHeaders(reply, error.headers);
+      reply.code(error.statusCode).send({ error: error.message });
+      return;
+    }
+
+    reply.send(error);
   });
 
   const jobs = new InMemoryJobStore();
