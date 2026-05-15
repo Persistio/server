@@ -5,8 +5,14 @@ import { query, withTransaction } from '../db/client';
 export type UsageField = 'ingest_events' | 'memory_adds' | 'searches';
 
 type PlanId = 'free' | 'starter' | 'pro';
-type LimitConfig = Partial<Record<UsageFieldLimitKey | GeminiLimitKey | 'memories_max', number>>;
-type GeminiLimitKey = 'gemini_rpm' | 'gemini_tpm';
+export type AiBudgetRole = 'extraction' | 'escalation' | 'curation';
+type AiLimitKey =
+  | 'ai_requests_per_minute'
+  | 'ai_tokens_per_minute'
+  | 'ai_extraction_weight'
+  | 'ai_escalation_weight'
+  | 'ai_curation_weight';
+type LimitConfig = Partial<Record<UsageFieldLimitKey | AiLimitKey | 'memories_max', number>>;
 type UsageFieldLimitKey = 'ingest_events_per_month' | 'memory_adds_per_month' | 'searches_per_month';
 
 interface VaultLimitRow {
@@ -61,18 +67,50 @@ const fieldColumn: Record<UsageField, string> = {
 };
 const allowedUsageFields: UsageField[] = ['ingest_events', 'memory_adds', 'searches'];
 
-const geminiPlanDefaults: Record<PlanId, Required<Pick<LimitConfig, GeminiLimitKey>>> = {
-  free: { gemini_rpm: 10, gemini_tpm: 50_000 },
-  starter: { gemini_rpm: 50, gemini_tpm: 250_000 },
-  pro: { gemini_rpm: 100, gemini_tpm: 500_000 }
+const aiPlanDefaults: Record<PlanId, Required<Pick<LimitConfig, AiLimitKey>>> = {
+  free: {
+    ai_requests_per_minute: 10,
+    ai_tokens_per_minute: 50_000,
+    ai_extraction_weight: 1,
+    ai_escalation_weight: 2,
+    ai_curation_weight: 4
+  },
+  starter: {
+    ai_requests_per_minute: 50,
+    ai_tokens_per_minute: 250_000,
+    ai_extraction_weight: 1,
+    ai_escalation_weight: 2,
+    ai_curation_weight: 4
+  },
+  pro: {
+    ai_requests_per_minute: 100,
+    ai_tokens_per_minute: 500_000,
+    ai_extraction_weight: 1,
+    ai_escalation_weight: 2,
+    ai_curation_weight: 4
+  }
 };
 
 // TODO: These buckets are in-process only. They reset on restart and do not coordinate across
 // replicas, so precise enforcement at scale requires Redis or shared database-backed state.
-const geminiRequestBuckets = new Map<string, BucketState>();
+const aiRequestBuckets = new Map<string, BucketState>();
 // TODO: These buckets are in-process only. They reset on restart and do not coordinate across
 // replicas, so precise enforcement at scale requires Redis or shared database-backed state.
-const geminiTokenBuckets = new Map<string, BucketState>();
+const aiTokenBuckets = new Map<string, BucketState>();
+
+export class AiBudgetDeferredError extends Error {
+  readonly availableAt: Date;
+  readonly role: AiBudgetRole;
+  readonly waitMs: number;
+
+  constructor(role: AiBudgetRole, availableAt: Date, waitMs: number) {
+    super(`AI budget deferred for ${role} until ${availableAt.toISOString()}`);
+    this.name = 'AiBudgetDeferredError';
+    this.availableAt = availableAt;
+    this.role = role;
+    this.waitMs = waitMs;
+  }
+}
 
 export class QuotaExceededError extends Error {
   readonly headers: RateLimitSnapshot;
@@ -288,49 +326,42 @@ export async function canCreateMemory(vaultId: string): Promise<boolean> {
   return capacity.limit === undefined || capacity.activeMemories < capacity.limit;
 }
 
-export async function consumeGeminiQuota(vaultId: string, estimatedTokens: number): Promise<void> {
+export async function acquireAiBudget(vaultId: string, role: AiBudgetRole, estimatedTokens: number): Promise<void> {
   const limits = await getVaultLimits(vaultId);
-  const requestLimit = limits.gemini_rpm;
-  const tokenLimit = limits.gemini_tpm;
+  const requestLimit = limits.ai_requests_per_minute;
+  const tokenLimit = limits.ai_tokens_per_minute;
+  const weight = getAiRoleWeight(limits, role);
+  const waitMs = Math.max(
+    requestLimit !== undefined
+      ? getTokenBucketWaitMs(aiRequestBuckets, `${vaultId}:${role}:requests`, requestLimit, weight)
+      : 0,
+    tokenLimit !== undefined
+      ? getTokenBucketWaitMs(aiTokenBuckets, `${vaultId}:${role}:tokens`, tokenLimit, Math.max(1, estimatedTokens) * weight)
+      : 0
+  );
 
-  if (requestLimit !== undefined) {
-    assertAndConsumeTokenBucket(
-      geminiRequestBuckets,
-      `${vaultId}:requests`,
-      requestLimit,
-      1,
-      `gemini_rpm quota exceeded for vault ${vaultId}`
-    );
+  if (waitMs > 0) {
+    throw new AiBudgetDeferredError(role, new Date(Date.now() + waitMs), waitMs);
   }
 
-  if (tokenLimit !== undefined) {
-    assertAndConsumeTokenBucket(
-      geminiTokenBuckets,
-      `${vaultId}:tokens`,
-      tokenLimit,
-      Math.max(1, estimatedTokens),
-      `gemini_tpm quota exceeded for vault ${vaultId}`
-    );
-  }
+  if (requestLimit !== undefined) consumeTokenBucket(aiRequestBuckets, `${vaultId}:${role}:requests`, requestLimit, weight);
+  if (tokenLimit !== undefined) consumeTokenBucket(aiTokenBuckets, `${vaultId}:${role}:tokens`, tokenLimit, Math.max(1, estimatedTokens) * weight);
 }
 
-export async function settleGeminiUsage(vaultId: string, estimatedTokens: number, actualTokens: number) {
+export async function settleAiUsage(vaultId: string, role: AiBudgetRole, estimatedTokens: number, actualTokens: number) {
   if (actualTokens <= estimatedTokens) {
     return;
   }
 
   const limits = await getVaultLimits(vaultId);
-  if (limits.gemini_tpm === undefined) {
+  if (limits.ai_tokens_per_minute === undefined) {
     return;
   }
 
-  assertAndConsumeTokenBucket(
-    geminiTokenBuckets,
-    `${vaultId}:tokens`,
-    limits.gemini_tpm,
-    actualTokens - estimatedTokens,
-    `gemini_tpm quota exceeded for vault ${vaultId}`
-  );
+  const weight = getAiRoleWeight(limits, role);
+  // Settlement may push the bucket negative when actual usage exceeds the estimate.
+  // That is intentional debt: later work waits for refill rather than erasing overage.
+  consumeTokenBucket(aiTokenBuckets, `${vaultId}:${role}:tokens`, limits.ai_tokens_per_minute, (actualTokens - estimatedTokens) * weight);
 }
 
 async function getMemoryCapacity(vaultId: string): Promise<{ activeMemories: number; limit: number | undefined }> {
@@ -374,7 +405,7 @@ async function getVaultLimits(vaultId: string): Promise<LimitConfig> {
   }
 
   const row = result.rows[0];
-  const planDefaults = geminiPlanDefaults[(row.plan_id as PlanId)] ?? geminiPlanDefaults.free;
+  const planDefaults = aiPlanDefaults[(row.plan_id as PlanId)] ?? aiPlanDefaults.free;
   return {
     ...planDefaults,
     ...(row.limits ?? {}),
@@ -382,14 +413,24 @@ async function getVaultLimits(vaultId: string): Promise<LimitConfig> {
   };
 }
 
-function assertAndConsumeTokenBucket(
+function getAiRoleWeight(limits: LimitConfig, role: AiBudgetRole): number {
+  const key: Record<AiBudgetRole, AiLimitKey> = {
+    extraction: 'ai_extraction_weight',
+    escalation: 'ai_escalation_weight',
+    curation: 'ai_curation_weight'
+  };
+  return Math.max(1, limits[key[role]] ?? 1);
+}
+
+function getTokenBucketWaitMs(
   buckets: Map<string, BucketState>,
   key: string,
   limit: number,
-  cost: number,
-  message: string
-) {
+  cost: number
+): number {
   const now = Date.now();
+  // Persisting the refilled snapshot during the eligibility check is intentional:
+  // deferral scheduling and the later consume path must observe the same bucket timeline.
   const state = refillBucket(
     buckets.get(key) ?? {
       capacity: limit,
@@ -401,18 +442,24 @@ function assertAndConsumeTokenBucket(
     now
   );
 
-  if (state.tokens < cost) {
-    const deficit = cost - state.tokens;
-    const retryAfterSeconds = Math.max(1, Math.ceil(deficit / state.refillPerMs / 1000));
-    buckets.set(key, state);
-    throw new QuotaExceededError(message, {
-      limit,
-      remaining: Math.max(0, Math.floor(state.tokens)),
-      resetAtEpochSeconds: Math.floor((now + deficit / state.refillPerMs) / 1000),
-      retryAfterSeconds
-    });
-  }
+  buckets.set(key, state);
+  if (state.tokens >= cost) return 0;
+  const deficit = cost - state.tokens;
+  return Math.max(1, Math.ceil(deficit / state.refillPerMs));
+}
 
+function consumeTokenBucket(buckets: Map<string, BucketState>, key: string, limit: number, cost: number) {
+  const now = Date.now();
+  const state = refillBucket(
+    buckets.get(key) ?? {
+      capacity: limit,
+      lastRefillMs: now,
+      refillPerMs: limit / 60_000,
+      tokens: limit
+    },
+    limit,
+    now
+  );
   state.tokens -= cost;
   buckets.set(key, state);
 }
@@ -433,14 +480,14 @@ function getNextUsageResetEpochSeconds(now = new Date()): number {
 }
 
 export const usageTestInternals = {
-  assertAndConsumeTokenBucket,
-  clearGeminiBuckets() {
-    geminiRequestBuckets.clear();
-    geminiTokenBuckets.clear();
+  clearAiBuckets() {
+    aiRequestBuckets.clear();
+    aiTokenBuckets.clear();
   },
-  getGeminiBucketTokens(kind: 'requests' | 'tokens', vaultId: string) {
-    const bucket = (kind === 'requests' ? geminiRequestBuckets : geminiTokenBuckets).get(`${vaultId}:${kind}`);
+  getAiBucketTokens(kind: 'requests' | 'tokens', vaultId: string, role: AiBudgetRole) {
+    const bucket = (kind === 'requests' ? aiRequestBuckets : aiTokenBuckets).get(`${vaultId}:${role}:${kind}`);
     return bucket?.tokens ?? null;
   },
+  getTokenBucketWaitMs,
   refillBucket
 };

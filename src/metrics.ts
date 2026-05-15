@@ -29,6 +29,15 @@ export const extractionCandidatesCounter = meter.createCounter('persistio.extrac
   description: 'Memory candidates accepted or dropped during extraction'
 });
 
+export const aiBudgetWaitHistogram = meter.createHistogram('persistio.ai_budget.wait_ms', {
+  description: 'Time background AI work waits for vault-local AI budget',
+  unit: 'ms'
+});
+
+export const aiBudgetThrottledJobsCounter = meter.createCounter('persistio.ai_budget.throttled_jobs.total', {
+  description: 'Background jobs deferred because vault-local AI budget was unavailable'
+});
+
 export const embeddingDurationHistogram = meter.createHistogram('persistio.embedding.duration', {
   description: 'Embedding call latency',
   unit: 'ms'
@@ -45,6 +54,21 @@ meter.createObservableGauge('persistio.extraction_queue_depth', {
     'SELECT COUNT(*)::int AS depth FROM extraction_queue WHERE claimed_at IS NULL'
   );
   result.observe(rows[0]?.depth ?? 0);
+});
+
+meter.createObservableGauge('persistio.ai_budget.waiting_jobs', {
+  description: 'Queued jobs deferred until local AI budget becomes available'
+}).addCallback(async (result: ObservableResultLike) => {
+  const { rows } = await query<{ queue: string; depth: number }>(
+    `SELECT 'extraction' AS queue, COUNT(*)::int AS depth
+     FROM extraction_queue
+     WHERE claimed_at IS NULL AND available_at > now()
+     UNION ALL
+     SELECT 'curation' AS queue, COUNT(*)::int AS depth
+     FROM curation_queue
+     WHERE claimed_at IS NULL AND available_at > now()`
+  );
+  for (const row of rows) result.observe(row.depth, { queue: row.queue });
 });
 
 memoriesTotalGauge.addCallback(async (observableResult: ObservableResultLike) => {

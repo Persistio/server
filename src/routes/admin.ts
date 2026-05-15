@@ -14,8 +14,9 @@ const createVaultSchema = z.object({
 
 const updateVaultSchema = z.object({
   name: z.string().min(1).optional(),
-  purpose: z.string().min(1).max(500).nullable().optional()
-}).refine((value) => value.name !== undefined || value.purpose !== undefined, {
+  purpose: z.string().min(1).max(500).nullable().optional(),
+  plan: z.enum(['free', 'starter', 'pro']).optional()
+}).refine((value) => value.name !== undefined || value.purpose !== undefined || value.plan !== undefined, {
   message: 'At least one field must be provided'
 });
 
@@ -73,10 +74,11 @@ export async function registerAdminRoutes(app: FastifyInstance) {
            purpose = CASE
              WHEN $3::boolean THEN $4
              ELSE purpose
-           END
+           END,
+           plan_id = COALESCE($5, plan_id)
        WHERE id = $1
        RETURNING id, name, purpose, created_at, settings, plan_id, account_id, vault_encryption_enabled`,
-      [id, body.name ?? null, body.purpose !== undefined, body.purpose ?? null]
+      [id, body.name ?? null, body.purpose !== undefined, body.purpose ?? null, body.plan ?? null]
     );
 
     if (!result.rowCount) {

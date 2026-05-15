@@ -9,14 +9,14 @@ vi.mock('../../db/client', () => ({
   withTransaction: async (callback: (client: { query: typeof queryMock }) => Promise<unknown>) => callback({ query: queryMock })
 }));
 
-import { QuotaExceededError, consumeApiQuota, consumeGeminiQuota, settleGeminiUsage, usageTestInternals } from '../usage';
+import { AiBudgetDeferredError, QuotaExceededError, acquireAiBudget, consumeApiQuota, settleAiUsage, usageTestInternals } from '../usage';
 
 describe('usage service', () => {
   const currentPeriod = new Date().toISOString().slice(0, 7);
 
   beforeEach(() => {
     queryMock.mockReset();
-    usageTestInternals.clearGeminiBuckets();
+    usageTestInternals.clearAiBuckets();
     vi.useRealTimers();
   });
 
@@ -111,7 +111,7 @@ describe('usage service', () => {
       expect(refilled.refillPerMs).toBe(120 / 60_000);
     });
 
-    it('tracks deficit when a consume request exceeds remaining tokens', () => {
+    it('calculates wait time when a token bucket is saturated', () => {
       const buckets = new Map<string, {
         capacity: number;
         lastRefillMs: number;
@@ -121,42 +121,72 @@ describe('usage service', () => {
 
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
-      usageTestInternals.assertAndConsumeTokenBucket(buckets, 'vault-1:tokens', 100, 80, 'quota exceeded');
+      expect(usageTestInternals.getTokenBucketWaitMs(buckets, 'vault-1:tokens', 100, 80)).toBe(0);
+      buckets.set('vault-1:tokens', { capacity: 100, lastRefillMs: Date.now(), refillPerMs: 100 / 60_000, tokens: 20 });
       expect(buckets.get('vault-1:tokens')?.tokens).toBe(20);
-
-      try {
-        usageTestInternals.assertAndConsumeTokenBucket(buckets, 'vault-1:tokens', 100, 30, 'quota exceeded');
-        throw new Error('expected quota exceeded');
-      } catch (error) {
-        expect(error).toBeInstanceOf(QuotaExceededError);
-        expect((error as QuotaExceededError).headers).toMatchObject({
-          limit: 100,
-          remaining: 20,
-          retryAfterSeconds: 6
-        });
-      }
+      expect(usageTestInternals.getTokenBucketWaitMs(buckets, 'vault-1:tokens', 100, 30)).toBe(6000);
     });
 
-    it('charges additional token overage during settlement', async () => {
+    it('defers instead of throwing a quota error when local AI budget is saturated', async () => {
       queryMock.mockResolvedValue({
         rowCount: 1,
         rows: [{
           plan_id: 'free',
           limits: null,
           rate_limit_override: {
-            gemini_tpm: 100
+            ai_tokens_per_minute: 100
           }
         }]
       });
 
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
-      await consumeGeminiQuota('vault-1', 60);
-      expect(usageTestInternals.getGeminiBucketTokens('tokens', 'vault-1')).toBe(40);
+      await acquireAiBudget('vault-1', 'extraction', 80);
+      await expect(acquireAiBudget('vault-1', 'extraction', 30)).rejects.toBeInstanceOf(AiBudgetDeferredError);
+    });
 
-      await settleGeminiUsage('vault-1', 60, 90);
-      expect(usageTestInternals.getGeminiBucketTokens('tokens', 'vault-1')).toBe(10);
-      expect(queryMock).toHaveBeenCalledTimes(2);
+    it('keeps vault buckets independent for fair per-vault throttling', async () => {
+      queryMock.mockResolvedValue({
+        rowCount: 1,
+        rows: [{
+          plan_id: 'free',
+          limits: null,
+          rate_limit_override: { ai_tokens_per_minute: 100 }
+        }]
+      });
+
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
+      await acquireAiBudget('vault-1', 'extraction', 90);
+      await acquireAiBudget('vault-2', 'extraction', 90);
+
+      expect(usageTestInternals.getAiBucketTokens('tokens', 'vault-1', 'extraction')).toBe(10);
+      expect(usageTestInternals.getAiBucketTokens('tokens', 'vault-2', 'extraction')).toBe(10);
+    });
+
+    it('keeps role buckets separate and charges weighted token overage during settlement', async () => {
+      queryMock.mockResolvedValue({
+        rowCount: 1,
+        rows: [{
+          plan_id: 'free',
+          limits: null,
+          rate_limit_override: {
+            ai_tokens_per_minute: 100,
+            ai_escalation_weight: 2
+          }
+        }]
+      });
+
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
+      await acquireAiBudget('vault-1', 'extraction', 60);
+      await acquireAiBudget('vault-1', 'escalation', 30);
+      expect(usageTestInternals.getAiBucketTokens('tokens', 'vault-1', 'extraction')).toBe(40);
+      expect(usageTestInternals.getAiBucketTokens('tokens', 'vault-1', 'escalation')).toBe(40);
+
+      await settleAiUsage('vault-1', 'escalation', 30, 45);
+      expect(usageTestInternals.getAiBucketTokens('tokens', 'vault-1', 'escalation')).toBe(10);
+      expect(queryMock).toHaveBeenCalledTimes(3);
     });
   });
 });

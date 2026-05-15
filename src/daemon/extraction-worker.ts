@@ -4,7 +4,7 @@ import pLimit from 'p-limit';
 
 import { getConfig } from '../config';
 import { closePool, query, withTransaction } from '../db/client';
-import { extractionCandidatesCounter, extractionJobsCounter, extractionLagHistogram } from '../metrics';
+import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram, extractionCandidatesCounter, extractionJobsCounter, extractionLagHistogram } from '../metrics';
 import { CircuitBreakerOpenError, isRateLimitError } from '../services/ai-resilience';
 import { scanForContradictions } from '../services/contradiction-scanner';
 import { decryptForVault, encryptForVault, initCryptoClient } from '../services/crypto';
@@ -15,6 +15,7 @@ import { normaliseSubject } from '../services/entity-resolver';
 import { ExtractorService } from '../services/extractor';
 import type { ConflictResolution } from '../services/extractor';
 import { archiveStaleMemories } from '../services/staleness';
+import { AiBudgetDeferredError } from '../services/usage';
 import {
   getVaultSubjectList,
   resolveSubjectTier1,
@@ -130,6 +131,7 @@ async function processBatch(vaultId?: string) {
          SELECT eq.id AS queue_id, eq.chunk_id, eq.segment_id, eq.vault_id, eq.retry_count
          FROM extraction_queue eq
          WHERE eq.claimed_at IS NULL
+           AND eq.available_at <= now()
            ${vaultClause}
          ORDER BY eq.enqueued_at ASC
          LIMIT $${vaultId ? 2 : 1}
@@ -445,6 +447,20 @@ async function processBatch(vaultId?: string) {
           await completeExtractionJob(job);
           });
         } catch (error) {
+          if (error instanceof AiBudgetDeferredError) {
+            aiBudgetWaitHistogram.record(error.waitMs, { role: error.role, queue: 'extraction', vault_id: queuedJob.vault_id });
+            aiBudgetThrottledJobsCounter.add(1, { role: error.role, queue: 'extraction', vault_id: queuedJob.vault_id });
+            console.info(JSON.stringify({
+              level: 30,
+              msg: 'deferring extraction job for ai budget',
+              queue_id: queuedJob.queue_id,
+              role: error.role,
+              available_at: error.availableAt.toISOString(),
+              wait_ms: error.waitMs
+            }));
+            await deferQueuedJob(queuedJob.queue_id, error);
+            return;
+          }
           if (error instanceof CircuitBreakerOpenError) {
             console.warn(JSON.stringify({
               level: 40,
@@ -582,6 +598,18 @@ async function releaseQueuedJob(queueId: string, lastError: string) {
          claimed_by = NULL
      WHERE id = $1`,
     [queueId, lastError]
+  );
+}
+
+async function deferQueuedJob(queueId: string, error: AiBudgetDeferredError) {
+  await query(
+    `UPDATE extraction_queue
+     SET available_at = $2,
+         last_error = $3,
+         claimed_at = NULL,
+         claimed_by = NULL
+     WHERE id = $1`,
+    [queueId, error.availableAt.toISOString(), error.message]
   );
 }
 

@@ -9,7 +9,12 @@ vi.mock('openai', () => ({
   default: openAiMock
 }));
 
-import { ExtractorService, resolveExtractorRoleConfig, shouldApplyGeminiQuota } from '../extractor';
+vi.mock('../usage', () => ({
+  acquireAiBudget: vi.fn(),
+  settleAiUsage: vi.fn()
+}));
+
+import { ExtractorService, resolveExtractorRoleConfig } from '../extractor';
 
 process.env.DATABASE_URL ??= 'postgres://localhost:5432/persistio_test';
 process.env.ADMIN_API_KEY ??= 'test-admin-key';
@@ -152,14 +157,12 @@ describe('resolveExtractorRoleConfig', () => {
       extraction: {
         baseURL: 'https://legacy.example/v1',
         apiKey: 'legacy-key',
-        model: 'legacy-model',
-        usesGeminiQuota: false
+        model: 'legacy-model'
       },
       escalation: {
         baseURL: 'https://legacy.example/v1',
         apiKey: 'legacy-key',
-        model: 'legacy-model',
-        usesGeminiQuota: false
+        model: 'legacy-model'
       }
     });
   });
@@ -177,14 +180,12 @@ describe('resolveExtractorRoleConfig', () => {
       extraction: {
         baseURL: 'https://flash.example/v1',
         apiKey: 'flash-key',
-        model: 'gemini-2.5-flash',
-        usesGeminiQuota: true
+        model: 'gemini-2.5-flash'
       },
       escalation: {
         baseURL: 'https://sonnet.example/v1',
         apiKey: 'sonnet-key',
-        model: 'claude-sonnet-4-5',
-        usesGeminiQuota: false
+        model: 'claude-sonnet-4-5'
       }
     });
   });
@@ -197,43 +198,13 @@ describe('resolveExtractorRoleConfig', () => {
       extraction: {
         baseURL: 'https://legacy.example/v1',
         apiKey: 'legacy-key',
-        model: 'gemini-2.5-flash',
-        usesGeminiQuota: true
+        model: 'gemini-2.5-flash'
       },
       escalation: {
         baseURL: 'https://legacy.example/v1',
         apiKey: 'legacy-key',
-        model: 'legacy-model',
-        usesGeminiQuota: false
+        model: 'legacy-model'
       }
     });
-  });
-});
-
-describe('shouldApplyGeminiQuota', () => {
-  it('applies Gemini quota for Gemini models or Google AI endpoints', () => {
-    expect(shouldApplyGeminiQuota({
-      baseURL: 'https://api.openai.com/v1',
-      model: 'gemini-2.5-flash'
-    })).toBe(true);
-    expect(shouldApplyGeminiQuota({
-      baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
-      model: 'custom-model'
-    })).toBe(true);
-    expect(shouldApplyGeminiQuota({
-      baseURL: 'https://us-central1-aiplatform.googleapis.com/v1/projects/example/locations/us-central1/endpoints/openapi',
-      model: 'custom-model'
-    })).toBe(true);
-  });
-
-  it('does not apply Gemini quota to non-Gemini escalation providers', () => {
-    expect(shouldApplyGeminiQuota({
-      baseURL: 'https://api.anthropic.com/v1',
-      model: 'claude-sonnet-4-5'
-    })).toBe(false);
-    expect(shouldApplyGeminiQuota({
-      baseURL: 'https://api.openai.com/v1',
-      model: 'gpt-4o-mini'
-    })).toBe(false);
   });
 });

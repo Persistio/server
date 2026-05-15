@@ -16,6 +16,8 @@ import {
 import { getEmbedder } from '../services/embedder';
 import { CuratorService, type CuratorAliasMaps, type CuratorMemory, type CuratorResult, type EdgeType, type MemoryType } from '../services/curator';
 import { getSpanAttributes } from '../telemetry';
+import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram } from '../metrics';
+import { AiBudgetDeferredError } from '../services/usage';
 
 interface CurationQueueRow {
   queue_id: string;
@@ -77,6 +79,7 @@ async function processBatch() {
        SELECT cq.id AS queue_id, cq.vault_id, cq.segment_id
        FROM curation_queue cq
        WHERE cq.claimed_at IS NULL
+         AND cq.available_at <= now()
        ORDER BY cq.enqueued_at ASC
        LIMIT $1
        FOR UPDATE SKIP LOCKED
@@ -134,6 +137,28 @@ async function processBatch() {
       await applyActions(job, result, aliasMaps, rawResponse);
       await query(`DELETE FROM curation_queue WHERE id = $1`, [job.queueId]);
     } catch (error) {
+      if (error instanceof AiBudgetDeferredError) {
+        aiBudgetWaitHistogram.record(error.waitMs, { role: error.role, queue: 'curation', vault_id: row.vault_id });
+        aiBudgetThrottledJobsCounter.add(1, { role: error.role, queue: 'curation', vault_id: row.vault_id });
+        console.info(JSON.stringify({
+          level: 30,
+          msg: 'deferring curation job for ai budget',
+          queue_id: row.queue_id,
+          role: error.role,
+          available_at: error.availableAt.toISOString(),
+          wait_ms: error.waitMs
+        }));
+        await query(
+          `UPDATE curation_queue
+           SET available_at = $2,
+               last_error = $3,
+               claimed_at = NULL,
+               claimed_by = NULL
+           WHERE id = $1`,
+          [row.queue_id, error.availableAt.toISOString(), error.message]
+        );
+        continue;
+      }
       if (error instanceof CircuitBreakerOpenError) {
         console.warn(JSON.stringify({
           level: 40,

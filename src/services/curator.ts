@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 import { getConfig } from '../config';
 import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
 import { PromptLoader } from './prompt-loader';
-import { consumeGeminiQuota, settleGeminiUsage } from './usage';
+import { acquireAiBudget, settleAiUsage } from './usage';
 import { sanitizePromptData, scrubMemoryForCurator } from '../utils/sanitize';
 
 export type MemoryType = 'user_preference' | 'user_rule' | 'task_pattern' | 'workflow' | 'project' | 'constraint' | 'decision' | 'system_fact' | 'domain_knowledge';
@@ -222,17 +222,17 @@ export class CuratorService {
         // TODO: This reserves request/token quota before the API call. If the call later fails
         // with a retriable non-auth, non-rate-limit error, there is no refund path yet. Fixing
         // that would require tracking and reconciling pre-call quota reservations.
-        await consumeGeminiQuota(vaultId, estimatedTokens);
+        await acquireAiBudget(vaultId, 'curation', estimatedTokens);
       }
 
       const response = await this.client.chat.completions.create(input);
       if (vaultId && response.usage?.total_tokens) {
         try {
-          await settleGeminiUsage(vaultId, estimatedTokens, response.usage.total_tokens);
+          await settleAiUsage(vaultId, 'curation', estimatedTokens, response.usage.total_tokens);
         } catch (error) {
           console.warn(JSON.stringify({
             level: 40,
-            msg: 'settle_gemini_usage_overage',
+            msg: 'settle_ai_usage_overage',
             service: 'curator',
             vaultId,
             error: error instanceof Error ? error.message : String(error)

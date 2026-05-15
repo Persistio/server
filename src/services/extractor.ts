@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 import { getConfig, type AppConfig } from '../config';
 import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
 import { PromptLoader } from './prompt-loader';
-import { consumeGeminiQuota, settleGeminiUsage } from './usage';
+import { acquireAiBudget, settleAiUsage } from './usage';
 import { sanitizePromptData } from '../utils/sanitize';
 
 export interface ExtractedFact {
@@ -71,7 +71,6 @@ type ModelRole = 'extraction' | 'escalation';
 interface RoleClient {
   client: OpenAI;
   model: string;
-  usesGeminiQuota: boolean;
 }
 
 type ExtractorRoleConfigKeys =
@@ -90,13 +89,11 @@ export interface ResolvedExtractorRoleConfig {
     baseURL: string;
     apiKey: string;
     model: string;
-    usesGeminiQuota: boolean;
   };
   escalation: {
     baseURL: string;
     apiKey: string;
     model: string;
-    usesGeminiQuota: boolean;
   };
 }
 
@@ -116,30 +113,9 @@ export function resolveExtractorRoleConfig(
   };
 
   return {
-    extraction: {
-      ...extraction,
-      usesGeminiQuota: shouldApplyGeminiQuota(extraction)
-    },
-    escalation: {
-      ...escalation,
-      usesGeminiQuota: shouldApplyGeminiQuota(escalation)
-    }
+    extraction,
+    escalation
   };
-}
-
-/** @internal */
-export function shouldApplyGeminiQuota(input: { baseURL: string; model: string }): boolean {
-  const model = input.model.toLowerCase();
-  if (model.startsWith('gemini-') || model.includes('/gemini-')) {
-    return true;
-  }
-
-  try {
-    const hostname = new URL(input.baseURL).hostname.toLowerCase();
-    return hostname === 'generativelanguage.googleapis.com' || hostname.endsWith('aiplatform.googleapis.com');
-  } catch {
-    return false;
-  }
 }
 
 const SENSITIVITIES: MemorySensitivity[] = ['low', 'medium', 'high', 'restricted'];
@@ -168,16 +144,14 @@ export class ExtractorService {
           apiKey: roleConfig.extraction.apiKey,
           baseURL: roleConfig.extraction.baseURL
         }),
-        model: roleConfig.extraction.model,
-        usesGeminiQuota: roleConfig.extraction.usesGeminiQuota
+        model: roleConfig.extraction.model
       },
       escalation: {
         client: new OpenAI({
           apiKey: roleConfig.escalation.apiKey,
           baseURL: roleConfig.escalation.baseURL
         }),
-        model: roleConfig.escalation.model,
-        usesGeminiQuota: roleConfig.escalation.usesGeminiQuota
+        model: roleConfig.escalation.model
       }
     };
     this.promptLoader = new PromptLoader({
@@ -504,21 +478,21 @@ export class ExtractorService {
     const estimatedTokens = estimateChatTokens(input.messages);
 
     try {
-      if (vaultId && roleClient.usesGeminiQuota) {
+      if (vaultId) {
         // TODO: This reserves request/token quota before the API call. If the call later fails
         // with a retriable non-auth, non-rate-limit error, there is no refund path yet. Fixing
         // that would require tracking and reconciling pre-call quota reservations.
-        await consumeGeminiQuota(vaultId, estimatedTokens);
+        await acquireAiBudget(vaultId, role, estimatedTokens);
       }
 
       const response = await roleClient.client.chat.completions.create(input);
-      if (vaultId && roleClient.usesGeminiQuota && response.usage?.total_tokens) {
+      if (vaultId && response.usage?.total_tokens) {
         try {
-          await settleGeminiUsage(vaultId, estimatedTokens, response.usage.total_tokens);
+          await settleAiUsage(vaultId, role, estimatedTokens, response.usage.total_tokens);
         } catch (error) {
           console.warn(JSON.stringify({
             level: 40,
-            msg: 'settle_gemini_usage_overage',
+            msg: 'settle_ai_usage_overage',
             service: `extractor.${role}`,
             vaultId,
             error: error instanceof Error ? error.message : String(error)

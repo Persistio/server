@@ -88,7 +88,7 @@ The full OpenAPI description is in [`openapi.yaml`](https://github.com/chriscove
 
 When switching a role to a different provider, set that role's `*_BASE_URL`, `*_API_KEY`, and `*_MODEL` together. Per-field fallback is supported for compatibility, but mixed provider settings are easy to misconfigure.
 
-Vault `gemini_rpm` / `gemini_tpm` limits apply only to extractor roles resolved to Gemini models or Google AI endpoints. Mixed setups such as Gemini extraction plus non-Gemini escalation debit Gemini quota for extraction only. Extractor circuit-breaker logs now use role-specific service names: `extractor.extraction` and `extractor.escalation`.
+Vault AI throughput is provider-neutral. Plans define `ai_requests_per_minute` and `ai_tokens_per_minute`, with per-role weights for extraction, escalation, and curation; each role uses its own per-vault in-process bucket. Background jobs that exhaust local AI budget are deferred in the queue rather than failed. Extractor circuit-breaker logs use role-specific service names: `extractor.extraction` and `extractor.escalation`.
 
 ## TLS / HTTPS
 
