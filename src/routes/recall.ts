@@ -13,7 +13,9 @@ import { withSpan } from '../telemetry';
 const recallSchema = z.object({
   query: z.string().min(1),
   top_k: z.number().int().positive().max(100).optional(),
-  include_raw: z.boolean().optional().default(false)
+  include_raw: z.boolean().optional().default(false),
+  include_evidence: z.boolean().optional().default(false),
+  mode: z.enum(['agent', 'factual']).optional().default('agent')
 });
 
 const recallQuerySchema = z.object({
@@ -45,6 +47,8 @@ interface RecallMemoryRow {
 }
 
 type RecallMemory = RecallMemoryRow;
+type RecallMode = 'agent' | 'factual';
+const MAX_EVIDENCE_CHUNKS = 200;
 
 interface RecallRawChunk {
   id: string;
@@ -55,8 +59,18 @@ interface RecallRawChunk {
   created_at: string;
 }
 
+interface RecallEvidenceChunk {
+  memory_id: string;
+  id: string;
+  session_id: string;
+  role: string;
+  content: string;
+  created_at: string;
+}
+
 interface RecallResponse {
   memories: RecallMemory[];
+  evidence_chunks: RecallEvidenceChunk[];
   raw_chunks: RecallRawChunk[];
 }
 
@@ -128,6 +142,25 @@ function compareRecallRows(left: RecallMemoryRow, right: RecallMemoryRow): numbe
   return Number(right.salience) - Number(left.salience) || right.similarity - left.similarity;
 }
 
+export function composeRecallRows(
+  rows: RecallMemoryRow[],
+  topK: number,
+  mode: RecallMode
+): RecallMemoryRow[] {
+  const behavioralRows = rows.filter((row) => row.source === 'behavioral');
+  const nonBehavioralRows = rows.filter((row) => row.source !== 'behavioral');
+
+  if (mode === 'factual') {
+    return nonBehavioralRows.slice(0, topK);
+  }
+
+  const injectedBehavioralRows = behavioralRows.slice(0, Math.min(5, topK));
+  return [
+    ...injectedBehavioralRows,
+    ...nonBehavioralRows.slice(0, Math.max(topK - injectedBehavioralRows.length, 0))
+  ];
+}
+
 function buildRecallBundle(memories: RecallMemory[]): RecallBundleResponse {
   const grouped = memories.reduce<Record<RecallBundleKey, RecallMemory[]>>((bundle, memory) => {
     const key = getBundleKey(memory.type);
@@ -168,14 +201,17 @@ export async function registerRecallRoutes(app: FastifyInstance) {
     return withSpan('recall.request', {
       'vault.id': request.vault.id,
       'recall.include_raw': body.include_raw,
-      'recall.top_k': topK
+      'recall.include_evidence': body.include_evidence,
+      'recall.top_k': topK,
+      'recall.mode': body.mode
     }, async (span) => {
       const start = performance.now();
       const embedder = getEmbedder();
       const embedding = await embedder.embed(body.query);
 
-      // Behavioral memories are always injected as top-5 context regardless of query so agent behavior
-      // rules and preferences are never missed by semantic matching alone.
+      // Agent-mode recall preserves the historical top-5 behavioral injection for
+      // personalization use cases. Factual recall keeps the full top_k budget for
+      // answer-bearing semantic/graph context instead.
       const behavioralResult = await query<RecallMemoryRow>(
         `SELECT id, data, subject, categories, confidence, score, salience, sensitivity, type, scope, polarity,
                 status, valid_from, valid_until, created_at, updated_at, recall_count, last_recalled,
@@ -228,11 +264,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
 
       const uniqueRows = [...behavioralResult.rows, ...semanticResult.rows, ...neighborResult.rows]
         .filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
-      const behavioralRows = uniqueRows.filter((row) => row.source === 'behavioral');
-      const nonBehavioralRows = uniqueRows
-        .filter((row) => row.source !== 'behavioral')
-        .slice(0, Math.max(topK - behavioralRows.length, 0));
-      const combinedRows = [...behavioralRows, ...nonBehavioralRows];
+      const combinedRows = composeRecallRows(uniqueRows, topK, body.mode);
 
       if (combinedRows.length) {
         await query(
@@ -242,6 +274,35 @@ export async function registerRecallRoutes(app: FastifyInstance) {
            WHERE id = ANY($1::uuid[])`,
           [combinedRows.map((row) => row.id)]
         );
+      }
+
+      let evidenceChunks: RecallEvidenceChunk[] = [];
+      if (body.include_evidence && qs.format !== 'bundle' && combinedRows.length) {
+        const evidenceResult = await query<RecallEvidenceChunk>(
+          `WITH evidence_sources AS (
+             SELECT m.id AS memory_id, unnest(m.source_chunks) AS chunk_id
+             FROM memories m
+             WHERE m.id = ANY($1::uuid[])
+             UNION
+             SELECT m.id AS memory_id, unnest(s.chunk_ids) AS chunk_id
+             FROM memories m
+             JOIN segments s ON s.id = m.source_segment_id
+             WHERE m.id = ANY($1::uuid[])
+           ), ranked_chunks AS (
+             SELECT es.memory_id, rc.id, rc.session_id, rc.role, rc.content, rc.created_at,
+                    ROW_NUMBER() OVER (PARTITION BY es.memory_id ORDER BY rc.created_at, rc.id) AS rank
+             FROM evidence_sources es
+             JOIN raw_chunks rc ON rc.id = es.chunk_id
+             WHERE rc.vault_id = $2
+           )
+           SELECT memory_id, id, session_id, role, content, created_at
+           FROM ranked_chunks
+           WHERE rank <= 6
+           ORDER BY memory_id, created_at, id
+           LIMIT $3`,
+          [combinedRows.map((row) => row.id), request.vault.id, MAX_EVIDENCE_CHUNKS]
+        );
+        evidenceChunks = evidenceResult.rows;
       }
 
       let rawChunks: RecallRawChunk[] = [];
@@ -264,6 +325,10 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         ...row,
         data: await decryptForVault(request.vault, row.data)
       })));
+      const decryptedEvidenceChunks = await Promise.all(evidenceChunks.map(async (row) => ({
+        ...row,
+        content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
+      })));
       const decryptedRawChunks = await Promise.all(rawChunks.map(async (row) => ({
         ...row,
         content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
@@ -275,6 +340,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         include_raw: String(body.include_raw)
       });
       span.setAttribute('recall.results_returned', combinedRows.length);
+      span.setAttribute('recall.evidence_results_returned', evidenceChunks.length);
       span.setAttribute('recall.raw_results_returned', rawChunks.length);
       span.setAttribute('recall.duration_ms', durationMs);
 
@@ -284,6 +350,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
 
       const response: RecallResponse = {
         memories: decryptedMemories,
+        evidence_chunks: decryptedEvidenceChunks,
         raw_chunks: decryptedRawChunks
       };
 

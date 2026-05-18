@@ -44,6 +44,8 @@ Also extract durable non-behavioral memories when clearly useful:
 
 Rules:
 - Write memories as short, definitive statements
+- Use timestamp prefixes on turns to resolve directly supported relative dates such as "yesterday" or "last Friday" into absolute dates
+- Preserve supported durable temporal details in the fact and valid_from / valid_until fields where applicable
 - Subject must be a specific entity, person, project, workflow, or concept
 - Include scope as one of: global, project, task, session
 - Include evidence as a short provenance summary, never raw quoted conversation
@@ -169,7 +171,7 @@ export class ExtractorService {
       messages: [
         {
           role: 'system',
-          content: 'You are a memory conflict resolver. Given two related facts, respond with ONLY one of: SUPERSEDE_OLD (the new fact replaces the old one), NEEDS_REVIEW (both should be kept but the conflict is ambiguous), MERGE (the new fact confirms or strengthens the old one and should be merged into it), DISCARD_NEW (the old fact is still accurate and the new one adds nothing).'
+          content: 'You are a memory conflict resolver. Decide whether a new memory candidate should survive when compared with an existing related memory. Optimize for future recall and action value, not just compression. Respond with ONLY one of: SUPERSEDE_OLD (the new fact replaces or corrects the old one), NEEDS_REVIEW (both may be useful, conflict is ambiguous, or the new fact is a specific answer-bearing detail under a broader existing summary), MERGE (the new fact confirms, strengthens, or usefully specializes the old one and should be represented with it), DISCARD_NEW (the old fact already captures all useful recall value and the new fact adds nothing). Do not discard a specific date, event, relationship, preference, commitment, artifact, or state merely because an existing broader summary is true.'
         },
         {
           role: 'user',
@@ -216,7 +218,7 @@ export class ExtractorService {
       messages: [
         {
           role: 'system',
-          content: 'You are resolving memory conflicts in bulk. For each numbered pair decide: supersede_old (new replaces old), discard_new (old is still correct), merge (new confirms/strengthens old), or needs_review (ambiguous). Respond ONLY with a valid JSON array of decisions in order, e.g. ["supersede_old","discard_new","merge"]. One decision per pair, same count as input pairs.'
+          content: 'You are resolving memory conflicts in bulk. For each numbered pair decide: supersede_old (new replaces or corrects old), discard_new (old already captures all useful recall value), merge (new confirms, strengthens, or usefully specializes old), or needs_review (ambiguous, possible conflict, or both broad summary and specific answer-bearing detail may be useful). Optimize for future recall and action value, not just compression. Do not discard specific dates, events, relationships, preferences, commitments, artifacts, or states merely because an existing broader summary is true. Respond ONLY with a valid JSON array of decisions in order, e.g. ["supersede_old","discard_new","merge"]. One decision per pair, same count as input pairs.'
         },
         { role: 'user', content: prompt }
       ]

@@ -35,8 +35,19 @@ async function requireHealthAuth(request: FastifyRequest, reply: FastifyReply, c
 async function checkDatabase() {
   const startedAt = Date.now();
   const dbCheck = pool.query('SELECT 1');
-  const queueDepthCheck = pool.query<{ depth: number }>(
-    'SELECT COUNT(*)::int AS depth FROM extraction_queue WHERE claimed_at IS NULL'
+  const queueDepthCheck = pool.query<{
+    extraction_depth: number;
+    curation_depth: number;
+    total_depth: number;
+  }>(
+    `SELECT
+       (SELECT COUNT(*) FROM extraction_queue)::int AS extraction_depth,
+       (SELECT COUNT(*) FROM curation_queue)::int AS curation_depth,
+       (
+         (SELECT COUNT(*) FROM extraction_queue)
+         +
+         (SELECT COUNT(*) FROM curation_queue)
+       )::int AS total_depth`
   );
   let timeoutHandle: NodeJS.Timeout | undefined;
 
@@ -53,18 +64,26 @@ async function checkDatabase() {
     ]);
 
     clearTimeout(timeoutHandle);
+    let extractionQueueDepth: number | null = null;
+    let curationQueueDepth: number | null = null;
     let queueDepth: number | null = null;
 
     try {
       const result = await queueDepthCheck;
-      queueDepth = result.rows[0]?.depth ?? 0;
+      extractionQueueDepth = result.rows[0]?.extraction_depth ?? 0;
+      curationQueueDepth = result.rows[0]?.curation_depth ?? 0;
+      queueDepth = result.rows[0]?.total_depth ?? 0;
     } catch {
+      extractionQueueDepth = null;
+      curationQueueDepth = null;
       queueDepth = null;
     }
 
     return {
       db: 'ok',
       db_latency_ms: Date.now() - startedAt,
+      extraction_queue_depth: extractionQueueDepth,
+      curation_queue_depth: curationQueueDepth,
       queue_depth: queueDepth
     } as const;
   } catch {
@@ -72,6 +91,8 @@ async function checkDatabase() {
     return {
       db: 'degraded',
       db_latency_ms: Date.now() - startedAt,
+      extraction_queue_depth: null,
+      curation_queue_depth: null,
       queue_depth: null
     } as const;
   }
@@ -89,6 +110,8 @@ export async function registerHealthRoutes(app: FastifyInstance, config: AppConf
       version: serverVersion.version ?? '0.0.0',
       db: database.db,
       db_latency_ms: database.db_latency_ms,
+      extraction_queue_depth: database.extraction_queue_depth,
+      curation_queue_depth: database.curation_queue_depth,
       queue_depth: database.queue_depth,
       uptime_s: Math.round(process.uptime())
     });

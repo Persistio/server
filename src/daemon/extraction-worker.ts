@@ -11,6 +11,7 @@ import { decryptForVault, encryptForVault, initCryptoClient } from '../services/
 import { deduplicateMemory, getDedupEscalationRequest, type DedupInput } from '../services/dedup';
 import { filterMemoryCandidates } from '../services/deterministic-filter';
 import { getEmbedder } from '../services/embedder';
+import { formatConversationForExtraction } from '../services/extraction-formatting';
 import { normaliseSubject } from '../services/entity-resolver';
 import { ExtractorService } from '../services/extractor';
 import type { ConflictResolution } from '../services/extractor';
@@ -183,9 +184,7 @@ async function processBatch(vaultId?: string) {
             decryptedContent: await decryptForVault(job.vault, chunk.content)
           })));
 
-          const conversation = decryptedChunks
-            .map((chunk) => `${chunk.role}: ${chunk.decryptedContent}`)
-            .join('\n');
+          const conversation = formatConversationForExtraction(decryptedChunks);
           const sessionContextCacheKey = `${job.vault.id}:${job.sessionId}`;
           if (!sessionContextCache.has(sessionContextCacheKey)) {
             sessionContextCache.set(
@@ -751,6 +750,7 @@ function buildPromptHeader(vaultPurpose: string | null, sessionContext: string |
 
   return lines.join('\n');
 }
+
 
 function getLatestChunkTimestamp(chunks: RawChunkRow[]): string | null {
   const latest = chunks.reduce<number | null>((currentLatest, chunk) => {
