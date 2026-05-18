@@ -38,7 +38,7 @@ interface RecallMemoryRow {
   valid_from: string | null;
   valid_until: string | null;
   similarity: number;
-  source?: 'behavioral' | 'semantic' | 'graph';
+  source?: 'global_behavioral' | 'semantic' | 'graph';
   edge_type?: string | null;
   created_at: string;
   updated_at: string;
@@ -75,6 +75,7 @@ interface RecallResponse {
 }
 
 interface RecallBundle {
+  global_user_rules: string[];
   user_rules: string[];
   user_preferences: string[];
   task_patterns: string[];
@@ -91,6 +92,7 @@ interface RecallBundleResponse {
 }
 
 const bundleKeys = [
+  'global_user_rules',
   'user_rules',
   'user_preferences',
   'task_patterns',
@@ -118,6 +120,7 @@ const typeToBundleKey: Record<string, RecallBundleKey> = {
 
 function createEmptyBundle(): RecallBundle {
   return {
+    global_user_rules: [],
     user_rules: [],
     user_preferences: [],
     task_patterns: [],
@@ -138,8 +141,14 @@ function getBundleKey(type: string | null): RecallBundleKey {
   return typeToBundleKey[type] ?? 'system_facts';
 }
 
-function compareRecallRows(left: RecallMemoryRow, right: RecallMemoryRow): number {
-  return Number(right.salience) - Number(left.salience) || right.similarity - left.similarity;
+function compareQueryRelevantRows(left: RecallMemoryRow, right: RecallMemoryRow): number {
+  return right.similarity - left.similarity || Number(right.salience) - Number(left.salience);
+}
+
+function compareGlobalRows(left: RecallMemoryRow, right: RecallMemoryRow): number {
+  return Number(right.salience) - Number(left.salience)
+    || new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
+    || left.id.localeCompare(right.id);
 }
 
 export function composeRecallRows(
@@ -147,26 +156,17 @@ export function composeRecallRows(
   topK: number,
   mode: RecallMode
 ): RecallMemoryRow[] {
-  const behavioralRows = rows.filter((row) => row.source === 'behavioral');
-  const nonBehavioralRows = rows.filter((row) => row.source !== 'behavioral');
-
-  if (mode === 'factual') {
-    return nonBehavioralRows.slice(0, topK);
-  }
-
-  const injectedBehavioralRows = behavioralRows.slice(0, Math.min(5, topK));
-  return [
-    ...injectedBehavioralRows,
-    ...nonBehavioralRows.slice(0, Math.max(topK - injectedBehavioralRows.length, 0))
-  ];
+  const queryRelevantRows = rows.filter((row) => row.source !== 'global_behavioral');
+  return queryRelevantRows.slice(0, topK);
 }
 
-function buildRecallBundle(memories: RecallMemory[]): RecallBundleResponse {
+export function buildRecallBundle(memories: RecallMemory[], globalUserRules: RecallMemory[] = []): RecallBundleResponse {
   const grouped = memories.reduce<Record<RecallBundleKey, RecallMemory[]>>((bundle, memory) => {
     const key = getBundleKey(memory.type);
     bundle[key].push(memory);
     return bundle;
   }, {
+    global_user_rules: [],
     user_rules: [],
     user_preferences: [],
     task_patterns: [],
@@ -179,10 +179,13 @@ function buildRecallBundle(memories: RecallMemory[]): RecallBundleResponse {
   });
 
   const bundle = createEmptyBundle();
+  bundle.global_user_rules = [...globalUserRules]
+    .sort(compareGlobalRows)
+    .map((memory) => memory.data);
 
-  for (const key of bundleKeys) {
+  for (const key of bundleKeys.filter((key) => key !== 'global_user_rules')) {
     bundle[key] = grouped[key]
-      .sort(compareRecallRows)
+      .sort(compareQueryRelevantRows)
       .map((memory) => memory.data);
   }
 
@@ -209,23 +212,25 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       const embedder = getEmbedder();
       const embedding = await embedder.embed(body.query);
 
-      // Agent-mode recall preserves the historical top-5 behavioral injection for
-      // personalization use cases. Factual recall keeps the full top_k budget for
-      // answer-bearing semantic/graph context instead.
-      const behavioralResult = await query<RecallMemoryRow>(
+      // Always-on global rules are kept separate from subject-oriented recall so they
+      // remain available to agents without consuming the query top_k budget.
+      const globalRuleResult = body.mode === 'agent' && qs.format === 'bundle'
+        ? await query<RecallMemoryRow>(
         `SELECT id, data, subject, categories, confidence, score, salience, sensitivity, type, scope, polarity,
                 status, valid_from, valid_until, created_at, updated_at, recall_count, last_recalled,
-                1.0 AS similarity,
-                'behavioral' AS source
+                0.0 AS similarity,
+                'global_behavioral' AS source
          FROM memories
          WHERE vault_id = $1
-           AND type IN ('user_rule', 'user_preference', 'task_pattern')
+           AND type = 'user_rule'
+           AND scope = 'global'
            AND status = 'active'
            AND archived_at IS NULL
-         ORDER BY salience DESC
+         ORDER BY salience DESC, created_at DESC, id
          LIMIT 5`,
         [request.vault.id]
-      );
+      )
+        : { rows: [] as RecallMemoryRow[] };
 
       const semanticResult = await query<RecallMemoryRow>(
         `SELECT m.id, m.data, m.subject, m.categories, m.confidence, m.score, m.salience, m.sensitivity, m.type, m.scope, m.polarity,
@@ -257,12 +262,13 @@ export async function registerRecallRoutes(app: FastifyInstance) {
              AND e.vault_id = $2
              AND m.status = 'active'
              AND m.archived_at IS NULL
+           ORDER BY m.salience DESC, e.confidence DESC, m.updated_at DESC, m.id
            LIMIT 20`,
           [semanticIds, request.vault.id]
         )
         : { rows: [] as RecallMemoryRow[] };
 
-      const uniqueRows = [...behavioralResult.rows, ...semanticResult.rows, ...neighborResult.rows]
+      const uniqueRows = [...semanticResult.rows, ...neighborResult.rows]
         .filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
       const combinedRows = composeRecallRows(uniqueRows, topK, body.mode);
 
@@ -325,6 +331,10 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         ...row,
         data: await decryptForVault(request.vault, row.data)
       })));
+      const decryptedGlobalUserRules = await Promise.all(globalRuleResult.rows.map(async (row) => ({
+        ...row,
+        data: await decryptForVault(request.vault, row.data)
+      })));
       const decryptedEvidenceChunks = await Promise.all(evidenceChunks.map(async (row) => ({
         ...row,
         content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
@@ -345,7 +355,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       span.setAttribute('recall.duration_ms', durationMs);
 
       if (qs.format === 'bundle') {
-        return buildRecallBundle(decryptedMemories);
+        return buildRecallBundle(decryptedMemories, decryptedGlobalUserRules);
       }
 
       const response: RecallResponse = {
