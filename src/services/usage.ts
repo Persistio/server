@@ -30,9 +30,7 @@ interface AtomicQuotaConsumeRow {
   consumed: string;
 }
 
-interface VaultQuotaStateRow {
-  current_period: string | null;
-  current_value: string | null;
+interface ApiQuotaLimitRow {
   quota_limit: string | null;
 }
 
@@ -142,10 +140,8 @@ export function applyRateLimitHeaders(reply: FastifyReply, snapshot: RateLimitSn
   }
 }
 
-// NOTE: incrementUsage does not acquire a vault-level lock and is not protected against
-// concurrent races with consumeApiQuota. If both run simultaneously for the same vault,
-// the FOR UPDATE lock in consumeApiQuota does not cover this path. This is a known gap
-// and should be addressed if incrementUsage is ever called on a hot write path.
+// NOTE: incrementUsage is intended for low-volume internal adjustments. Hot API paths
+// use consumeApiQuota so quota checks and increments stay atomic.
 export async function incrementUsage(vaultId: string, field: UsageField) {
   const period = getCurrentUsagePeriod();
   const columns: UsageField[] = ['ingest_events', 'memory_adds', 'searches'];
@@ -192,35 +188,24 @@ export async function consumeApiQuota(vaultId: string, field: UsageField): Promi
     END`;
   }).join(',\n           ');
   const resetAtEpochSeconds = getNextUsageResetEpochSeconds();
-  const { limit, consumed } = await withTransaction(async (client) => {
-    // Lock the vault row to serialise concurrent quota consumption for the same vault.
-    // Without this, two simultaneous requests could both read "under quota" and both increment,
-    // allowing the limit to be exceeded.
-    const stateResult = await client.query<VaultQuotaStateRow>(
-      `SELECT
-         vu.period AS current_period,
-         vu.${fieldColumn[field]}::text AS current_value,
-         COALESCE((v.rate_limit_override->>$2), (p.limits->>$2)) AS quota_limit
+  const { consumed, limit } = await withTransaction(async (client) => {
+    const limitResult = await client.query<ApiQuotaLimitRow>(
+      `SELECT COALESCE((v.rate_limit_override->>$2), (p.limits->>$2)) AS quota_limit
        FROM vaults AS v
        JOIN plans AS p
          ON p.id = v.plan_id
-       LEFT JOIN vault_usage AS vu
-         ON vu.vault_id = v.id
        WHERE v.id = $1
        LIMIT 1
-       FOR UPDATE OF v`,
+       FOR KEY SHARE OF v`,
       [vaultId, limitKey]
     );
 
-    if (!stateResult.rowCount) {
+    if (!limitResult.rowCount) {
       throw new Error(`Vault ${vaultId} not found`);
     }
 
-    const state = stateResult.rows[0];
-    const limit = state.quota_limit ? Number(state.quota_limit) : undefined;
-    const consumedBefore = state.current_period === period ? Number(state.current_value ?? '0') : 0;
-
-    if (limit !== undefined && consumedBefore >= limit) {
+    const limit = limitResult.rows[0].quota_limit ? Number(limitResult.rows[0].quota_limit) : undefined;
+    if (limit !== undefined && limit <= 0) {
       throw new QuotaExceededError(`${field} quota exceeded`, {
         limit,
         remaining: 0,
@@ -236,22 +221,32 @@ export async function consumeApiQuota(vaultId: string, field: UsageField): Promi
        SET period = EXCLUDED.period,
            ${assignments},
            updated_at = now()
+       WHERE $6::int IS NULL
+          OR vault_usage.period <> EXCLUDED.period
+          OR vault_usage.${fieldColumn[field]} < $6::int
        RETURNING ${fieldColumn[field]}::text AS consumed`,
       [
         vaultId,
         period,
         field === 'ingest_events' ? 1 : 0,
         field === 'memory_adds' ? 1 : 0,
-        field === 'searches' ? 1 : 0
+        field === 'searches' ? 1 : 0,
+        limit ?? null
       ]
     );
+
     if (!result.rowCount) {
-      throw new Error(`Vault ${vaultId} not found or upsert returned no rows`);
+      throw new QuotaExceededError(`${field} quota exceeded`, {
+        limit: limit ?? null,
+        remaining: 0,
+        resetAtEpochSeconds,
+        retryAfterSeconds: Math.max(1, resetAtEpochSeconds - Math.floor(Date.now() / 1000))
+      });
     }
 
     return {
-      limit,
-      consumed: Number(result.rows[0].consumed)
+      consumed: Number(result.rows[0].consumed),
+      limit
     };
   });
 

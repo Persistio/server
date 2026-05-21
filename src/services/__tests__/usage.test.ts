@@ -12,8 +12,6 @@ vi.mock('../../db/client', () => ({
 import { AiBudgetDeferredError, QuotaExceededError, acquireAiBudget, consumeApiQuota, settleAiUsage, usageTestInternals } from '../usage';
 
 describe('usage service', () => {
-  const currentPeriod = new Date().toISOString().slice(0, 7);
-
   beforeEach(() => {
     queryMock.mockReset();
     usageTestInternals.clearAiBuckets();
@@ -21,14 +19,16 @@ describe('usage service', () => {
   });
 
   describe('consumeApiQuota', () => {
-    it('throws before writing when the current usage is already at the quota limit', async () => {
+    it('throws when the atomic consume is rejected by the quota guard', async () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          current_period: currentPeriod,
-          current_value: '5',
           quota_limit: '5'
         }]
+      });
+      queryMock.mockResolvedValueOnce({
+        rowCount: 0,
+        rows: []
       });
 
       await expect(consumeApiQuota('vault-1', 'memory_adds')).rejects.toMatchObject({
@@ -38,15 +38,14 @@ describe('usage service', () => {
           remaining: 0
         })
       });
-      expect(queryMock).toHaveBeenCalledTimes(1);
+      expect(queryMock).toHaveBeenCalledTimes(2);
+      expect(queryMock.mock.calls[1]?.[0]).toContain('vault_usage.memory_adds < $6::int');
     });
 
     it('returns remaining quota after a successful atomic consume', async () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          current_period: currentPeriod,
-          current_value: '2',
           quota_limit: '10'
         }]
       });
@@ -63,14 +62,22 @@ describe('usage service', () => {
         retryAfterSeconds: null
       });
       expect(queryMock).toHaveBeenCalledTimes(2);
+      expect(queryMock.mock.calls[0]?.[0]).not.toContain('FOR UPDATE');
+      expect(queryMock.mock.calls[0]?.[0]).toContain('FOR KEY SHARE OF v');
+      expect(queryMock.mock.calls[1]?.[1]).toEqual([
+        'vault-1',
+        expect.stringMatching(/^\d{4}-\d{2}$/),
+        0,
+        1,
+        0,
+        10
+      ]);
     });
 
     it('treats a new period as rolled over and reports the fresh remaining quota', async () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          current_period: '2026-04',
-          current_value: '9',
           quota_limit: '4'
         }]
       });
@@ -91,7 +98,8 @@ describe('usage service', () => {
         expect.stringMatching(/^\d{4}-\d{2}$/),
         0,
         0,
-        1
+        1,
+        4
       ]);
     });
   });

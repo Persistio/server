@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import pLimit from 'p-limit';
 import { z } from 'zod';
 
 import { getConfig } from '../config';
@@ -23,6 +24,13 @@ const ingestSchema = z.object({
 export async function registerIngestRoutes(app: FastifyInstance) {
   app.post('/v1/ingest', { preHandler: requireVaultAuth }, async (request, reply) => {
     const body = ingestSchema.parse(request.body);
+    const config = getConfig();
+    if (body.chunks.length > config.MAX_INGEST_CHUNKS) {
+      return reply.code(413).send({
+        error: `Too many chunks: maximum is ${config.MAX_INGEST_CHUNKS}`
+      });
+    }
+
     const rateLimit = await consumeApiQuota(request.vault.id, 'ingest_events');
     applyRateLimitHeaders(reply, rateLimit);
 
@@ -34,7 +42,8 @@ export async function registerIngestRoutes(app: FastifyInstance) {
       const embedder = getEmbedder();
       const inserted: Array<{ id: string; created_at: string }> = [];
       const insertedWithEmbeddings: Array<{ id: string; created_at: string; role: string; content: string; embedding: number[] }> = [];
-      const prepared = await Promise.all(body.chunks.map(async (chunk) => {
+      const limitEmbedding = pLimit(config.INGEST_EMBEDDING_CONCURRENCY);
+      const prepared = await Promise.all(body.chunks.map((chunk) => limitEmbedding(async () => {
         const [storedContent, embedding] = await Promise.all([
           encryptForVault(request.vault, chunk.content),
           embedder.embed(chunk.content)
@@ -45,7 +54,7 @@ export async function registerIngestRoutes(app: FastifyInstance) {
           storedContent,
           embedding
         };
-      }));
+      })));
       const client = await pool.connect();
 
       try {
@@ -68,7 +77,7 @@ export async function registerIngestRoutes(app: FastifyInstance) {
         }
         const segments = buildSegments(
           insertedWithEmbeddings,
-          getConfig().SEGMENTATION_THRESHOLD
+          config.SEGMENTATION_THRESHOLD
         );
 
         for (const segment of segments) {

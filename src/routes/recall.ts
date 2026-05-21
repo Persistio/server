@@ -273,13 +273,15 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       const combinedRows = composeRecallRows(uniqueRows, topK, body.mode);
 
       if (combinedRows.length) {
-        await query(
+        void query(
           `UPDATE memories
            SET last_recalled = now(),
                recall_count = recall_count + 1
            WHERE id = ANY($1::uuid[])`,
           [combinedRows.map((row) => row.id)]
-        );
+        ).catch((error: unknown) => {
+          request.log.warn({ err: error, vault_id: request.vault.id }, 'Failed to record recall metadata');
+        });
       }
 
       let evidenceChunks: RecallEvidenceChunk[] = [];

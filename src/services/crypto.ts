@@ -9,7 +9,10 @@ const DEK_CACHE_TTL_MS = 5 * 60 * 1000;
 const credential = new ManagedIdentityCredential();
 let cryptoClient: CryptographyClient | null = null;
 
+
 const dekCache = new Map<string, { dek: Buffer; expiresAt: number }>();
+// In-flight deduplication map: prevents cache stampede under concurrent decryption (Fix 1).
+const dekInflight = new Map<string, Promise<Buffer>>();
 
 export interface VaultEncryptionContext {
   id: string;
@@ -17,11 +20,17 @@ export interface VaultEncryptionContext {
   vault_encryption_enabled: boolean;
 }
 
+// Keep-alive options: reuse TCP/TLS connections across Key Vault calls.
+// `keepAliveOptions` is part of ExtendedClientOptions, which KeyClientOptions
+// and CryptographyClientOptions both inherit via ExtendedCommonClientOptions.
+// This avoids the TS2353 error that `pipelineOptions` caused in PR #126.
+const KV_KEEP_ALIVE = { keepAliveOptions: { enable: true } } as const;
+
 export async function initCryptoClient(): Promise<void> {
   const { KEY_VAULT_URI, KEK_KEY_NAME } = getConfig();
-  const keyClient = new KeyClient(KEY_VAULT_URI, credential);
+  const keyClient = new KeyClient(KEY_VAULT_URI, credential, KV_KEEP_ALIVE);
   const key = await keyClient.getKey(KEK_KEY_NAME);
-  cryptoClient = new CryptographyClient(key, credential);
+  cryptoClient = new CryptographyClient(key, credential, KV_KEEP_ALIVE);
   console.log('[persistio] Key Vault crypto client initialised');
 }
 
@@ -102,17 +111,34 @@ async function getVaultDek(vault: VaultEncryptionContext): Promise<Buffer> {
     throw new Error(`Vault ${vault.id} is missing encrypted_dek`);
   }
 
+  // Fast path: valid cached DEK.
   const cached = dekCache.get(vault.id);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.dek;
   }
 
-  const dek = await unwrapDek(vault.encrypted_dek);
-  dekCache.set(vault.id, {
-    dek,
-    expiresAt: Date.now() + DEK_CACHE_TTL_MS
-  });
-  return dek;
+  // In-flight deduplication (Fix 1): if an unwrapKey call is already in progress
+  // for this vault, await it rather than issuing a parallel request.
+  const inflight = dekInflight.get(vault.id);
+  if (inflight) {
+    return inflight;
+  }
+
+  const encryptedDek = vault.encrypted_dek;
+  const promise = unwrapDek(encryptedDek)
+    .then((dek) => {
+      dekCache.set(vault.id, {
+        dek,
+        expiresAt: Date.now() + DEK_CACHE_TTL_MS
+      });
+      return dek;
+    })
+    .finally(() => {
+      dekInflight.delete(vault.id);
+    });
+
+  dekInflight.set(vault.id, promise);
+  return promise;
 }
 
 function getCryptographyClient(): CryptographyClient {
