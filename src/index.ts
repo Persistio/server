@@ -16,6 +16,7 @@ import { registerJobRoutes } from './routes/jobs';
 import { registerMemoryRoutes } from './routes/memories';
 import { registerRecallRoutes } from './routes/recall';
 import { registerStatsRoutes } from './routes/stats';
+import { registerCurationRoutes } from './routes/curation';
 import { initCryptoClient } from './services/crypto';
 import { QuotaExceededError, applyRateLimitHeaders } from './services/usage';
 import { getSpanAttributes } from './telemetry';
@@ -157,6 +158,7 @@ async function main() {
     await registerMemoryRoutes(app);
     await registerJobRoutes(app, jobs, triggerExtraction);
     await registerStatsRoutes(app);
+    await registerCurationRoutes(app);
     await registerAdminRoutes(app);
   }
 

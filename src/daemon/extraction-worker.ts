@@ -17,6 +17,7 @@ import { ExtractorService } from '../services/extractor';
 import type { ConflictResolution } from '../services/extractor';
 import { archiveStaleMemories } from '../services/staleness';
 import { AiBudgetDeferredError } from '../services/usage';
+import { isCuratorEnabled } from '../services/curation-capacity';
 import {
   getVaultSubjectList,
   resolveSubjectTier1,
@@ -85,26 +86,6 @@ const subjectArbitrationLimit = pLimit(5);
 const MAX_EXTRACTION_RATE_LIMIT_RETRIES = 5;
 const EXTRACTION_RATE_LIMIT_BASE_DELAY_MS = 1_000;
 const EXTRACTION_RATE_LIMIT_MAX_DELAY_MS = 32_000;
-
-interface VaultPlanRow {
-  plan_id: string;
-}
-
-async function getVaultPlanId(vaultId: string): Promise<string> {
-  const planResult = await query<VaultPlanRow>(
-    `SELECT plan_id
-     FROM vaults
-     WHERE id = $1
-     LIMIT 1`,
-    [vaultId]
-  );
-
-  if (!planResult.rowCount) {
-    throw new Error(`Vault ${vaultId} not found`);
-  }
-
-  return planResult.rows[0].plan_id;
-}
 
 async function processBatch(vaultId?: string) {
   return withSpan('extraction.process_batch', {
@@ -347,7 +328,7 @@ async function processBatch(vaultId?: string) {
             resolvedFacts[index] = fact;
           }));
 
-          const currentPlanId = await getVaultPlanId(job.vault.id);
+          const curatorEnabled = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id);
           const memoryInputs: DedupInput[] = [];
           const sourceTimestamp = getLatestChunkTimestamp(job.chunks);
 
@@ -357,7 +338,7 @@ async function processBatch(vaultId?: string) {
               throw new Error(`Subject resolution did not complete for fact index ${i}`);
             }
             const embedding = factEmbeddings[i];
-            const status = currentPlanId === 'pro' && config.CURATOR_AUTO_RUN ? 'candidate' : fact.status;
+            const status = curatorEnabled ? 'candidate' : fact.status;
             memoryInputs.push({
               vaultId: job.vault.id,
               fact: fact.fact,
@@ -525,19 +506,7 @@ async function completeExtractionJob(job: LoadedJob): Promise<void> {
     );
 
     if (job.segmentId && config.CURATOR_AUTO_RUN) {
-      const planResult = await client.query<VaultPlanRow>(
-        `SELECT plan_id
-         FROM vaults
-         WHERE id = $1
-         LIMIT 1`,
-        [job.vault.id]
-      );
-
-      if (!planResult.rowCount) {
-        throw new Error(`Vault ${job.vault.id} not found when finalising extraction job`);
-      }
-
-      if (planResult.rows[0].plan_id === 'pro') {
+      if (await isCuratorEnabled(job.vault.id, client)) {
         await client.query(
           `INSERT INTO curation_queue (vault_id, segment_id)
            VALUES ($1, $2)

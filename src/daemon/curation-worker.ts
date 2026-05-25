@@ -18,6 +18,15 @@ import { CuratorService, type CuratorAliasMaps, type CuratorMemory, type Curator
 import { getSpanAttributes } from '../telemetry';
 import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram } from '../metrics';
 import { AiBudgetDeferredError } from '../services/usage';
+import {
+  claimEligibleCurationJobs,
+  getCuratorPlanBlockReason,
+  getCuratorLimits,
+  recordCuratorDeferral,
+  recordCuratorUsage,
+  releaseCuratorClaim,
+  type CuratorPlanLimits
+} from '../services/curation-capacity';
 
 interface CurationQueueRow {
   queue_id: string;
@@ -48,6 +57,7 @@ interface MemoryRow {
   source_chunks: string[];
   archived_at: string | null;
   status: string;
+  total_candidates?: string;
 }
 
 interface LoadedCurationJob {
@@ -58,6 +68,9 @@ interface LoadedCurationJob {
   candidates: CuratorMemory[];
   activeMemories: CuratorMemory[];
   candidateIds: Set<string>;
+  limits: CuratorPlanLimits;
+  hasMoreCandidates: boolean;
+  deferredCandidates: number;
 }
 
 const config = getConfig();
@@ -73,26 +86,20 @@ async function processBatch() {
      SET claimed_at = NULL, claimed_by = NULL
      WHERE claimed_at < now() - interval '10 minutes'`
   );
-
-  const claimed = await query<CurationQueueRow>(
-    `WITH claimed AS (
-       SELECT cq.id AS queue_id, cq.vault_id, cq.segment_id
-       FROM curation_queue cq
-       WHERE cq.claimed_at IS NULL
-         AND cq.available_at <= now()
-       ORDER BY cq.enqueued_at ASC
-       LIMIT $1
-       FOR UPDATE SKIP LOCKED
-     )
-     UPDATE curation_queue cq
-     SET claimed_at = now(), claimed_by = $2
-     FROM claimed
-     WHERE cq.id = claimed.queue_id
-     RETURNING claimed.queue_id, claimed.vault_id, claimed.segment_id`,
-    [config.CURATION_BATCH_SIZE, workerId]
+  await query(
+    `UPDATE vault_curation_state
+     SET curator_claimed_until = NULL,
+         curator_claimed_by = NULL,
+         updated_at = now()
+     WHERE curator_claimed_until < now()`
   );
 
-  for (const row of claimed.rows) {
+  const claimed = await claimEligibleCurationJobs(config.CURATION_BATCH_SIZE, workerId);
+  const claimedVaults = new Set(claimed.map((row) => row.vault_id));
+  const remainingCandidatesByVault = new Map<string, number>();
+  const runRecordedVaults = new Set<string>();
+
+  for (const row of claimed) {
     try {
       const retryResult = await query<{ retry_count: number; last_error: string | null }>(
         `SELECT retry_count, last_error
@@ -127,15 +134,70 @@ async function processBatch() {
         [row.queue_id]
       );
 
-      const job = await loadJob(row);
+      const limits = await getCuratorLimits(row.vault_id);
+      const planBlockReason = getCuratorPlanBlockReason(limits);
+      if (planBlockReason) {
+        await deferCapacityBlockedJob(row, limits, planBlockReason);
+        continue;
+      }
+
+      const remainingCandidates = remainingCandidatesByVault.get(row.vault_id) ?? limits.curator_candidates_per_run;
+      if (remainingCandidates <= 0) {
+        await deferCapacityBlockedJob(row, limits, 'curator candidate batch limit reached');
+        continue;
+      }
+
+      const candidateLimit = Math.min(remainingCandidates, limits.curator_candidates_per_call);
+      const job = await loadJob(row, limits, candidateLimit);
       if (job.candidates.length === 0) {
         await query(`DELETE FROM curation_queue WHERE id = $1`, [job.queueId]);
         continue;
       }
+      remainingCandidatesByVault.set(row.vault_id, Math.max(0, remainingCandidates - job.candidates.length));
 
-      const { result, aliasMaps, rawResponse } = await curator.curate(job.candidates, job.activeMemories, job.conversation, job.vault.id);
+      const { result, aliasMaps, rawResponse, usage } = await curator.curate(
+        job.candidates,
+        job.activeMemories,
+        job.conversation,
+        job.vault.id,
+        {
+          maxInputTokens: limits.curator_input_tokens_per_call > 0 ? limits.curator_input_tokens_per_call : undefined,
+          maxOutputTokens: limits.curator_output_tokens_per_call > 0 ? limits.curator_output_tokens_per_call : undefined
+        }
+      );
       await applyActions(job, result, aliasMaps, rawResponse);
-      await query(`DELETE FROM curation_queue WHERE id = $1`, [job.queueId]);
+      const countRun = !runRecordedVaults.has(job.vault.id);
+      await recordCuratorUsage({
+        vaultId: job.vault.id,
+        candidatesProcessed: job.candidates.length,
+        countRun,
+        promptTokens: usage?.promptTokens ?? 0,
+        completionTokens: usage?.completionTokens ?? 0,
+        limits
+      });
+      if (countRun) {
+        runRecordedVaults.add(job.vault.id);
+      }
+      if (job.hasMoreCandidates) {
+        const availableAt = getNextCapacityAvailableAt(limits);
+        await recordCuratorDeferral({
+          vaultId: job.vault.id,
+          candidatesDeferred: job.deferredCandidates,
+          reason: 'curator candidate batch limit reached',
+          availableAt
+        });
+        await query(
+          `UPDATE curation_queue
+           SET available_at = $2,
+               last_error = $3,
+               claimed_at = NULL,
+               claimed_by = NULL
+           WHERE id = $1`,
+          [job.queueId, availableAt.toISOString(), 'curator candidate batch limit reached']
+        );
+      } else {
+        await query(`DELETE FROM curation_queue WHERE id = $1`, [job.queueId]);
+      }
     } catch (error) {
       if (error instanceof AiBudgetDeferredError) {
         aiBudgetWaitHistogram.record(error.waitMs, { role: error.role, queue: 'curation', vault_id: row.vault_id });
@@ -157,6 +219,11 @@ async function processBatch() {
            WHERE id = $1`,
           [row.queue_id, error.availableAt.toISOString(), error.message]
         );
+        await recordCuratorDeferral({
+          vaultId: row.vault_id,
+          reason: error.message,
+          availableAt: error.availableAt
+        });
         continue;
       }
       if (error instanceof CircuitBreakerOpenError) {
@@ -174,6 +241,10 @@ async function processBatch() {
            WHERE id = $1`,
           [row.queue_id, error.message]
         );
+        await recordCuratorDeferral({
+          vaultId: row.vault_id,
+          reason: error.message
+        });
         continue;
       }
       const lastError = error instanceof Error ? error.message : 'Unknown curation error';
@@ -189,9 +260,52 @@ async function processBatch() {
       );
     }
   }
+
+  for (const vaultId of claimedVaults) {
+    await releaseCuratorClaim(vaultId, workerId);
+  }
 }
 
-async function loadJob(row: CurationQueueRow): Promise<LoadedCurationJob> {
+function getNextCapacityAvailableAt(limits: CuratorPlanLimits): Date {
+  const delayMinutes = Math.max(1, limits.curator_schedule_interval_minutes);
+  return new Date(Date.now() + delayMinutes * 60_000);
+}
+
+async function deferCapacityBlockedJob(row: CurationQueueRow, limits: CuratorPlanLimits, reason: string): Promise<void> {
+  const countResult = await query<{ total_candidates: string }>(
+    `SELECT COUNT(*)::text AS total_candidates
+     FROM memories
+     WHERE vault_id = $1
+       AND source_segment_id = $2
+       AND archived_at IS NULL
+       AND status = 'candidate'`,
+    [row.vault_id, row.segment_id]
+  );
+  const totalCandidates = Number(countResult.rows[0]?.total_candidates ?? 0);
+
+  if (totalCandidates === 0) {
+    await query(`DELETE FROM curation_queue WHERE id = $1`, [row.queue_id]);
+    return;
+  }
+
+  const availableAt = getNextCapacityAvailableAt(limits);
+  await recordCuratorDeferral({
+    vaultId: row.vault_id,
+    reason,
+    availableAt
+  });
+  await query(
+    `UPDATE curation_queue
+     SET available_at = $2,
+         last_error = $3,
+         claimed_at = NULL,
+         claimed_by = NULL
+     WHERE id = $1`,
+    [row.queue_id, availableAt.toISOString(), reason]
+  );
+}
+
+async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candidateLimit: number): Promise<LoadedCurationJob> {
   const vaultResult = await query<VaultRow>(
     `SELECT id, encrypted_dek, vault_encryption_enabled, plan_id
      FROM vaults
@@ -223,20 +337,25 @@ async function loadJob(row: CurationQueueRow): Promise<LoadedCurationJob> {
 
   const candidateRows = await query<MemoryRow>(
     `SELECT id, vault_id, data, subject, subject_encrypted, subject_hmac, confidence, salience, sensitivity, type,
-            scope, polarity, volatility, evidence, parent_id, source_chunks, archived_at, status
+            scope, polarity, volatility, evidence, parent_id, source_chunks, archived_at, status,
+            COUNT(*) OVER()::text AS total_candidates
      FROM memories
      WHERE vault_id = $1
        AND source_segment_id = $2
        AND archived_at IS NULL
        AND status = 'candidate'
-     ORDER BY created_at ASC`,
-    [row.vault_id, row.segment_id]
+     ORDER BY confidence DESC, salience DESC, created_at ASC
+     LIMIT $3`,
+    [row.vault_id, row.segment_id, candidateLimit + 1]
   );
 
-  const candidates = await Promise.all(candidateRows.rows.map((memory) => decryptMemory(vault, memory)));
+  const hasMoreCandidates = candidateRows.rows.length > candidateLimit;
+  const candidates = await Promise.all(candidateRows.rows.slice(0, candidateLimit).map((memory) => decryptMemory(vault, memory)));
+  const totalCandidates = candidateRows.rows[0]?.total_candidates ? Number(candidateRows.rows[0].total_candidates) : candidates.length;
   const candidateIds = new Set(candidates.map((memory) => memory.id));
   const subjects = Array.from(new Set(candidates.map((memory) => memory.subject)));
-  const activeMemories = await loadActiveMemoriesForSubjects(vault, subjects);
+  const activeMemories = (await loadActiveMemoriesForSubjects(vault, subjects))
+    .slice(0, Math.max(0, limits.curator_active_memories_per_call));
 
   return {
     queueId: row.queue_id,
@@ -245,7 +364,10 @@ async function loadJob(row: CurationQueueRow): Promise<LoadedCurationJob> {
     conversation,
     candidates,
     activeMemories,
-    candidateIds
+    candidateIds,
+    limits,
+    hasMoreCandidates,
+    deferredCandidates: Math.max(0, totalCandidates - candidates.length)
   };
 }
 
@@ -619,9 +741,10 @@ async function applyActions(
          AND source_segment_id = $2
          AND archived_at IS NULL
          AND status = 'candidate'
+         AND id = ANY($4::uuid[])
          AND NOT (id = ANY($3::uuid[]))
        RETURNING id`,
-      [job.vault.id, job.segmentId, Array.from(touchedCandidates)]
+      [job.vault.id, job.segmentId, Array.from(touchedCandidates), Array.from(job.candidateIds)]
     );
 
     for (const row of promoteResult.rows) {

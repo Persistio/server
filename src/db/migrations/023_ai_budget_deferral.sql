@@ -1,11 +1,9 @@
 UPDATE plans
 SET limits = (limits - 'gemini_rpm' - 'gemini_tpm') || CASE id
-  WHEN 'free' THEN '{"ai_requests_per_minute": 10, "ai_tokens_per_minute": 50000, "ai_extraction_weight": 1, "ai_escalation_weight": 2, "ai_curation_weight": 4}'::jsonb
-  WHEN 'starter' THEN '{"ai_requests_per_minute": 50, "ai_tokens_per_minute": 250000, "ai_extraction_weight": 1, "ai_escalation_weight": 2, "ai_curation_weight": 4}'::jsonb
-  WHEN 'pro' THEN '{"ai_requests_per_minute": 100, "ai_tokens_per_minute": 500000, "ai_extraction_weight": 1, "ai_escalation_weight": 2, "ai_curation_weight": 4}'::jsonb
+  WHEN 'unlimited' THEN '{"ai_requests_per_minute": 300, "ai_tokens_per_minute": 3000000, "ai_extraction_weight": 1, "ai_escalation_weight": 2, "ai_curation_weight": 4}'::jsonb
   ELSE '{}'::jsonb
 END
-WHERE id IN ('free', 'starter', 'pro');
+WHERE id IN ('unlimited');
 
 ALTER TABLE extraction_queue
   ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT now();

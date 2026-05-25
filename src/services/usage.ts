@@ -4,7 +4,7 @@ import { query, withTransaction } from '../db/client';
 
 export type UsageField = 'ingest_events' | 'memory_adds' | 'searches';
 
-type PlanId = 'free' | 'starter' | 'pro';
+type PlanId = 'unlimited' | 'free' | 'pro';
 export type AiBudgetRole = 'extraction' | 'escalation' | 'curation';
 type AiLimitKey =
   | 'ai_requests_per_minute'
@@ -65,24 +65,26 @@ const fieldColumn: Record<UsageField, string> = {
 };
 const allowedUsageFields: UsageField[] = ['ingest_events', 'memory_adds', 'searches'];
 
+const conservativeAiDefaults: Required<Pick<LimitConfig, AiLimitKey>> = {
+  ai_requests_per_minute: 10,
+  ai_tokens_per_minute: 50_000,
+  ai_extraction_weight: 1,
+  ai_escalation_weight: 2,
+  ai_curation_weight: 4
+};
+
 const aiPlanDefaults: Record<PlanId, Required<Pick<LimitConfig, AiLimitKey>>> = {
-  free: {
-    ai_requests_per_minute: 10,
-    ai_tokens_per_minute: 50_000,
+  unlimited: {
+    ai_requests_per_minute: 300,
+    ai_tokens_per_minute: 3_000_000,
     ai_extraction_weight: 1,
     ai_escalation_weight: 2,
     ai_curation_weight: 4
   },
-  starter: {
-    ai_requests_per_minute: 50,
-    ai_tokens_per_minute: 250_000,
-    ai_extraction_weight: 1,
-    ai_escalation_weight: 2,
-    ai_curation_weight: 4
-  },
+  free: conservativeAiDefaults,
   pro: {
-    ai_requests_per_minute: 100,
-    ai_tokens_per_minute: 500_000,
+    ai_requests_per_minute: 300,
+    ai_tokens_per_minute: 3_000_000,
     ai_extraction_weight: 1,
     ai_escalation_weight: 2,
     ai_curation_weight: 4
@@ -400,7 +402,7 @@ async function getVaultLimits(vaultId: string): Promise<LimitConfig> {
   }
 
   const row = result.rows[0];
-  const planDefaults = aiPlanDefaults[(row.plan_id as PlanId)] ?? aiPlanDefaults.free;
+  const planDefaults = aiPlanDefaults[(row.plan_id as PlanId)] ?? conservativeAiDefaults;
   return {
     ...planDefaults,
     ...(row.limits ?? {}),

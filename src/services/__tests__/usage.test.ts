@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const { queryMock } = vi.hoisted(() => ({
   queryMock: vi.fn()
@@ -19,6 +21,18 @@ describe('usage service', () => {
   });
 
   describe('consumeApiQuota', () => {
+    it('seeds unlimited plan quotas and memory capacity as positive guardrails', () => {
+      const migration = readFileSync(resolve(__dirname, '../../db/migrations/002_rename_tenant_to_vault.sql'), 'utf8');
+      const unlimitedLimitsJson = migration.match(/\('unlimited', '([^']+)'\)/)?.[1];
+      expect(unlimitedLimitsJson).toBeDefined();
+
+      const unlimitedLimits = JSON.parse(unlimitedLimitsJson ?? '{}') as Record<string, number>;
+      expect(unlimitedLimits.memories_max).toBeGreaterThan(0);
+      expect(unlimitedLimits.ingest_events_per_month).toBeGreaterThan(0);
+      expect(unlimitedLimits.memory_adds_per_month).toBeGreaterThan(0);
+      expect(unlimitedLimits.searches_per_month).toBeGreaterThan(0);
+    });
+
     it('throws when the atomic consume is rejected by the quota guard', async () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
@@ -151,6 +165,22 @@ describe('usage service', () => {
       vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
       await acquireAiBudget('vault-1', 'extraction', 80);
       await expect(acquireAiBudget('vault-1', 'extraction', 30)).rejects.toBeInstanceOf(AiBudgetDeferredError);
+    });
+
+    it('uses conservative AI defaults for unknown plan IDs', async () => {
+      queryMock.mockResolvedValue({
+        rowCount: 1,
+        rows: [{
+          plan_id: 'custom',
+          limits: null,
+          rate_limit_override: null
+        }]
+      });
+
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
+      await acquireAiBudget('vault-1', 'extraction', 40_000);
+      await expect(acquireAiBudget('vault-1', 'extraction', 20_000)).rejects.toBeInstanceOf(AiBudgetDeferredError);
     });
 
     it('keeps vault buckets independent for fair per-vault throttling', async () => {

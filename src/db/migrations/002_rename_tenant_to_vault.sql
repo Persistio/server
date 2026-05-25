@@ -97,12 +97,10 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 
 INSERT INTO plans (id, limits) VALUES
-  ('free', '{"memories_max": 500, "ingest_events_per_month": 100, "memory_adds_per_month": 500, "searches_per_month": 1000}'),
-  ('starter', '{"memories_max": 5000, "ingest_events_per_month": 1000, "memory_adds_per_month": 5000, "searches_per_month": 10000}'),
-  ('pro', '{"memories_max": 50000, "ingest_events_per_month": 10000, "memory_adds_per_month": 50000, "searches_per_month": 100000}')
+  ('unlimited', '{"memories_max": 1000000, "ingest_events_per_month": 1000000, "memory_adds_per_month": 1000000, "searches_per_month": 5000000}')
 ON CONFLICT DO NOTHING;
 
-ALTER TABLE vaults ADD COLUMN IF NOT EXISTS plan_id TEXT NOT NULL DEFAULT 'free' REFERENCES plans(id);
+ALTER TABLE vaults ADD COLUMN IF NOT EXISTS plan_id TEXT NOT NULL DEFAULT 'unlimited' REFERENCES plans(id);
 
 CREATE TABLE IF NOT EXISTS vault_usage (
   vault_id UUID PRIMARY KEY REFERENCES vaults(id) ON DELETE CASCADE,
