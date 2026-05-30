@@ -46,15 +46,20 @@ const configSchema = z.object({
   MAX_EXTRACTION_RETRIES: z.coerce.number().int().positive().default(5),
   CURATION_INTERVAL_MS: z.coerce.number().int().positive().default(2000),
   CURATION_BATCH_SIZE: z.coerce.number().int().positive().default(5),
-  WORKER_CONCURRENCY: z.coerce.number().int().positive().max(20).default(4),
+  EXTRACTION_WORKER_CONCURRENCY: z.coerce.number().int().positive().max(20).default(5),
   ARBITRATION_BATCH_SIZE: z.coerce.number().int().positive().default(15),
-  PG_POOL_MAX: z.coerce.number().int().positive().default(50),
+  DB_POOL_MAX: z.coerce.number().int().positive().default(20),
   MAX_INGEST_CHUNKS: z.coerce.number().int().positive().default(100),
   INGEST_EMBEDDING_CONCURRENCY: z.coerce.number().int().positive().default(4),
+  INGEST_RATE_LIMIT_RPM: z.coerce.number().int().positive().default(60),
+  INGEST_CHUNK_MAX_CHARS: z.coerce.number().int().positive().default(8000),
+  BULK_INGEST_MAX_CHUNKS: z.coerce.number().int().positive().default(2048),
+  BULK_INGEST_BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(25 * 1024 * 1024),
   EXTRACTION_SCORE_THRESHOLD: z.coerce.number().int().min(1).max(10).default(5),
   SEGMENTATION_THRESHOLD: z.coerce.number().min(0).max(1).default(0.75),
   DEFAULT_TOKEN_BUDGET: z.coerce.number().int().positive().default(2000),
   DEFAULT_RECALL_TOP_K: z.coerce.number().int().positive().default(10),
+  MIN_RECALL_SIMILARITY: z.coerce.number().min(0).max(1).default(0.30),
   CIRCUIT_BREAKER_THRESHOLD: z.coerce.number().int().positive().default(3),
   CIRCUIT_BREAKER_PROBE_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
   CIRCUIT_BREAKER_MAX_PROBE_INTERVAL_MS: z.coerce.number().int().positive().default(600000),
@@ -119,8 +124,16 @@ export type AppConfig = z.infer<typeof configSchema>;
 let cachedConfig: AppConfig | undefined;
 
 export function getConfig(): AppConfig {
-  cachedConfig ??= configSchema.parse(process.env);
+  cachedConfig ??= configSchema.parse(normalizeConfigEnv(process.env));
   return cachedConfig;
+}
+
+function normalizeConfigEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    EXTRACTION_WORKER_CONCURRENCY: env.EXTRACTION_WORKER_CONCURRENCY ?? env.WORKER_CONCURRENCY,
+    DB_POOL_MAX: env.DB_POOL_MAX ?? env.PG_POOL_MAX
+  };
 }
 
 export function getConfiguredEmbeddingDimensions(config = getConfig()): number {

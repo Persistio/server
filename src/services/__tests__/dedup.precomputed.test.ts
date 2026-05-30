@@ -133,4 +133,19 @@ describe('deduplicateMemory precomputed conflict decisions', () => {
       'vault-1'
     );
   });
+
+  it('limits subject similarity lookup to the best matching memory', async () => {
+    const db = createDb();
+
+    await deduplicateMemory(input(), db, extractorMock as never, {
+      precomputedConflictDecision: 'merge',
+      precomputedConflictMemoryId: 'memory-1'
+    });
+
+    const similarityQuery = db.query.mock.calls
+      .map(([sql]) => String(sql))
+      .find((sql) => sql.includes('FROM memories AS m'));
+
+    expect(similarityQuery).toMatch(/ORDER BY similarity DESC\s+LIMIT 1/);
+  });
 });

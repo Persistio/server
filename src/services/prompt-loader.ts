@@ -47,10 +47,13 @@ export class PromptLoader {
       return this.fallback;
     }
 
-    const allowedDir = path.resolve(this.promptsDir);
+    const allowedDir = fs.existsSync(this.promptsDir)
+      ? fs.realpathSync(path.resolve(this.promptsDir))
+      : path.resolve(this.promptsDir);
+    const promptPath = this.resolvePromptPath();
     let resolved: string;
     try {
-      resolved = fs.realpathSync(path.resolve(this.promptFile));
+      resolved = fs.realpathSync(promptPath);
     } catch {
       console.warn(`[${this.label}] Could not resolve prompt file path, falling back to default`);
       return this.fallback;
@@ -72,5 +75,23 @@ export class PromptLoader {
       console.warn(`[${this.label}] Failed to read prompt file, falling back to default`);
       return this.fallback;
     }
+  }
+
+  private resolvePromptPath(): string {
+    if (path.isAbsolute(this.promptFile)) {
+      return this.promptFile;
+    }
+
+    const fromPromptsDir = path.resolve(this.promptsDir, this.promptFile);
+    if (fs.existsSync(fromPromptsDir)) {
+      return fromPromptsDir;
+    }
+
+    const basenameFromPromptsDir = path.resolve(this.promptsDir, path.basename(this.promptFile));
+    if (fs.existsSync(basenameFromPromptsDir)) {
+      return basenameFromPromptsDir;
+    }
+
+    return path.resolve(this.promptFile);
   }
 }

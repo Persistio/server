@@ -35,24 +35,18 @@ async function requireHealthAuth(request: FastifyRequest, reply: FastifyReply, c
 async function checkDatabase() {
   const startedAt = Date.now();
   const dbCheck = pool.query('SELECT 1');
-  const queueDepthCheck = pool.query<{
+  const queueDepthsCheck = pool.query<{
     extraction_depth: number;
     curation_depth: number;
-    total_depth: number;
   }>(
     `SELECT
        (SELECT COUNT(*) FROM extraction_queue)::int AS extraction_depth,
-       (SELECT COUNT(*) FROM curation_queue)::int AS curation_depth,
-       (
-         (SELECT COUNT(*) FROM extraction_queue)
-         +
-         (SELECT COUNT(*) FROM curation_queue)
-       )::int AS total_depth`
+       (SELECT COUNT(*) FROM curation_queue)::int AS curation_depth`
   );
   let timeoutHandle: NodeJS.Timeout | undefined;
 
   void dbCheck.catch(() => undefined);
-  void queueDepthCheck.catch(() => undefined);
+  void queueDepthsCheck.catch(() => undefined);
 
   try {
     await Promise.race([
@@ -66,25 +60,21 @@ async function checkDatabase() {
     clearTimeout(timeoutHandle);
     let extractionQueueDepth: number | null = null;
     let curationQueueDepth: number | null = null;
-    let queueDepth: number | null = null;
 
     try {
-      const result = await queueDepthCheck;
+      const result = await queueDepthsCheck;
       extractionQueueDepth = result.rows[0]?.extraction_depth ?? 0;
       curationQueueDepth = result.rows[0]?.curation_depth ?? 0;
-      queueDepth = result.rows[0]?.total_depth ?? 0;
     } catch {
       extractionQueueDepth = null;
       curationQueueDepth = null;
-      queueDepth = null;
     }
 
     return {
       db: 'ok',
       db_latency_ms: Date.now() - startedAt,
       extraction_queue_depth: extractionQueueDepth,
-      curation_queue_depth: curationQueueDepth,
-      queue_depth: queueDepth
+      curation_queue_depth: curationQueueDepth
     } as const;
   } catch {
     clearTimeout(timeoutHandle);
@@ -92,8 +82,7 @@ async function checkDatabase() {
       db: 'degraded',
       db_latency_ms: Date.now() - startedAt,
       extraction_queue_depth: null,
-      curation_queue_depth: null,
-      queue_depth: null
+      curation_queue_depth: null
     } as const;
   }
 }
@@ -112,7 +101,6 @@ export async function registerHealthRoutes(app: FastifyInstance, config: AppConf
       db_latency_ms: database.db_latency_ms,
       extraction_queue_depth: database.extraction_queue_depth,
       curation_queue_depth: database.curation_queue_depth,
-      queue_depth: database.queue_depth,
       uptime_s: Math.round(process.uptime())
     });
   });

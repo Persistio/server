@@ -1,4 +1,5 @@
 import type { FastifyReply } from 'fastify';
+import type { PoolClient } from 'pg';
 
 import { query, withTransaction } from '../db/client';
 
@@ -53,6 +54,13 @@ export interface RateLimitSnapshot {
   retryAfterSeconds: number | null;
 }
 
+export interface ApiQuotaReservation {
+  field: UsageField;
+  period: string;
+  snapshot: RateLimitSnapshot;
+  vaultId: string;
+}
+
 const usageLimitKeys: Record<UsageField, UsageFieldLimitKey> = {
   ingest_events: 'ingest_events_per_month',
   memory_adds: 'memory_adds_per_month',
@@ -97,6 +105,9 @@ const aiRequestBuckets = new Map<string, BucketState>();
 // TODO: These buckets are in-process only. They reset on restart and do not coordinate across
 // replicas, so precise enforcement at scale requires Redis or shared database-backed state.
 const aiTokenBuckets = new Map<string, BucketState>();
+// TODO: Normal-ingest RPM buckets are in-process only. Use Redis/shared state if strict
+// cross-replica enforcement becomes necessary.
+const ingestRequestBuckets = new Map<string, BucketState>();
 
 export class AiBudgetDeferredError extends Error {
   readonly availableAt: Date;
@@ -142,6 +153,42 @@ export function applyRateLimitHeaders(reply: FastifyReply, snapshot: RateLimitSn
   }
 }
 
+export function isPremiumPlan(planId: string): boolean {
+  return planId === 'pro' || planId === 'unlimited';
+}
+
+export function consumeNormalIngestRateLimit(vaultId: string, planId: string, requestsPerMinute: number): RateLimitSnapshot {
+  if (isPremiumPlan(planId)) {
+    return {
+      limit: null,
+      remaining: null,
+      resetAtEpochSeconds: null,
+      retryAfterSeconds: null
+    };
+  }
+
+  const limit = Math.max(1, requestsPerMinute);
+  const key = `${vaultId}:normal-ingest`;
+  const waitMs = getTokenBucketWaitMs(ingestRequestBuckets, key, limit, 1);
+  if (waitMs > 0) {
+    throw new QuotaExceededError('ingest rate limit exceeded', {
+      limit,
+      remaining: 0,
+      resetAtEpochSeconds: Math.floor((Date.now() + waitMs) / 1000),
+      retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000))
+    });
+  }
+
+  consumeTokenBucket(ingestRequestBuckets, key, limit, 1);
+  const remaining = Math.max(0, Math.floor(ingestRequestBuckets.get(key)?.tokens ?? 0));
+  return {
+    limit,
+    remaining,
+    resetAtEpochSeconds: Math.floor((Date.now() + 60_000) / 1000),
+    retryAfterSeconds: null
+  };
+}
+
 // NOTE: incrementUsage is intended for low-volume internal adjustments. Hot API paths
 // use consumeApiQuota so quota checks and increments stay atomic.
 export async function incrementUsage(vaultId: string, field: UsageField) {
@@ -174,6 +221,30 @@ export async function incrementUsage(vaultId: string, field: UsageField) {
 }
 
 export async function consumeApiQuota(vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
+  const reservation = await reserveApiQuota(vaultId, field);
+  return reservation.snapshot;
+}
+
+export async function reserveApiQuota(vaultId: string, field: UsageField): Promise<ApiQuotaReservation> {
+  const result = await withTransaction((client) => consumeApiQuotaWithPeriodInTransaction(client, vaultId, field));
+  return {
+    field,
+    period: result.period,
+    snapshot: result.snapshot,
+    vaultId
+  };
+}
+
+export async function consumeApiQuotaInTransaction(client: PoolClient, vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
+  const result = await consumeApiQuotaWithPeriodInTransaction(client, vaultId, field);
+  return result.snapshot;
+}
+
+async function consumeApiQuotaWithPeriodInTransaction(
+  client: PoolClient,
+  vaultId: string,
+  field: UsageField
+): Promise<{ period: string; snapshot: RateLimitSnapshot }> {
   if (!allowedUsageFields.includes(field)) {
     throw new Error(`Invalid usage field: ${field}`);
   }
@@ -190,74 +261,89 @@ export async function consumeApiQuota(vaultId: string, field: UsageField): Promi
     END`;
   }).join(',\n           ');
   const resetAtEpochSeconds = getNextUsageResetEpochSeconds();
-  const { consumed, limit } = await withTransaction(async (client) => {
-    const limitResult = await client.query<ApiQuotaLimitRow>(
-      `SELECT COALESCE((v.rate_limit_override->>$2), (p.limits->>$2)) AS quota_limit
-       FROM vaults AS v
-       JOIN plans AS p
-         ON p.id = v.plan_id
-       WHERE v.id = $1
-       LIMIT 1
-       FOR KEY SHARE OF v`,
-      [vaultId, limitKey]
-    );
+  const limitResult = await client.query<ApiQuotaLimitRow>(
+    `SELECT COALESCE((v.rate_limit_override->>$2), (p.limits->>$2)) AS quota_limit
+     FROM vaults AS v
+     JOIN plans AS p
+       ON p.id = v.plan_id
+     WHERE v.id = $1
+     LIMIT 1
+     FOR KEY SHARE OF v`,
+    [vaultId, limitKey]
+  );
 
-    if (!limitResult.rowCount) {
-      throw new Error(`Vault ${vaultId} not found`);
-    }
+  if (!limitResult.rowCount) {
+    throw new Error(`Vault ${vaultId} not found`);
+  }
 
-    const limit = limitResult.rows[0].quota_limit ? Number(limitResult.rows[0].quota_limit) : undefined;
-    if (limit !== undefined && limit <= 0) {
-      throw new QuotaExceededError(`${field} quota exceeded`, {
-        limit,
-        remaining: 0,
-        resetAtEpochSeconds,
-        retryAfterSeconds: Math.max(1, resetAtEpochSeconds - Math.floor(Date.now() / 1000))
-      });
-    }
+  const limit = limitResult.rows[0].quota_limit ? Number(limitResult.rows[0].quota_limit) : undefined;
+  if (limit !== undefined && limit <= 0) {
+    throw new QuotaExceededError(`${field} quota exceeded`, {
+      limit,
+      remaining: 0,
+      resetAtEpochSeconds,
+      retryAfterSeconds: Math.max(1, resetAtEpochSeconds - Math.floor(Date.now() / 1000))
+    });
+  }
 
-    const result = await client.query<AtomicQuotaConsumeRow>(
-      `INSERT INTO vault_usage (vault_id, period, ingest_events, memory_adds, searches, updated_at)
-       VALUES ($1, $2, $3, $4, $5, now())
-       ON CONFLICT (vault_id) DO UPDATE
-       SET period = EXCLUDED.period,
-           ${assignments},
-           updated_at = now()
-       WHERE $6::int IS NULL
-          OR vault_usage.period <> EXCLUDED.period
-          OR vault_usage.${fieldColumn[field]} < $6::int
-       RETURNING ${fieldColumn[field]}::text AS consumed`,
-      [
-        vaultId,
-        period,
-        field === 'ingest_events' ? 1 : 0,
-        field === 'memory_adds' ? 1 : 0,
-        field === 'searches' ? 1 : 0,
-        limit ?? null
-      ]
-    );
+  const result = await client.query<AtomicQuotaConsumeRow>(
+    `INSERT INTO vault_usage (vault_id, period, ingest_events, memory_adds, searches, updated_at)
+     VALUES ($1, $2, $3, $4, $5, now())
+     ON CONFLICT (vault_id) DO UPDATE
+     SET period = EXCLUDED.period,
+         ${assignments},
+         updated_at = now()
+     WHERE $6::int IS NULL
+        OR vault_usage.period <> EXCLUDED.period
+        OR vault_usage.${fieldColumn[field]} < $6::int
+     RETURNING ${fieldColumn[field]}::text AS consumed`,
+    [
+      vaultId,
+      period,
+      field === 'ingest_events' ? 1 : 0,
+      field === 'memory_adds' ? 1 : 0,
+      field === 'searches' ? 1 : 0,
+      limit ?? null
+    ]
+  );
 
-    if (!result.rowCount) {
-      throw new QuotaExceededError(`${field} quota exceeded`, {
-        limit: limit ?? null,
-        remaining: 0,
-        resetAtEpochSeconds,
-        retryAfterSeconds: Math.max(1, resetAtEpochSeconds - Math.floor(Date.now() / 1000))
-      });
-    }
+  if (!result.rowCount) {
+    throw new QuotaExceededError(`${field} quota exceeded`, {
+      limit: limit ?? null,
+      remaining: 0,
+      resetAtEpochSeconds,
+      retryAfterSeconds: Math.max(1, resetAtEpochSeconds - Math.floor(Date.now() / 1000))
+    });
+  }
 
-    return {
-      consumed: Number(result.rows[0].consumed),
-      limit
-    };
-  });
+  const consumed = Number(result.rows[0].consumed);
 
   return {
-    limit: limit ?? null,
-    remaining: limit === undefined ? null : Math.max(0, limit - consumed),
-    resetAtEpochSeconds,
-    retryAfterSeconds: null
+    period,
+    snapshot: {
+      limit: limit ?? null,
+      remaining: limit === undefined ? null : Math.max(0, limit - consumed),
+      resetAtEpochSeconds,
+      retryAfterSeconds: null
+    }
   };
+}
+
+export async function refundApiQuotaReservation(reservation: ApiQuotaReservation): Promise<void> {
+  if (!allowedUsageFields.includes(reservation.field)) {
+    throw new Error(`Invalid usage field: ${reservation.field}`);
+  }
+
+  const column = fieldColumn[reservation.field];
+  await query(
+    `UPDATE vault_usage
+     SET ${column} = GREATEST(${column} - 1, 0),
+         updated_at = now()
+     WHERE vault_id = $1
+       AND period = $2
+       AND ${column} > 0`,
+    [reservation.vaultId, reservation.period]
+  );
 }
 
 export async function checkQuota(vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
@@ -480,6 +566,13 @@ export const usageTestInternals = {
   clearAiBuckets() {
     aiRequestBuckets.clear();
     aiTokenBuckets.clear();
+    ingestRequestBuckets.clear();
+  },
+  clearIngestBuckets() {
+    ingestRequestBuckets.clear();
+  },
+  getIngestBucketTokens(vaultId: string) {
+    return ingestRequestBuckets.get(`${vaultId}:normal-ingest`)?.tokens ?? null;
   },
   getAiBucketTokens(kind: 'requests' | 'tokens', vaultId: string, role: AiBudgetRole) {
     const bucket = (kind === 'requests' ? aiRequestBuckets : aiTokenBuckets).get(`${vaultId}:${role}:${kind}`);

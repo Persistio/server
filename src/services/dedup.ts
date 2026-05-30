@@ -439,7 +439,8 @@ async function resolveDedupMatch(
        AND ${subjectMatchColumn} = $2
        AND m.archived_at IS NULL
        AND m.embedding IS NOT NULL
-     ORDER BY similarity DESC`,
+     ORDER BY similarity DESC
+     LIMIT 1`,
     [input.vaultId, subjectMatchTarget, JSON.stringify(input.embedding)]
   );
 

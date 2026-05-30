@@ -153,7 +153,7 @@ async function main() {
 
   await registerHealthRoutes(app, config);
   if (shouldRegisterFullApi) {
-    await registerIngestRoutes(app);
+    await registerIngestRoutes(app, worker ? triggerExtraction : undefined);
     await registerRecallRoutes(app);
     await registerMemoryRoutes(app);
     await registerJobRoutes(app, jobs, triggerExtraction);

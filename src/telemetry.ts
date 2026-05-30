@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { context, metrics, SpanStatusCode, trace } from '@opentelemetry/api';
 
 export interface SpanLike {
@@ -36,11 +39,15 @@ const noopSpan: SpanLike = {
   end() {}
 };
 
+const serverPackageJsonPath = path.resolve(__dirname, '..', 'package.json');
+const serverVersion = JSON.parse(fs.readFileSync(serverPackageJsonPath, 'utf8')) as { version?: string };
+const instrumentationVersion = serverVersion.version ?? '0.0.0';
+
 export function getTracer() {
-  return trace.getTracer('persistio-server', '0.1.0');
+  return trace.getTracer('persistio-server', instrumentationVersion);
 }
 
-export const meter = metrics.getMeter('persistio-server', '0.1.0');
+export const meter = metrics.getMeter('persistio-server', instrumentationVersion);
 
 export function getTraceId() {
   return trace.getActiveSpan()?.spanContext().traceId;

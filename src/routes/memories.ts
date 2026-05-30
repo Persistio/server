@@ -7,7 +7,16 @@ import { query } from '../db/client';
 import { requireVaultAuth } from '../middleware/auth';
 import { decryptForVault, encryptForVault, encryptSubjectForVault, isVaultEncryptionActive } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
+import { pendingRecallCutoff } from '../services/pending-memory';
 import { enforceMemoryCreationLimit } from '../services/usage';
+
+const booleanQueryParam = z.preprocess((value) => {
+  if (value === undefined) return false;
+  if (Array.isArray(value)) return value[0];
+  if (value === 'true' || value === true) return true;
+  if (value === 'false' || value === false) return false;
+  return value;
+}, z.boolean());
 
 const listQuerySchema = z.object({
   archived: z.enum(['true', 'false']).optional().default('false'),
@@ -15,6 +24,10 @@ const listQuerySchema = z.object({
   include_children: z.coerce.boolean().optional().default(false),
   limit: z.coerce.number().int().min(1).max(200).default(50),
   offset: z.coerce.number().int().min(0).default(0)
+});
+
+const readMemoryQuerySchema = z.object({
+  include_pending: booleanQueryParam
 });
 
 const createMemorySchema = z.object({
@@ -38,6 +51,39 @@ const updateMemorySchema = z.object({
   evidence: z.string().nullable().optional(),
   archived: z.boolean().optional()
 });
+
+const graphEdgeTypes = [
+  'applies_to',
+  'part_of',
+  'depends_on',
+  'supports',
+  'contradicts',
+  'supersedes',
+  'refines',
+  'relevant_when'
+] as const;
+
+const graphQuerySchema = z.object({
+  seed_memory_id: z.string().uuid().optional(),
+  depth: z.coerce.number().int().min(0).max(3).optional().default(1),
+  limit: z.coerce.number().int().min(1).max(100).optional().default(50),
+  direction: z.enum(['out', 'in', 'both']).optional().default('both'),
+  edge_types: z.preprocess((value) => {
+    if (value === undefined) return undefined;
+    const values = Array.isArray(value) ? value : [value];
+    return values
+      .flatMap((item) => String(item).split(','))
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }, z.array(z.enum(graphEdgeTypes)).min(1).max(graphEdgeTypes.length).optional())
+});
+
+function memoryResponseSelect(source: string, edgeSource = source): string {
+  return `${source}.id, ${source}.vault_id, ${source}.data, ${source}.subject, ${source}.subject_encrypted, ${source}.hash, ${source}.source_chunks,
+       ${source}.categories, ${source}.confidence, ${source}.score, ${source}.salience, ${source}.sensitivity, ${source}.type, ${source}.scope, ${source}.evidence, ${source}.polarity, ${source}.status,
+       ${source}.valid_from, ${source}.valid_until, ${source}.source_timestamp, ${source}.archived_at, ${source}.created_at, ${source}.updated_at, ${source}.parent_id, ${source}.volatility,
+       COALESCE((SELECT COUNT(*)::int FROM memory_edges edge_counts WHERE edge_counts.from_memory_id = ${edgeSource}.id OR edge_counts.to_memory_id = ${edgeSource}.id), 0) AS edge_count`;
+}
 
 export async function registerMemoryRoutes(app: FastifyInstance) {
   app.get('/v1/memories', { preHandler: requireVaultAuth }, async (request) => {
@@ -73,20 +119,14 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
                  AND ${recursiveArchivedClause}
                  AND t.depth < 10
              )
-             SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-                    categories, confidence, score, salience, sensitivity, type, scope, evidence, polarity, status,
-                    valid_from, valid_until, archived_at, created_at, updated_at, parent_id, volatility,
-                    COALESCE((SELECT COUNT(*) FROM memory_edges e WHERE e.from_memory_id = tree.id OR e.to_memory_id = tree.id), 0) AS edge_count
+             SELECT ${memoryResponseSelect('tree')}
              FROM tree
              WHERE ${finalArchivedClause}
              ORDER BY created_at DESC
              LIMIT 1000`;
     } else {
       values.push(qs.limit, qs.offset);
-      sql = `SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-                    categories, confidence, score, salience, sensitivity, type, scope, evidence, polarity, status,
-                    valid_from, valid_until, archived_at, created_at, updated_at, parent_id, volatility,
-                    COALESCE((SELECT COUNT(*) FROM memory_edges e WHERE e.from_memory_id = memories.id OR e.to_memory_id = memories.id), 0) AS edge_count
+      sql = `SELECT ${memoryResponseSelect('memories')}
              FROM memories
              WHERE ${conditions.join(' AND ')}
              ORDER BY updated_at DESC, created_at DESC
@@ -134,10 +174,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
          vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, categories, parent_id, type, scope, evidence, volatility
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::text[], $9, $10, $11, $12::jsonb, $13::memory_volatility)
-       RETURNING id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-                categories, confidence, score, salience, sensitivity, type, scope, evidence, polarity, status,
-                valid_from, valid_until, archived_at, created_at, updated_at, parent_id, volatility,
-                COALESCE((SELECT COUNT(*) FROM memory_edges e WHERE e.from_memory_id = memories.id OR e.to_memory_id = memories.id), 0) AS edge_count`,
+       RETURNING ${memoryResponseSelect('memories')}`,
       [
         request.vault.id,
         storedData,
@@ -166,19 +203,67 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     return reply.code(201).send(await decryptMemoryRow(request.vault, result.rows[0]));
   });
 
+  app.get('/v1/memories/graph', { preHandler: requireVaultAuth }, async (request, reply) => {
+    const parsedQuery = graphQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) {
+      return reply.code(400).send({ error: 'Invalid graph query' });
+    }
+
+    const qs = parsedQuery.data;
+    const edgeTypes = qs.edge_types ?? null;
+    const nodes = qs.seed_memory_id
+      ? await fetchSeededGraphNodes(request.vault.id, qs.seed_memory_id, qs.depth, qs.limit, qs.direction, edgeTypes)
+      : await fetchGraphOverviewNodes(request.vault.id, qs.limit);
+
+    if (qs.seed_memory_id && nodes.length === 0) {
+      return reply.code(404).send({ error: 'Seed memory not found' });
+    }
+
+    const nodeIds = nodes.map((node) => String(node.id));
+    const edges = nodeIds.length
+      ? await fetchGraphEdges(request.vault.id, nodeIds, edgeTypes)
+      : [];
+    const decryptedNodes = await Promise.all(nodes.map((row) => decryptMemoryRow(request.vault, row)));
+
+    return {
+      seed_memory_id: qs.seed_memory_id ?? null,
+      depth: qs.depth,
+      limit: qs.limit,
+      direction: qs.direction,
+      edge_types: qs.edge_types ?? null,
+      nodes: decryptedNodes,
+      edges
+    };
+  });
+
   app.get('/v1/memories/:id', { preHandler: requireVaultAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const qs = readMemoryQuerySchema.parse(request.query);
+    const values: unknown[] = [request.vault.id, params.id];
+    const visibility = qs.include_pending
+      ? `(
+           status IS NULL
+           OR status <> 'candidate'
+           OR (
+             status = 'candidate'
+             AND archived_at IS NULL
+             AND COALESCE(source_timestamp, created_at) >= $3::timestamptz
+           )
+         )`
+      : `(status IS NULL OR status <> 'candidate')`;
+
+    if (qs.include_pending) {
+      values.push(pendingRecallCutoff().toISOString());
+    }
+
     const result = await query<Record<string, unknown>>(
-      `SELECT id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-              categories, confidence, score, salience, sensitivity, type, scope, evidence, polarity, status,
-              valid_from, valid_until, archived_at, created_at, updated_at, parent_id, volatility,
-              COALESCE((SELECT COUNT(*) FROM memory_edges e WHERE e.from_memory_id = memories.id OR e.to_memory_id = memories.id), 0) AS edge_count
+      `SELECT ${memoryResponseSelect('memories')}
        FROM memories
        WHERE vault_id = $1
          AND id = $2
-         AND (status IS NULL OR status <> 'candidate')
+         AND ${visibility}
        LIMIT 1`,
-      [request.vault.id, params.id]
+      values
     );
 
     if (!result.rowCount) {
@@ -283,10 +368,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
        WHERE vault_id = $1
          AND id = $2
          AND (status IS NULL OR status <> 'candidate')
-       RETURNING id, vault_id, data, subject, subject_encrypted, hash, source_chunks,
-                 categories, confidence, score, salience, sensitivity, type, scope, evidence, polarity, status,
-                 valid_from, valid_until, archived_at, created_at, updated_at, parent_id, volatility,
-                 COALESCE((SELECT COUNT(*) FROM memory_edges e WHERE e.from_memory_id = memories.id OR e.to_memory_id = memories.id), 0) AS edge_count`,
+       RETURNING ${memoryResponseSelect('memories')}`,
       [
         request.vault.id,
         params.id,
@@ -321,6 +403,176 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
 
     return decryptMemoryRow(request.vault, result.rows[0]);
   });
+}
+
+type GraphDirection = 'out' | 'in' | 'both';
+type GraphEdgeType = typeof graphEdgeTypes[number];
+
+interface GraphNodeRow extends MemoryResponseRow {
+  id: string;
+  depth: number;
+}
+
+interface GraphEdgeRow extends QueryResultRow {
+  id: string;
+  from_memory_id: string;
+  to_memory_id: string;
+  type: GraphEdgeType;
+  confidence: number;
+  reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+async function fetchSeededGraphNodes(
+  vaultId: string,
+  seedMemoryId: string,
+  depth: number,
+  limit: number,
+  direction: GraphDirection,
+  edgeTypes: GraphEdgeType[] | null
+): Promise<GraphNodeRow[]> {
+  const seed = await fetchVisibleGraphSeed(vaultId, seedMemoryId);
+  if (!seed) return [];
+
+  const nodes: GraphNodeRow[] = [seed];
+  const seen = new Set<string>([seed.id]);
+  let frontier: GraphNodeRow[] = [seed];
+
+  for (let nextDepth = 1; nextDepth <= depth && nodes.length < limit && frontier.length > 0; nextDepth += 1) {
+    const remaining = limit - nodes.length;
+    const neighbors = await fetchGraphNeighborNodes(
+      vaultId,
+      frontier.map((node) => node.id),
+      [...seen],
+      nextDepth,
+      remaining,
+      direction,
+      edgeTypes
+    );
+    const uniqueNeighbors = neighbors.filter((node) => {
+      if (seen.has(node.id)) return false;
+      seen.add(node.id);
+      return true;
+    });
+
+    nodes.push(...uniqueNeighbors);
+    frontier = uniqueNeighbors;
+  }
+
+  return nodes;
+}
+
+async function fetchVisibleGraphSeed(vaultId: string, seedMemoryId: string): Promise<GraphNodeRow | null> {
+  const result = await query<GraphNodeRow>(
+    `SELECT ${memoryResponseSelect('memories')}, 0 AS depth
+     FROM memories
+     WHERE vault_id = $1
+       AND id = $2
+       AND archived_at IS NULL
+       AND (status IS NULL OR status <> 'candidate')
+     LIMIT 1`,
+    [vaultId, seedMemoryId]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+function getNeighborEdgeSelect(direction: GraphDirection): string {
+  const outbound = `SELECT e.to_memory_id AS neighbor_id, e.confidence, e.updated_at AS edge_updated_at
+                   FROM memory_edges e
+                   WHERE e.vault_id = $1
+                     AND e.from_memory_id = frontier.id
+                     AND NOT (e.to_memory_id = ANY($3::uuid[]))
+                     AND ($4::text[] IS NULL OR e.type = ANY($4::text[]))`;
+  const inbound = `SELECT e.from_memory_id AS neighbor_id, e.confidence, e.updated_at AS edge_updated_at
+                  FROM memory_edges e
+                  WHERE e.vault_id = $1
+                    AND e.to_memory_id = frontier.id
+                    AND NOT (e.from_memory_id = ANY($3::uuid[]))
+                    AND ($4::text[] IS NULL OR e.type = ANY($4::text[]))`;
+
+  if (direction === 'out') return outbound;
+  if (direction === 'in') return inbound;
+  return `${outbound} UNION ALL ${inbound}`;
+}
+
+async function fetchGraphNeighborNodes(
+  vaultId: string,
+  frontierIds: string[],
+  excludedIds: string[],
+  nextDepth: number,
+  limit: number,
+  direction: GraphDirection,
+  edgeTypes: GraphEdgeType[] | null
+): Promise<GraphNodeRow[]> {
+  const perFrontierNodeLimit = Math.min(Math.max(limit * 2, 10), 50);
+  const neighborEdgeSelect = getNeighborEdgeSelect(direction);
+  const result = await query<GraphNodeRow>(
+    `WITH frontier AS (
+       SELECT unnest($2::uuid[]) AS id
+     ), candidate_edges AS (
+       SELECT candidate.neighbor_id, candidate.confidence, candidate.edge_updated_at
+       FROM frontier
+       CROSS JOIN LATERAL (
+         ${neighborEdgeSelect}
+         ORDER BY confidence DESC, edge_updated_at DESC, neighbor_id
+         LIMIT $7
+       ) candidate
+     ), ranked_edges AS (
+       SELECT neighbor_id,
+              MAX(confidence) AS confidence,
+              MAX(edge_updated_at) AS edge_updated_at
+       FROM candidate_edges
+       GROUP BY neighbor_id
+     )
+     SELECT ${memoryResponseSelect('memories')}, $5::int AS depth
+     FROM ranked_edges
+     JOIN memories ON memories.id = ranked_edges.neighbor_id
+     WHERE memories.vault_id = $1
+       AND memories.archived_at IS NULL
+       AND (memories.status IS NULL OR memories.status <> 'candidate')
+     ORDER BY ranked_edges.confidence DESC, memories.salience DESC, ranked_edges.edge_updated_at DESC, memories.updated_at DESC, memories.id
+     LIMIT $6`,
+    [vaultId, frontierIds, excludedIds, edgeTypes, nextDepth, limit, perFrontierNodeLimit]
+  );
+
+  return result.rows;
+}
+
+async function fetchGraphOverviewNodes(vaultId: string, limit: number): Promise<GraphNodeRow[]> {
+  const result = await query<GraphNodeRow>(
+    `SELECT ${memoryResponseSelect('memories')}, 0 AS depth
+     FROM memories
+     WHERE vault_id = $1
+       AND archived_at IS NULL
+       AND (status IS NULL OR status <> 'candidate')
+     ORDER BY salience DESC, updated_at DESC, created_at DESC, id
+     LIMIT $2`,
+    [vaultId, limit]
+  );
+
+  return result.rows;
+}
+
+async function fetchGraphEdges(
+  vaultId: string,
+  nodeIds: string[],
+  edgeTypes: GraphEdgeType[] | null
+): Promise<GraphEdgeRow[]> {
+  const result = await query<GraphEdgeRow>(
+    `SELECT id, from_memory_id, to_memory_id, type, confidence, reason, created_at, updated_at
+     FROM memory_edges
+     WHERE vault_id = $1
+       AND from_memory_id = ANY($2::uuid[])
+       AND to_memory_id = ANY($2::uuid[])
+       AND ($3::text[] IS NULL OR type = ANY($3::text[]))
+     ORDER BY type ASC, confidence DESC, updated_at DESC, id
+     LIMIT 500`,
+    [vaultId, nodeIds, edgeTypes]
+  );
+
+  return result.rows;
 }
 
 interface MemoryResponseRow extends QueryResultRow {

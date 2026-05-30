@@ -1,22 +1,66 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Pool, type PoolClient, type QueryResultRow } from 'pg';
+import { Pool, type PoolClient, type PoolConfig, type QueryResultRow } from 'pg';
 import pgvector from 'pgvector/pg';
 
 import { getConfig } from '../config';
 
 const config = getConfig();
+const registeredPgvectorClients = new WeakSet<PoolClient>();
+let pgvectorTypeRegistrationEnabled = false;
+let lastPoolWarningAt = 0;
+
+type PoolConfigWithVerify = PoolConfig & {
+  verify?: (client: PoolClient, callback: (error?: Error) => void) => void;
+};
+
+type PgvectorRegisterType = (client: PoolClient) => Promise<void>;
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+async function registerPgvectorTypes(
+  client: PoolClient,
+  registerType: PgvectorRegisterType = pgvector.registerType
+): Promise<void> {
+  if (registeredPgvectorClients.has(client)) {
+    return;
+  }
+
+  await registerType(client);
+  registeredPgvectorClients.add(client);
+}
+
+export function createPgvectorVerifyHook(
+  registerType: PgvectorRegisterType = pgvector.registerType,
+  isEnabled = () => pgvectorTypeRegistrationEnabled
+): (client: PoolClient, callback: (error?: Error) => void) => void {
+  return (client, callback) => {
+    if (!isEnabled() || registeredPgvectorClients.has(client)) {
+      callback();
+      return;
+    }
+
+    registerPgvectorTypes(client, registerType)
+      .then(() => callback())
+      .catch((error: unknown) => callback(toError(error)));
+  };
+}
 
 export const pool = new Pool({
   connectionString: config.DATABASE_URL,
-  max: config.PG_POOL_MAX
-});
+  max: getConfiguredPoolMax(config),
+  verify: createPgvectorVerifyHook()
+} as PoolConfigWithVerify);
 
 export async function query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]) {
+  warnIfPoolNearExhaustion();
   return pool.query<T>(text, values);
 }
 
 export async function withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+  warnIfPoolNearExhaustion();
   const client = await pool.connect();
 
   try {
@@ -77,20 +121,42 @@ export async function runMigrations() {
         throw error;
       }
     }
+    pgvectorTypeRegistrationEnabled = true;
+    await registerPgvectorTypes(client);
   } finally {
     client.release();
   }
-
-  // Now that the vector extension exists, register the type for all future connections
-  pool.on('connect', (client) => {
-    pgvector.registerType(client);
-  });
-
-  // Re-register on existing idle connections by bouncing the pool
-  // (simplest approach: end pool and recreate — but since we just started, pool is empty after release)
-  // Force a fresh connection so the handler fires for the next query
 }
 
 export async function closePool() {
   await pool.end();
+}
+
+export function getConfiguredPoolMax(appConfig = config): number {
+  return Math.min(appConfig.DB_POOL_MAX, appConfig.EXTRACTION_WORKER_CONCURRENCY * 2 + 2);
+}
+
+export function warnIfPoolNearExhaustion(now = Date.now()) {
+  const max = getPoolMax(pool);
+  if (max <= 0 || pool.totalCount < max * 0.8) {
+    return;
+  }
+
+  if (now - lastPoolWarningAt < 60_000) {
+    return;
+  }
+
+  lastPoolWarningAt = now;
+  console.warn(JSON.stringify({
+    level: 40,
+    msg: 'postgres pool nearing capacity',
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount,
+    max
+  }));
+}
+
+function getPoolMax(poolLike: Pool): number {
+  return Number((poolLike as unknown as { options?: { max?: number } }).options?.max ?? config.DB_POOL_MAX);
 }

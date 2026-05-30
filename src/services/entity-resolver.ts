@@ -1,4 +1,5 @@
 import { query } from '../db/client';
+import { computeSubjectHmac, isVaultEncryptionActive, unwrapDek, type VaultEncryptionContext } from './crypto';
 
 export function normaliseSubject(subject: string): string {
   return subject
@@ -33,25 +34,43 @@ export async function getVaultSubjectList(
   topN: number,
   recentN: number
 ): Promise<VaultSubject[]> {
+  const vaultResult = await query<VaultEncryptionContext>(
+    `SELECT id, encrypted_dek, vault_encryption_enabled
+     FROM vaults
+     WHERE id = $1
+     LIMIT 1`,
+    [vaultId]
+  );
+  const vault = vaultResult.rows[0];
+  if (!vault) {
+    return [];
+  }
+
+  if (isVaultEncryptionActive(vault)) {
+    return getEncryptedVaultSubjectList(vault, topN, recentN);
+  }
+
   // Top N by memory count
-  const topResult = await query<{ canonical: string }>(
-    `SELECT ea.canonical, COUNT(m.id) AS cnt
+  const topResult = await query<{ subject: string }>(
+    `SELECT m.subject, COUNT(m.id) AS cnt
      FROM memories m
-     JOIN entity_aliases ea ON ea.vault_id = m.vault_id AND ea.canonical = m.subject_hmac
-     WHERE m.vault_id = $1 AND m.archived_at IS NULL
-     GROUP BY ea.canonical
+     WHERE m.vault_id = $1
+       AND m.archived_at IS NULL
+       AND m.subject <> ''
+     GROUP BY m.subject
      ORDER BY cnt DESC
      LIMIT $2`,
     [vaultId, topN]
   );
 
   // Recent N by latest memory activity
-  const recentResult = await query<{ canonical: string }>(
-    `SELECT ea.canonical
+  const recentResult = await query<{ subject: string }>(
+    `SELECT m.subject
      FROM memories m
-     JOIN entity_aliases ea ON ea.vault_id = m.vault_id AND ea.canonical = m.subject_hmac
-     WHERE m.vault_id = $1 AND m.archived_at IS NULL
-     GROUP BY ea.canonical
+     WHERE m.vault_id = $1
+       AND m.archived_at IS NULL
+       AND m.subject <> ''
+     GROUP BY m.subject
      ORDER BY MAX(COALESCE(m.updated_at, m.created_at)) DESC NULLS LAST
      LIMIT $2`,
     [vaultId, recentN]
@@ -61,22 +80,108 @@ export async function getVaultSubjectList(
   const seen = new Set<string>();
   const canonicals: string[] = [];
   for (const row of [...topResult.rows, ...recentResult.rows]) {
-    if (!seen.has(row.canonical)) {
-      seen.add(row.canonical);
-      canonicals.push(row.canonical);
+    const canonical = normaliseSubject(row.subject);
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      canonicals.push(canonical);
     }
   }
 
-  if (canonicals.length === 0) {
+  return hydrateVaultSubjects(vaultId, canonicals);
+}
+
+async function getEncryptedVaultSubjectList(
+  vault: VaultEncryptionContext,
+  topN: number,
+  recentN: number
+): Promise<VaultSubject[]> {
+  if (!vault.encrypted_dek) {
     return [];
   }
+
+  const aliasResult = await query<{ canonical: string; alias: string }>(
+    `SELECT canonical, alias
+     FROM entity_aliases
+     WHERE vault_id = $1`,
+    [vault.id]
+  );
+  if (aliasResult.rows.length === 0) {
+    return [];
+  }
+
+  const dek = await unwrapDek(vault.encrypted_dek);
+  const hmacs: string[] = [];
+  const hmacCanonicals: string[] = [];
+  for (const row of aliasResult.rows) {
+    hmacs.push(computeSubjectHmac(row.alias, dek));
+    hmacCanonicals.push(row.canonical);
+  }
+
+  const topResult = await query<{ canonical: string }>(
+    `WITH known_subjects AS (
+       SELECT subject_hmac, canonical
+       FROM UNNEST($2::text[], $3::text[]) AS t(subject_hmac, canonical)
+     )
+     SELECT ks.canonical, COUNT(m.id) AS cnt
+     FROM memories m
+     JOIN known_subjects ks ON ks.subject_hmac = m.subject_hmac
+     WHERE m.vault_id = $1
+       AND m.archived_at IS NULL
+     GROUP BY ks.canonical
+     ORDER BY cnt DESC
+     LIMIT $4`,
+    [vault.id, hmacs, hmacCanonicals, topN]
+  );
+
+  const recentResult = await query<{ canonical: string }>(
+    `WITH known_subjects AS (
+       SELECT subject_hmac, canonical
+       FROM UNNEST($2::text[], $3::text[]) AS t(subject_hmac, canonical)
+     )
+     SELECT ks.canonical
+     FROM memories m
+     JOIN known_subjects ks ON ks.subject_hmac = m.subject_hmac
+     WHERE m.vault_id = $1
+       AND m.archived_at IS NULL
+     GROUP BY ks.canonical
+     ORDER BY MAX(COALESCE(m.updated_at, m.created_at)) DESC NULLS LAST
+     LIMIT $4`,
+    [vault.id, hmacs, hmacCanonicals, recentN]
+  );
+
+  return hydrateVaultSubjects(vault.id, [
+    ...topResult.rows.map((row) => row.canonical),
+    ...recentResult.rows.map((row) => row.canonical)
+  ]);
+}
+
+async function hydrateVaultSubjects(vaultId: string, canonicals: string[]): Promise<VaultSubject[]> {
+  const uniqueCanonicals = Array.from(new Set(canonicals));
+  if (uniqueCanonicals.length === 0) {
+    return [];
+  }
+
+  const aliasLookupResult = await query<{ canonical: string; alias: string }>(
+    `SELECT canonical, alias
+     FROM entity_aliases
+     WHERE vault_id = $1
+       AND (
+         canonical = ANY($2::text[])
+         OR alias = ANY($2::text[])
+       )`,
+    [vaultId, uniqueCanonicals]
+  );
+
+  const canonicalByAlias = new Map(aliasLookupResult.rows.map((row) => [row.alias, row.canonical]));
+  const resolvedCanonicals = uniqueCanonicals.map((canonical) => canonicalByAlias.get(canonical) ?? canonical);
+  const uniqueResolvedCanonicals = Array.from(new Set(resolvedCanonicals));
 
   const aliasResult = await query<{ canonical: string; alias: string; embedding: string | null }>(
     `SELECT canonical, alias, embedding::text AS embedding
      FROM entity_aliases
      WHERE vault_id = $1
        AND canonical = ANY($2::text[])`,
-    [vaultId, canonicals]
+    [vaultId, uniqueResolvedCanonicals]
   );
 
   const aliasRowsByCanonical = new Map<string, { alias: string; embedding: string | null }[]>();
@@ -86,7 +191,7 @@ export async function getVaultSubjectList(
     aliasRowsByCanonical.set(row.canonical, rows);
   }
 
-  return canonicals.map((canonical) => {
+  return uniqueResolvedCanonicals.map((canonical) => {
     const rows = aliasRowsByCanonical.get(canonical) ?? [];
     const aliases = rows
       .map((row) => row.alias)
@@ -95,11 +200,7 @@ export async function getVaultSubjectList(
     const canonicalRow = rows.find((row) => row.alias === canonical);
     let embedding: number[] | null = null;
     if (canonicalRow?.embedding) {
-      try {
-        embedding = JSON.parse(canonicalRow.embedding) as number[];
-      } catch {
-        embedding = null;
-      }
+      embedding = parseEmbedding(canonicalRow.embedding);
     }
 
     return { canonical, aliases, embedding };
@@ -107,7 +208,13 @@ export async function getVaultSubjectList(
 }
 
 function normaliseForMatching(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  return s
+    .toLowerCase()
+    .replace(/`[^`]+`/g, ' ')
+    .replace(/'s\b/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function levenshtein(a: string, b: string): number {
@@ -189,11 +296,41 @@ export async function storeCanonicalEmbedding(
   canonical: string,
   embedding: number[]
 ): Promise<void> {
+  const normalisedCanonical = normaliseSubject(canonical);
   await query(
     `INSERT INTO entity_aliases (vault_id, alias, canonical, embedding)
      VALUES ($1, $2, $2, $3::vector)
      ON CONFLICT (vault_id, alias)
      DO UPDATE SET embedding = EXCLUDED.embedding`,
-    [vaultId, canonical, JSON.stringify(embedding)]
+    [vaultId, normalisedCanonical, JSON.stringify(embedding)]
   );
+}
+
+export async function storeSubjectAlias(
+  vaultId: string,
+  alias: string,
+  canonical: string
+): Promise<void> {
+  const normalisedAlias = normaliseSubject(alias);
+  const normalisedCanonical = normaliseSubject(canonical);
+  if (!normalisedAlias || !normalisedCanonical || normalisedAlias === normalisedCanonical) {
+    return;
+  }
+
+  await query(
+    `INSERT INTO entity_aliases (vault_id, alias, canonical)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (vault_id, alias)
+     DO UPDATE SET canonical = EXCLUDED.canonical`,
+    [vaultId, normalisedAlias, normalisedCanonical]
+  );
+}
+
+function parseEmbedding(value: string): number[] | null {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(Number) : null;
+  } catch {
+    return null;
+  }
 }

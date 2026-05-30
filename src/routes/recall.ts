@@ -7,14 +7,17 @@ import { recallDurationHistogram } from '../metrics';
 import { requireVaultAuth } from '../middleware/auth';
 import { decryptForVault } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
+import { PENDING_RECALL_WINDOW_MS, pendingRecallCutoff } from '../services/pending-memory';
 import { applyRateLimitHeaders, consumeApiQuota } from '../services/usage';
 import { withSpan } from '../telemetry';
 
 const recallSchema = z.object({
   query: z.string().min(1),
   top_k: z.number().int().positive().max(100).optional(),
+  min_similarity: z.number().min(0).max(1).optional(),
   include_raw: z.boolean().optional().default(false),
   include_evidence: z.boolean().optional().default(false),
+  include_pending: z.boolean().optional().default(false),
   mode: z.enum(['agent', 'factual']).optional().default('agent')
 });
 
@@ -37,7 +40,8 @@ interface RecallMemoryRow {
   status: string;
   valid_from: string | null;
   valid_until: string | null;
-  similarity: number;
+  source_timestamp: string | null;
+  similarity: number | null;
   source?: 'global_behavioral' | 'semantic' | 'graph';
   edge_type?: string | null;
   created_at: string;
@@ -49,6 +53,11 @@ interface RecallMemoryRow {
 type RecallMemory = RecallMemoryRow;
 type RecallMode = 'agent' | 'factual';
 const MAX_EVIDENCE_CHUNKS = 200;
+const GRAPH_RECALL_LIMIT = 20;
+const RECALL_OVERFETCH_MULTIPLIER = 4;
+const MIN_RECALL_CANDIDATE_LIMIT = 25;
+const RECENCY_BOOST_MAX = 0.04;
+const RECENCY_BOOST_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 
 interface RecallRawChunk {
   id: string;
@@ -70,6 +79,7 @@ interface RecallEvidenceChunk {
 
 interface RecallResponse {
   memories: RecallMemory[];
+  related_memories: RecallMemory[];
   evidence_chunks: RecallEvidenceChunk[];
   raw_chunks: RecallRawChunk[];
 }
@@ -89,6 +99,7 @@ interface RecallBundle {
 
 interface RecallBundleResponse {
   bundle: RecallBundle;
+  related_bundle?: RecallBundle;
 }
 
 const bundleKeys = [
@@ -118,6 +129,30 @@ const typeToBundleKey: Record<string, RecallBundleKey> = {
   domain_knowledge: 'domain_knowledge'
 };
 
+const agentTypeBoosts: Record<string, number> = {
+  user_rule: 0.08,
+  user_preference: 0.07,
+  task_pattern: 0.06,
+  workflow: 0.04,
+  constraint: 0.03,
+  decision: 0.02,
+  project: 0.01,
+  system_fact: 0,
+  domain_knowledge: 0
+};
+
+const factualTypeBoosts: Record<string, number> = {
+  system_fact: 0.08,
+  domain_knowledge: 0.08,
+  project: 0.06,
+  decision: 0.06,
+  constraint: 0.05,
+  workflow: 0.02,
+  user_preference: 0.01,
+  task_pattern: 0.01,
+  user_rule: 0
+};
+
 function createEmptyBundle(): RecallBundle {
   return {
     global_user_rules: [],
@@ -141,8 +176,8 @@ function getBundleKey(type: string | null): RecallBundleKey {
   return typeToBundleKey[type] ?? 'system_facts';
 }
 
-function compareQueryRelevantRows(left: RecallMemoryRow, right: RecallMemoryRow): number {
-  return right.similarity - left.similarity || Number(right.salience) - Number(left.salience);
+function getSimilarity(row: RecallMemoryRow): number {
+  return row.similarity ?? 0;
 }
 
 function compareGlobalRows(left: RecallMemoryRow, right: RecallMemoryRow): number {
@@ -151,13 +186,135 @@ function compareGlobalRows(left: RecallMemoryRow, right: RecallMemoryRow): numbe
     || left.id.localeCompare(right.id);
 }
 
+function getModeTypeBoost(type: string | null, mode: RecallMode): number {
+  if (!type) {
+    return 0;
+  }
+
+  const boosts = mode === 'agent' ? agentTypeBoosts : factualTypeBoosts;
+  return boosts[type] ?? 0;
+}
+
+function getMemoryTimestampMs(row: RecallMemoryRow): number {
+  const timestamp = row.source_timestamp ?? row.updated_at ?? row.created_at;
+  const parsed = new Date(timestamp).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getPendingTimestampMs(row: RecallMemoryRow): number {
+  const timestamp = row.source_timestamp ?? row.created_at;
+  const parsed = new Date(timestamp).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isFreshPendingMemory(row: RecallMemoryRow, now: Date): boolean {
+  if (row.status !== 'candidate') {
+    return false;
+  }
+
+  const timestampMs = getPendingTimestampMs(row);
+  const nowMs = now.getTime();
+  if (!timestampMs || !Number.isFinite(nowMs)) {
+    return false;
+  }
+
+  return Math.max(0, nowMs - timestampMs) <= PENDING_RECALL_WINDOW_MS;
+}
+
+function isRecallableRow(row: RecallMemoryRow, includePending: boolean, now: Date): boolean {
+  return row.status === 'active' || (includePending && isFreshPendingMemory(row, now));
+}
+
+function getRecencyBoost(row: RecallMemoryRow, now: Date): number {
+  const timestampMs = getMemoryTimestampMs(row);
+  const nowMs = now.getTime();
+  if (!timestampMs || !Number.isFinite(nowMs)) {
+    return 0;
+  }
+
+  const ageMs = Math.max(0, nowMs - timestampMs);
+  if (ageMs >= RECENCY_BOOST_WINDOW_MS) {
+    return 0;
+  }
+
+  return RECENCY_BOOST_MAX * (1 - (ageMs / RECENCY_BOOST_WINDOW_MS));
+}
+
+function getModeRankScore(row: RecallMemoryRow, mode: RecallMode, now: Date): number {
+  return getSimilarity(row) + getModeTypeBoost(row.type, mode) + getRecencyBoost(row, now);
+}
+
+function compareModeRankedRows(mode: RecallMode, now: Date) {
+  return (left: RecallMemoryRow, right: RecallMemoryRow): number => (
+    getModeRankScore(right, mode, now) - getModeRankScore(left, mode, now)
+      || getSimilarity(right) - getSimilarity(left)
+      || Number(right.salience) - Number(left.salience)
+      || getMemoryTimestampMs(right) - getMemoryTimestampMs(left)
+      || left.id.localeCompare(right.id)
+  );
+}
+
+export function recallCandidateLimit(topK: number): number {
+  return Math.max(topK, MIN_RECALL_CANDIDATE_LIMIT, topK * RECALL_OVERFETCH_MULTIPLIER);
+}
+
 export function composeRecallRows(
   rows: RecallMemoryRow[],
   topK: number,
-  mode: RecallMode
+  mode: RecallMode,
+  minSimilarity = 0,
+  now = new Date(),
+  includePending = false
 ): RecallMemoryRow[] {
-  const queryRelevantRows = rows.filter((row) => row.source !== 'global_behavioral');
-  return queryRelevantRows.slice(0, topK);
+  const queryRelevantRows = rows.filter((row) => (
+    row.source !== 'global_behavioral'
+      && row.source !== 'graph'
+      && isRecallableRow(row, includePending, now)
+      && (row.source !== 'semantic' || getSimilarity(row) >= minSimilarity)
+  ));
+
+  return queryRelevantRows
+    .sort(compareModeRankedRows(mode, now))
+    .slice(0, topK);
+}
+
+export function composeRelatedRecallRows(
+  rows: RecallMemoryRow[],
+  directRows: RecallMemoryRow[],
+  limit = GRAPH_RECALL_LIMIT
+): RecallMemoryRow[] {
+  const seenIds = new Set(directRows.map((row) => row.id));
+  const relatedRows: RecallMemoryRow[] = [];
+
+  for (const row of rows) {
+    if (row.source !== 'graph' || seenIds.has(row.id)) {
+      continue;
+    }
+
+    seenIds.add(row.id);
+    relatedRows.push(row);
+    if (relatedRows.length >= limit) {
+      break;
+    }
+  }
+
+  return relatedRows;
+}
+
+export function combineSemanticCandidateRows(activeRows: RecallMemoryRow[], pendingRows: RecallMemoryRow[]): RecallMemoryRow[] {
+  const seenIds = new Set<string>();
+  const combinedRows: RecallMemoryRow[] = [];
+
+  for (const row of [...activeRows, ...pendingRows]) {
+    if (seenIds.has(row.id)) {
+      continue;
+    }
+
+    seenIds.add(row.id);
+    combinedRows.push(row);
+  }
+
+  return combinedRows;
 }
 
 export function buildRecallBundle(memories: RecallMemory[], globalUserRules: RecallMemory[] = []): RecallBundleResponse {
@@ -184,9 +341,7 @@ export function buildRecallBundle(memories: RecallMemory[], globalUserRules: Rec
     .map((memory) => memory.data);
 
   for (const key of bundleKeys.filter((key) => key !== 'global_user_rules')) {
-    bundle[key] = grouped[key]
-      .sort(compareQueryRelevantRows)
-      .map((memory) => memory.data);
+    bundle[key] = grouped[key].map((memory) => memory.data);
   }
 
   return { bundle };
@@ -205,19 +360,25 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       'vault.id': request.vault.id,
       'recall.include_raw': body.include_raw,
       'recall.include_evidence': body.include_evidence,
+      'recall.include_pending': body.include_pending,
       'recall.top_k': topK,
-      'recall.mode': body.mode
+      'recall.mode': body.mode,
+      'recall.min_similarity': body.min_similarity ?? config.MIN_RECALL_SIMILARITY
     }, async (span) => {
       const start = performance.now();
+      const recallTime = new Date();
       const embedder = getEmbedder();
       const embedding = await embedder.embed(body.query);
+      const minSimilarity = body.min_similarity ?? config.MIN_RECALL_SIMILARITY;
+      const candidateLimit = recallCandidateLimit(topK);
+      const pendingCutoff = pendingRecallCutoff(recallTime);
 
       // Always-on global rules are kept separate from subject-oriented recall so they
       // remain available to agents without consuming the query top_k budget.
       const globalRuleResult = body.mode === 'agent' && qs.format === 'bundle'
         ? await query<RecallMemoryRow>(
         `SELECT id, data, subject, categories, confidence, score, salience, sensitivity, type, scope, polarity,
-                status, valid_from, valid_until, created_at, updated_at, recall_count, last_recalled,
+                status, valid_from, valid_until, source_timestamp, created_at, updated_at, recall_count, last_recalled,
                 0.0 AS similarity,
                 'global_behavioral' AS source
          FROM memories
@@ -234,7 +395,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
 
       const semanticResult = await query<RecallMemoryRow>(
         `SELECT m.id, m.data, m.subject, m.categories, m.confidence, m.score, m.salience, m.sensitivity, m.type, m.scope, m.polarity,
-                m.status, m.valid_from, m.valid_until, m.created_at, m.updated_at, m.recall_count, m.last_recalled,
+                m.status, m.valid_from, m.valid_until, m.source_timestamp, m.created_at, m.updated_at, m.recall_count, m.last_recalled,
                 1 - (me.embedding <=> $2::vector) AS similarity,
                 'semantic' AS source
          FROM memories m
@@ -244,17 +405,37 @@ export async function registerRecallRoutes(app: FastifyInstance) {
            AND m.status = 'active'
          ORDER BY me.embedding <=> $2::vector
          LIMIT $3`,
-        [request.vault.id, JSON.stringify(embedding), topK]
+        [request.vault.id, JSON.stringify(embedding), candidateLimit]
       );
+      const pendingResult = body.include_pending
+        ? await query<RecallMemoryRow>(
+          `SELECT m.id, m.data, m.subject, m.categories, m.confidence, m.score, m.salience, m.sensitivity, m.type, m.scope, m.polarity,
+                  m.status, m.valid_from, m.valid_until, m.source_timestamp, m.created_at, m.updated_at, m.recall_count, m.last_recalled,
+                  1 - (me.embedding <=> $2::vector) AS similarity,
+                  'semantic' AS source
+           FROM memories m
+           JOIN memory_embeddings me ON me.memory_id = m.id
+           WHERE m.vault_id = $1
+             AND m.archived_at IS NULL
+             AND m.status = 'candidate'
+             AND COALESCE(m.source_timestamp, m.created_at) >= $4::timestamptz
+           ORDER BY me.embedding <=> $2::vector
+           LIMIT $3`,
+          [request.vault.id, JSON.stringify(embedding), candidateLimit, pendingCutoff.toISOString()]
+        )
+        : { rows: [] as RecallMemoryRow[] };
 
-      const semanticIds = semanticResult.rows.map((row) => row.id);
+      const semanticRows = combineSemanticCandidateRows(semanticResult.rows, pendingResult.rows)
+        .filter((row) => getSimilarity(row) >= minSimilarity);
+      const directRows = composeRecallRows(semanticRows, topK, body.mode, minSimilarity, recallTime, body.include_pending);
+      const semanticIds = directRows.map((row) => row.id);
       const neighborResult = semanticIds.length
         ? await query<RecallMemoryRow>(
           // Directed traversal is intentional here: edges are stored as A -> B, so querying A finds B
           // neighbors, but querying B does not walk back to A in the current retrieval model.
           `SELECT m.id, m.data, m.subject, m.categories, m.confidence, m.score, m.salience, m.sensitivity, m.type, m.scope, m.polarity,
-                  m.status, m.valid_from, m.valid_until, m.created_at, m.updated_at, m.recall_count, m.last_recalled,
-                  0.5 AS similarity, 'graph' AS source, e.type AS edge_type
+                  m.status, m.valid_from, m.valid_until, m.source_timestamp, m.created_at, m.updated_at, m.recall_count, m.last_recalled,
+                  NULL::double precision AS similarity, 'graph' AS source, e.type AS edge_type
            FROM memory_edges e
            JOIN memories m ON m.id = e.to_memory_id
            WHERE e.from_memory_id = ANY($1::uuid[])
@@ -263,29 +444,28 @@ export async function registerRecallRoutes(app: FastifyInstance) {
              AND m.status = 'active'
              AND m.archived_at IS NULL
            ORDER BY m.salience DESC, e.confidence DESC, m.updated_at DESC, m.id
-           LIMIT 20`,
-          [semanticIds, request.vault.id]
+           LIMIT $3`,
+          [semanticIds, request.vault.id, GRAPH_RECALL_LIMIT]
         )
         : { rows: [] as RecallMemoryRow[] };
 
-      const uniqueRows = [...semanticResult.rows, ...neighborResult.rows]
-        .filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
-      const combinedRows = composeRecallRows(uniqueRows, topK, body.mode);
+      const relatedRows = composeRelatedRecallRows(neighborResult.rows, directRows);
+      const recalledRows = [...directRows, ...relatedRows];
 
-      if (combinedRows.length) {
+      if (recalledRows.length) {
         void query(
           `UPDATE memories
            SET last_recalled = now(),
                recall_count = recall_count + 1
            WHERE id = ANY($1::uuid[])`,
-          [combinedRows.map((row) => row.id)]
+          [recalledRows.map((row) => row.id)]
         ).catch((error: unknown) => {
           request.log.warn({ err: error, vault_id: request.vault.id }, 'Failed to record recall metadata');
         });
       }
 
       let evidenceChunks: RecallEvidenceChunk[] = [];
-      if (body.include_evidence && qs.format !== 'bundle' && combinedRows.length) {
+      if (body.include_evidence && qs.format !== 'bundle' && recalledRows.length) {
         const evidenceResult = await query<RecallEvidenceChunk>(
           `WITH evidence_sources AS (
              SELECT m.id AS memory_id, unnest(m.source_chunks) AS chunk_id
@@ -308,7 +488,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
            WHERE rank <= 6
            ORDER BY memory_id, created_at, id
            LIMIT $3`,
-          [combinedRows.map((row) => row.id), request.vault.id, MAX_EVIDENCE_CHUNKS]
+          [recalledRows.map((row) => row.id), request.vault.id, MAX_EVIDENCE_CHUNKS]
         );
         evidenceChunks = evidenceResult.rows;
       }
@@ -324,12 +504,18 @@ export async function registerRecallRoutes(app: FastifyInstance) {
              AND embedding IS NOT NULL
            ORDER BY embedding <=> $2::vector
            LIMIT $3`,
-          [request.vault.id, JSON.stringify(embedding), topK]
+          [request.vault.id, JSON.stringify(embedding), candidateLimit]
         );
-        rawChunks = rawResult.rows;
+        rawChunks = rawResult.rows
+          .filter((row) => row.similarity >= minSimilarity)
+          .slice(0, topK);
       }
 
-      const decryptedMemories = await Promise.all(combinedRows.map(async (row) => ({
+      const decryptedMemories = await Promise.all(directRows.map(async (row) => ({
+        ...row,
+        data: await decryptForVault(request.vault, row.data)
+      })));
+      const decryptedRelatedMemories = await Promise.all(relatedRows.map(async (row) => ({
         ...row,
         data: await decryptForVault(request.vault, row.data)
       })));
@@ -351,17 +537,26 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         vault_id: request.vault.id,
         include_raw: String(body.include_raw)
       });
-      span.setAttribute('recall.results_returned', combinedRows.length);
+      span.setAttribute('recall.results_returned', directRows.length);
+      span.setAttribute('recall.semantic_candidates_returned', semanticResult.rows.length);
+      span.setAttribute('recall.pending_candidates_returned', pendingResult.rows.length);
+      span.setAttribute('recall.semantic_candidates_accepted', semanticRows.length);
+      span.setAttribute('recall.pending_candidates_accepted', directRows.filter((row) => row.status === 'candidate').length);
+      span.setAttribute('recall.related_results_returned', relatedRows.length);
       span.setAttribute('recall.evidence_results_returned', evidenceChunks.length);
       span.setAttribute('recall.raw_results_returned', rawChunks.length);
       span.setAttribute('recall.duration_ms', durationMs);
 
       if (qs.format === 'bundle') {
-        return buildRecallBundle(decryptedMemories, decryptedGlobalUserRules);
+        return {
+          ...buildRecallBundle(decryptedMemories, decryptedGlobalUserRules),
+          related_bundle: buildRecallBundle(decryptedRelatedMemories).bundle
+        };
       }
 
       const response: RecallResponse = {
         memories: decryptedMemories,
+        related_memories: decryptedRelatedMemories,
         evidence_chunks: decryptedEvidenceChunks,
         raw_chunks: decryptedRawChunks
       };

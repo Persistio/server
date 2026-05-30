@@ -11,7 +11,17 @@ vi.mock('../../db/client', () => ({
   withTransaction: async (callback: (client: { query: typeof queryMock }) => Promise<unknown>) => callback({ query: queryMock })
 }));
 
-import { AiBudgetDeferredError, QuotaExceededError, acquireAiBudget, consumeApiQuota, settleAiUsage, usageTestInternals } from '../usage';
+import {
+  AiBudgetDeferredError,
+  QuotaExceededError,
+  acquireAiBudget,
+  consumeApiQuota,
+  consumeNormalIngestRateLimit,
+  refundApiQuotaReservation,
+  reserveApiQuota,
+  settleAiUsage,
+  usageTestInternals
+} from '../usage';
 
 describe('usage service', () => {
   beforeEach(() => {
@@ -86,6 +96,44 @@ describe('usage service', () => {
         0,
         10
       ]);
+    });
+
+    it('returns a reservation that can be refunded against the reserved period', async () => {
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{
+          quota_limit: '10'
+        }]
+      });
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{
+          consumed: '3'
+        }]
+      });
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: []
+      });
+
+      const reservation = await reserveApiQuota('vault-1', 'ingest_events');
+      expect(reservation).toMatchObject({
+        field: 'ingest_events',
+        period: expect.stringMatching(/^\d{4}-\d{2}$/),
+        snapshot: {
+          limit: 10,
+          remaining: 7,
+          retryAfterSeconds: null
+        },
+        vaultId: 'vault-1'
+      });
+
+      await refundApiQuotaReservation(reservation);
+
+      expect(queryMock).toHaveBeenCalledTimes(3);
+      expect(queryMock.mock.calls[2]?.[0]).toContain('SET ingest_events = GREATEST(ingest_events - 1, 0)');
+      expect(queryMock.mock.calls[2]?.[0]).toContain('AND period = $2');
+      expect(queryMock.mock.calls[2]?.[1]).toEqual(['vault-1', reservation.period]);
     });
 
     it('treats a new period as rolled over and reports the fresh remaining quota', async () => {
@@ -225,6 +273,31 @@ describe('usage service', () => {
       await settleAiUsage('vault-1', 'escalation', 30, 45);
       expect(usageTestInternals.getAiBucketTokens('tokens', 'vault-1', 'escalation')).toBe(10);
       expect(queryMock).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('normal ingest request throttling', () => {
+    it('rate limits non-premium normal ingest requests per minute', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
+
+      expect(consumeNormalIngestRateLimit('vault-1', 'free', 1)).toMatchObject({
+        limit: 1,
+        remaining: 0,
+        retryAfterSeconds: null
+      });
+
+      expect(() => consumeNormalIngestRateLimit('vault-1', 'free', 1)).toThrow(QuotaExceededError);
+    });
+
+    it('bypasses normal ingest RPM throttling for premium plans', () => {
+      expect(consumeNormalIngestRateLimit('vault-1', 'pro', 1)).toEqual({
+        limit: null,
+        remaining: null,
+        resetAtEpochSeconds: null,
+        retryAfterSeconds: null
+      });
+      expect(usageTestInternals.getIngestBucketTokens('vault-1')).toBeNull();
     });
   });
 });
