@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { configMock, embedBatchMock, queryMock, refundApiQuotaReservationMock, reserveApiQuotaMock } = vi.hoisted(() => ({
+const { configMock, embedBatchMock, queryMock, rawChunkDeleteMock, rawChunkPutMock, refundApiQuotaReservationMock, reserveApiQuotaMock } = vi.hoisted(() => ({
   configMock: {
     EMBEDDER_PROVIDER: 'openai',
     MAX_INGEST_CHUNKS: 100,
@@ -14,6 +14,8 @@ const { configMock, embedBatchMock, queryMock, refundApiQuotaReservationMock, re
   },
   embedBatchMock: vi.fn(),
   queryMock: vi.fn(),
+  rawChunkDeleteMock: vi.fn(),
+  rawChunkPutMock: vi.fn(),
   refundApiQuotaReservationMock: vi.fn(),
   reserveApiQuotaMock: vi.fn()
 }));
@@ -45,7 +47,7 @@ vi.mock('../middleware/auth', () => ({
       name: 'Premium Eval',
       purpose: null,
       settings: {},
-      plan_id: 'pro',
+      plan_id: 'unlimited',
       status: 'active',
       encrypted_dek: null,
       vault_encryption_enabled: false
@@ -65,6 +67,15 @@ vi.mock('../services/embedder', () => ({
   })
 }));
 
+vi.mock('../services/raw-chunk-storage', () => ({
+  createRawChunkBlobKey: (vaultId: string, sessionId: string, chunkId: string) => `vaults/${vaultId}/sessions/${sessionId}/chunks/${chunkId}.txt`,
+  getRawChunkStorage: () => ({
+    store: 'local',
+    put: rawChunkPutMock,
+    delete: rawChunkDeleteMock
+  })
+}));
+
 vi.mock('../services/usage', () => ({
   applyRateLimitHeaders: vi.fn(),
   refundApiQuotaReservation: refundApiQuotaReservationMock,
@@ -75,7 +86,7 @@ vi.mock('../services/usage', () => ({
     resetAtEpochSeconds: 1,
     retryAfterSeconds: null
   })),
-  isPremiumPlan: (planId: string) => planId === 'pro' || planId === 'unlimited'
+  isPremiumPlan: (planId: string) => planId === 'unlimited'
 }));
 
 vi.mock('../metrics', () => ({
@@ -91,8 +102,11 @@ describe('bulk ingest route body limit', () => {
     configMock.EMBEDDER_PROVIDER = 'openai';
     embedBatchMock.mockReset();
     queryMock.mockReset();
+    rawChunkDeleteMock.mockReset();
+    rawChunkPutMock.mockReset();
     refundApiQuotaReservationMock.mockReset();
     reserveApiQuotaMock.mockReset();
+    rawChunkPutMock.mockImplementation(async (key: string) => ({ blobStore: 'local', blobKey: key }));
     reserveApiQuotaMock.mockResolvedValue(quotaReservation);
   });
 
@@ -140,6 +154,7 @@ describe('bulk ingest route body limit', () => {
     );
     expect(reserveApiQuotaMock.mock.invocationCallOrder[0]).toBeLessThan(embedBatchMock.mock.invocationCallOrder[0]);
     expect(refundApiQuotaReservationMock).not.toHaveBeenCalled();
+    expect(rawChunkPutMock).toHaveBeenCalledTimes(chunks.length);
     expect(queryMock.mock.calls[1][0]).toContain('WITH input AS');
     expect(queryMock.mock.calls[1][0]).toContain('ORDER BY input.ordinal');
     expect(triggerExtraction).toHaveBeenCalledWith(expect.any(String), '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070');
@@ -233,7 +248,11 @@ describe('bulk ingest route body limit', () => {
     expect(response.statusCode).toBe(202);
     expect(response.json()).toMatchObject({ accepted: 1 });
     expect(reserveApiQuotaMock).toHaveBeenCalledWith('5a3b3e77-cbd8-48f3-98fd-095f8fcb6070', 'ingest_events');
-    expect(embedBatchMock).toHaveBeenCalledWith([chunk.content]);
+    expect(embedBatchMock).toHaveBeenCalledWith([chunk.content], {
+      vaultId: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
+      modelRole: 'embedding',
+      inputType: 'document'
+    });
     expect(refundApiQuotaReservationMock).not.toHaveBeenCalled();
 
     await app.close();
@@ -310,6 +329,82 @@ describe('bulk ingest route body limit', () => {
     expect(response.statusCode).toBe(500);
     expect(embedBatchMock).toHaveBeenCalled();
     expect(refundApiQuotaReservationMock).toHaveBeenCalledWith(quotaReservation);
+    expect(rawChunkDeleteMock).toHaveBeenCalledTimes(1);
+
+    await app.close();
+  });
+
+  it('cleans up successful raw chunk blob writes when a later blob write fails', async () => {
+    const app = Fastify();
+    await registerIngestRoutes(app, vi.fn());
+    const chunks = [
+      { role: 'user', content: 'hello', timestamp: '2026-05-12T16:00:00.000Z' },
+      { role: 'assistant', content: 'hi', timestamp: '2026-05-12T16:00:01.000Z' }
+    ];
+    embedBatchMock.mockResolvedValueOnce(chunks.map(() => [1, 0]));
+    const writtenKeys: string[] = [];
+    rawChunkPutMock.mockImplementation(async (key: string) => {
+      writtenKeys.push(key);
+      if (writtenKeys.length === 2) {
+        throw new Error('blob write failed');
+      }
+      return { blobStore: 'local', blobKey: key };
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ingest/bulk',
+      headers: { authorization: 'Bearer test-vault-key' },
+      payload: {
+        session_id: 'bulk-session',
+        chunks
+      }
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(refundApiQuotaReservationMock).toHaveBeenCalledWith(quotaReservation);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(rawChunkDeleteMock).toHaveBeenCalledTimes(2);
+    expect(rawChunkDeleteMock).toHaveBeenNthCalledWith(1, writtenKeys[0]);
+    expect(rawChunkDeleteMock).toHaveBeenNthCalledWith(2, writtenKeys[1]);
+
+    await app.close();
+  });
+
+  it('surfaces rollback failures when partial raw chunk blob cleanup fails', async () => {
+    const app = Fastify();
+    await registerIngestRoutes(app, vi.fn());
+    const chunks = [
+      { role: 'user', content: 'hello', timestamp: '2026-05-12T16:00:00.000Z' },
+      { role: 'assistant', content: 'hi', timestamp: '2026-05-12T16:00:01.000Z' }
+    ];
+    embedBatchMock.mockResolvedValueOnce(chunks.map(() => [1, 0]));
+    const attemptedKeys: string[] = [];
+    rawChunkPutMock.mockImplementation(async (key: string) => {
+      attemptedKeys.push(key);
+      if (attemptedKeys.length === 2) {
+        throw new Error('blob write failed');
+      }
+      return { blobStore: 'local', blobKey: key };
+    });
+    rawChunkDeleteMock.mockRejectedValueOnce(new Error('delete failed'));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ingest/bulk',
+      headers: { authorization: 'Bearer test-vault-key' },
+      payload: {
+        session_id: 'bulk-session',
+        chunks
+      }
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(refundApiQuotaReservationMock).toHaveBeenCalledWith(quotaReservation);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(rawChunkDeleteMock).toHaveBeenCalledTimes(2);
+    expect(rawChunkDeleteMock).toHaveBeenNthCalledWith(1, attemptedKeys[0]);
+    expect(rawChunkDeleteMock).toHaveBeenNthCalledWith(2, attemptedKeys[1]);
 
     await app.close();
   });

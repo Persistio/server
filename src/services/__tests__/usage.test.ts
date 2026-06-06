@@ -17,11 +17,15 @@ import {
   acquireAiBudget,
   consumeApiQuota,
   consumeNormalIngestRateLimit,
+  incrementUsage,
+  recordModelUsage,
   refundApiQuotaReservation,
   reserveApiQuota,
   settleAiUsage,
   usageTestInternals
 } from '../usage';
+
+const noClosingUsagePeriod = { rowCount: 0, rows: [] };
 
 describe('usage service', () => {
   beforeEach(() => {
@@ -50,6 +54,7 @@ describe('usage service', () => {
           quota_limit: '5'
         }]
       });
+      queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
       queryMock.mockResolvedValueOnce({
         rowCount: 0,
         rows: []
@@ -62,8 +67,9 @@ describe('usage service', () => {
           remaining: 0
         })
       });
-      expect(queryMock).toHaveBeenCalledTimes(2);
-      expect(queryMock.mock.calls[1]?.[0]).toContain('vault_usage.memory_adds < $6::int');
+      expect(queryMock).toHaveBeenCalledTimes(3);
+      expect(queryMock.mock.calls[1]?.[0]).toContain('FOR UPDATE OF vu');
+      expect(queryMock.mock.calls[2]?.[0]).toContain('vault_usage.memory_adds < $6::int');
     });
 
     it('returns remaining quota after a successful atomic consume', async () => {
@@ -73,6 +79,7 @@ describe('usage service', () => {
           quota_limit: '10'
         }]
       });
+      queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
@@ -85,10 +92,10 @@ describe('usage service', () => {
         remaining: 7,
         retryAfterSeconds: null
       });
-      expect(queryMock).toHaveBeenCalledTimes(2);
+      expect(queryMock).toHaveBeenCalledTimes(3);
       expect(queryMock.mock.calls[0]?.[0]).not.toContain('FOR UPDATE');
       expect(queryMock.mock.calls[0]?.[0]).toContain('FOR KEY SHARE OF v');
-      expect(queryMock.mock.calls[1]?.[1]).toEqual([
+      expect(queryMock.mock.calls[2]?.[1]).toEqual([
         'vault-1',
         expect.stringMatching(/^\d{4}-\d{2}$/),
         0,
@@ -105,6 +112,7 @@ describe('usage service', () => {
           quota_limit: '10'
         }]
       });
+      queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
@@ -130,18 +138,52 @@ describe('usage service', () => {
 
       await refundApiQuotaReservation(reservation);
 
-      expect(queryMock).toHaveBeenCalledTimes(3);
-      expect(queryMock.mock.calls[2]?.[0]).toContain('SET ingest_events = GREATEST(ingest_events - 1, 0)');
-      expect(queryMock.mock.calls[2]?.[0]).toContain('AND period = $2');
-      expect(queryMock.mock.calls[2]?.[1]).toEqual(['vault-1', reservation.period]);
+      expect(queryMock).toHaveBeenCalledTimes(4);
+      expect(queryMock.mock.calls[3]?.[0]).toContain('SET ingest_events = GREATEST(ingest_events - 1, 0)');
+      expect(queryMock.mock.calls[3]?.[0]).toContain('AND period = $2');
+      expect(queryMock.mock.calls[3]?.[1]).toEqual(['vault-1', reservation.period]);
     });
 
-    it('treats a new period as rolled over and reports the fresh remaining quota', async () => {
+    it('writes a closed-period event before rolling usage into a new period', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-06-01T00:00:03.000Z'));
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
           quota_limit: '4'
         }]
+      });
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{
+          account_id: 'account-1',
+          curator_candidates_deferred: '2',
+          curator_candidates_processed: '9',
+          curator_input_tokens: '100',
+          curator_output_tokens: '20',
+          curator_requests: '4',
+          curator_runs: '1',
+          ingest_events: '7',
+          limits: {
+            ingest_events_per_month: 10,
+            memory_adds_per_month: 20,
+            searches_per_month: 30,
+            curator_runs_per_month: 5
+          },
+          memory_adds: '3',
+          period: '2026-05',
+          plan_id: 'unlimited',
+          rate_limit_override: {
+            searches_per_month: 4,
+            curator_requests_per_month: 8,
+            curator_tokens_per_month: 1000
+          },
+          searches: '2'
+        }]
+      });
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: []
       });
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
@@ -154,14 +196,130 @@ describe('usage service', () => {
         limit: 4,
         remaining: 3
       });
-      expect(queryMock).toHaveBeenCalledTimes(2);
-      expect(queryMock.mock.calls[1]?.[1]).toEqual([
+      expect(queryMock).toHaveBeenCalledTimes(4);
+      expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO platform_event_outbox');
+      expect(queryMock.mock.calls[2]?.[1]?.[0]).toBe('vault:vault-1');
+      expect(JSON.parse(queryMock.mock.calls[2]?.[1]?.[1] as string)).toEqual({
+        platform_vault_id: 'vault-1',
+        account_id: 'account-1',
+        period: '2026-05',
+        plan_id: 'unlimited',
+        usage: {
+          ingest_events: 7,
+          memory_adds: 3,
+          searches: 2,
+          curator_runs: 1,
+          curator_requests: 4,
+          curator_input_tokens: 100,
+          curator_output_tokens: 20,
+          curator_candidates_processed: 9,
+          curator_candidates_deferred: 2
+        },
+        limits: {
+          ingest_events_per_month: 10,
+          memory_adds_per_month: 20,
+          searches_per_month: 4,
+          curator_runs_per_month: 5,
+          curator_requests_per_month: 8,
+          curator_tokens_per_month: 1000
+        }
+      });
+      expect(queryMock.mock.calls[3]?.[1]).toEqual([
         'vault-1',
-        expect.stringMatching(/^\d{4}-\d{2}$/),
+        '2026-06',
         0,
         0,
         1,
         4
+      ]);
+    });
+
+    it('does not roll over usage when the closed-period event insert fails', async () => {
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{
+          quota_limit: '4'
+        }]
+      });
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{
+          account_id: null,
+          curator_candidates_deferred: '0',
+          curator_candidates_processed: '0',
+          curator_input_tokens: '0',
+          curator_output_tokens: '0',
+          curator_requests: '0',
+          curator_runs: '0',
+          ingest_events: '1',
+          limits: null,
+          memory_adds: '0',
+          period: '2026-05',
+          plan_id: 'free',
+          rate_limit_override: null,
+          searches: '0'
+        }]
+      });
+      queryMock.mockRejectedValueOnce(new Error('outbox unavailable'));
+
+      await expect(consumeApiQuota('vault-1', 'ingest_events')).rejects.toThrow('outbox unavailable');
+
+      expect(queryMock).toHaveBeenCalledTimes(3);
+      expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO platform_event_outbox');
+    });
+  });
+
+  describe('incrementUsage', () => {
+    it('checks for a closed period in the same transaction before incrementing', async () => {
+      queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
+      queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+      await incrementUsage('vault-1', 'memory_adds');
+
+      expect(queryMock).toHaveBeenCalledTimes(2);
+      expect(queryMock.mock.calls[0]?.[0]).toContain('FOR UPDATE OF vu');
+      expect(queryMock.mock.calls[1]?.[0]).toContain('INSERT INTO vault_usage');
+      expect(queryMock.mock.calls[1]?.[1]).toEqual([
+        'vault-1',
+        expect.stringMatching(/^\d{4}-\d{2}$/),
+        0,
+        1,
+        0
+      ]);
+    });
+  });
+
+  describe('recordModelUsage', () => {
+    it('rolls up durable per-vault provider/model-role usage', async () => {
+      queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+      await recordModelUsage({
+        vaultId: 'vault-1',
+        provider: 'google',
+        modelRole: 'extraction',
+        model: 'gemini-2.5-flash',
+        requestCount: 1,
+        promptTokens: 100,
+        completionTokens: 25,
+        totalTokens: 125
+      });
+
+      expect(queryMock).toHaveBeenCalledTimes(1);
+      expect(queryMock.mock.calls[0]?.[0]).toContain('INSERT INTO vault_model_usage');
+      expect(queryMock.mock.calls[0]?.[0]).toContain('ON CONFLICT (vault_id, period, provider, model_role, model)');
+      expect(queryMock.mock.calls[0]?.[1]).toEqual([
+        'vault-1',
+        expect.stringMatching(/^\d{4}-\d{2}$/),
+        'google',
+        'extraction',
+        'gemini-2.5-flash',
+        1,
+        0,
+        0,
+        0,
+        100,
+        25,
+        125
       ]);
     });
   });
@@ -291,13 +449,25 @@ describe('usage service', () => {
     });
 
     it('bypasses normal ingest RPM throttling for premium plans', () => {
-      expect(consumeNormalIngestRateLimit('vault-1', 'pro', 1)).toEqual({
+      expect(consumeNormalIngestRateLimit('vault-1', 'unlimited', 1)).toEqual({
         limit: null,
         remaining: null,
         resetAtEpochSeconds: null,
         retryAfterSeconds: null
       });
       expect(usageTestInternals.getIngestBucketTokens('vault-1')).toBeNull();
+    });
+
+    it('does not treat legacy pro as a premium-plan alias', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-12T12:26:00.000Z'));
+
+      expect(consumeNormalIngestRateLimit('vault-1', 'pro', 1)).toMatchObject({
+        limit: 1,
+        remaining: 0,
+        retryAfterSeconds: null
+      });
+      expect(() => consumeNormalIngestRateLimit('vault-1', 'pro', 1)).toThrow(QuotaExceededError);
     });
   });
 });

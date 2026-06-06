@@ -6,6 +6,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import type { AppConfig } from '../config';
 import { pool } from '../db/client';
+import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 
 const HEALTH_DB_TIMEOUT_MS = 2000;
 const serverPackageJsonPath = path.resolve(__dirname, '..', '..', 'package.json');
@@ -37,10 +38,12 @@ async function checkDatabase() {
   const dbCheck = pool.query('SELECT 1');
   const queueDepthsCheck = pool.query<{
     extraction_depth: number;
+    extraction_inflight_depth: number;
     curation_depth: number;
   }>(
     `SELECT
-       (SELECT COUNT(*) FROM extraction_queue)::int AS extraction_depth,
+       (SELECT COUNT(*) FROM extraction_queue eq WHERE ${EXTRACTION_QUEUE_READY_PREDICATE})::int AS extraction_depth,
+       (SELECT COUNT(*) FROM extraction_queue WHERE claimed_at IS NOT NULL)::int AS extraction_inflight_depth,
        (SELECT COUNT(*) FROM curation_queue)::int AS curation_depth`
   );
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -59,14 +62,17 @@ async function checkDatabase() {
 
     clearTimeout(timeoutHandle);
     let extractionQueueDepth: number | null = null;
+    let extractionInflightDepth: number | null = null;
     let curationQueueDepth: number | null = null;
 
     try {
       const result = await queueDepthsCheck;
       extractionQueueDepth = result.rows[0]?.extraction_depth ?? 0;
+      extractionInflightDepth = result.rows[0]?.extraction_inflight_depth ?? 0;
       curationQueueDepth = result.rows[0]?.curation_depth ?? 0;
     } catch {
       extractionQueueDepth = null;
+      extractionInflightDepth = null;
       curationQueueDepth = null;
     }
 
@@ -74,6 +80,7 @@ async function checkDatabase() {
       db: 'ok',
       db_latency_ms: Date.now() - startedAt,
       extraction_queue_depth: extractionQueueDepth,
+      extraction_inflight_depth: extractionInflightDepth,
       curation_queue_depth: curationQueueDepth
     } as const;
   } catch {
@@ -82,6 +89,7 @@ async function checkDatabase() {
       db: 'degraded',
       db_latency_ms: Date.now() - startedAt,
       extraction_queue_depth: null,
+      extraction_inflight_depth: null,
       curation_queue_depth: null
     } as const;
   }
@@ -100,6 +108,7 @@ export async function registerHealthRoutes(app: FastifyInstance, config: AppConf
       db: database.db,
       db_latency_ms: database.db_latency_ms,
       extraction_queue_depth: database.extraction_queue_depth,
+      extraction_inflight_depth: database.extraction_inflight_depth,
       curation_queue_depth: database.curation_queue_depth,
       uptime_s: Math.round(process.uptime())
     });

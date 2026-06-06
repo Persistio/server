@@ -153,7 +153,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     await enforceMemoryCreationLimit(request.vault.id);
 
     const embedder = getEmbedder();
-    const embedding = await embedder.embed(body.data);
+    const embedding = await embedder.embed(body.data, { vaultId: request.vault.id, modelRole: 'embedding', inputType: 'document' });
     const hash = crypto.createHash('md5').update(body.data).digest('hex');
     const storedData = await encryptForVault(request.vault, body.data);
     const encryptedSubject = await encryptSubjectForVault(request.vault, body.subject);
@@ -346,7 +346,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
 
     if (body.data) {
       const embedder = getEmbedder();
-      embedding = JSON.stringify(await embedder.embed(body.data));
+      embedding = JSON.stringify(await embedder.embed(body.data, { vaultId: request.vault.id, modelRole: 'embedding', inputType: 'document' }));
       hash = crypto.createHash('md5').update(body.data).digest('hex');
     }
 

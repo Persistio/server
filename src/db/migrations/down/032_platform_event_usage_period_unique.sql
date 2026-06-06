@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_platform_event_outbox_usage_period_closed_unique;

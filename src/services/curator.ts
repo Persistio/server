@@ -3,8 +3,14 @@ import OpenAI from 'openai';
 import { getConfig } from '../config';
 import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
 import { PromptLoader } from './prompt-loader';
-import { acquireAiBudget, settleAiUsage } from './usage';
+import { acquireAiBudget, recordModelUsage, settleAiUsage } from './usage';
 import { sanitizePromptData, scrubMemoryForCurator } from '../utils/sanitize';
+import { withSystemPromptPrefix } from './chat-completion';
+import {
+  MAX_CUSTOM_CURATION_PROMPT_BYTES,
+  resolveVaultPrompt,
+  type VaultPromptContext
+} from './vault-prompts';
 
 export type MemoryType = 'user_preference' | 'user_rule' | 'task_pattern' | 'workflow' | 'project' | 'constraint' | 'decision' | 'system_fact' | 'domain_knowledge';
 export type MemoryScope = 'global' | 'project' | 'task' | 'session';
@@ -88,6 +94,10 @@ export interface CuratorUsage {
 }
 
 const HARDCODED_PROMPT = `You are a memory curator. Build a behavioral memory graph and respond only with JSON using the nodes_to_create, nodes_to_update, edges_to_create, nodes_to_archive, and discarded_candidates schema. For every memory id field, use the provided short aliases instead of raw UUIDs: existing active memories are M1, M2, ... and candidate memories are C1, C2, ....`;
+const CURATOR_SYSTEM_OVERHEAD_CHARS = 1000;
+const MIN_CURATOR_SYSTEM_PROMPT_CHARS = 2000;
+const MIN_CURATOR_USER_CONTENT_CHARS = 4000;
+const TARGET_CURATOR_USER_CONTENT_CHARS = 12000;
 
 function buildAliasMaps(candidates: CuratorMemory[], activeMemories: CuratorMemory[]): CuratorAliasMaps {
   const aliasToId = new Map<string, string>();
@@ -155,6 +165,41 @@ function truncateText(value: string, maxChars: number): string {
   return `${value.slice(0, maxChars - marker.length)}${marker}`;
 }
 
+function truncateMiddleText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 0) return '';
+  const marker = '\n...[truncated]...\n';
+  if (maxChars <= marker.length) return value.slice(0, maxChars);
+  const remaining = maxChars - marker.length;
+  const head = Math.ceil(remaining * 0.6);
+  const tail = remaining - head;
+  return `${value.slice(0, head)}${marker}${tail > 0 ? value.slice(-tail) : ''}`;
+}
+
+function allocateCuratorPromptBudget(systemPromptLength: number, maxPromptChars: number): { system: number; user: number } {
+  const available = Math.max(0, maxPromptChars - CURATOR_SYSTEM_OVERHEAD_CHARS);
+  if (available <= 0) {
+    return { system: 0, user: 0 };
+  }
+
+  const desiredSystem = Math.min(systemPromptLength, MAX_CUSTOM_CURATION_PROMPT_BYTES);
+  if (desiredSystem <= 0) {
+    return { system: 0, user: available };
+  }
+
+  if (available <= MIN_CURATOR_SYSTEM_PROMPT_CHARS + MIN_CURATOR_USER_CONTENT_CHARS) {
+    const system = Math.min(desiredSystem, Math.max(1, Math.floor(available * 0.4)));
+    return { system, user: Math.max(0, available - system) };
+  }
+
+  const userReserve = Math.min(
+    TARGET_CURATOR_USER_CONTENT_CHARS,
+    Math.max(MIN_CURATOR_USER_CONTENT_CHARS, Math.floor(available * 0.35))
+  );
+  const system = Math.min(desiredSystem, Math.max(1, available - userReserve));
+  return { system, user: Math.max(0, available - system) };
+}
+
 function boundPromptSections(
   sections: Array<{ text: string; weight: number }>,
   maxChars: number
@@ -196,6 +241,7 @@ export class CuratorService {
   private static readonly circuitBreaker = new ServiceCircuitBreaker('curator');
   private readonly client: OpenAI;
   private readonly model: string;
+  private readonly provider: string;
   private readonly promptLoader: PromptLoader;
 
   constructor() {
@@ -205,6 +251,7 @@ export class CuratorService {
       baseURL: config.CURATOR_BASE_URL
     });
     this.model = config.CURATOR_MODEL;
+    this.provider = getProviderLabel(config.CURATOR_BASE_URL);
     this.promptLoader = new PromptLoader({
       promptFile: config.CURATOR_PROMPT_FILE,
       promptsDir: config.PROMPTS_DIR,
@@ -218,20 +265,25 @@ export class CuratorService {
     activeMemories: CuratorMemory[],
     rawConversation: string | null,
     vaultId?: string,
-    options: { maxInputTokens?: number; maxOutputTokens?: number } = {}
+    options: { maxInputTokens?: number; maxOutputTokens?: number; vaultPromptContext?: VaultPromptContext | null } = {}
   ): Promise<{ result: CuratorResult; aliasMaps: CuratorAliasMaps; rawResponse: unknown; usage: CuratorUsage | null }> {
     const aliasMaps = buildAliasMaps(candidates, activeMemories);
     const candidateText = formatMemories('Part 1: Candidate memories', candidates, aliasMaps);
     const activeMemoryText = formatMemories('Part 2: Existing active memories for matched subjects', activeMemories, aliasMaps);
     const conversationText = formatConversation(rawConversation);
-    const systemPrompt = this.promptLoader.getPrompt();
+    const resolvedSystemPrompt = resolveVaultPrompt({
+      role: 'curation',
+      defaultPrompt: this.promptLoader.getPrompt(),
+      vault: options.vaultPromptContext
+    });
     const maxPromptChars = options.maxInputTokens ? options.maxInputTokens * 4 : 48000;
-    const maxUserContentChars = Math.max(0, maxPromptChars - systemPrompt.length - 1000);
+    const promptBudget = allocateCuratorPromptBudget(resolvedSystemPrompt.length, maxPromptChars);
+    const systemPrompt = truncateMiddleText(resolvedSystemPrompt, promptBudget.system);
     const [boundedCandidateText, boundedActiveMemoryText, boundedConversationText] = boundPromptSections([
       { text: candidateText, weight: 0.5 },
       { text: activeMemoryText, weight: 0.35 },
       { text: conversationText, weight: 0.15 }
-    ], maxUserContentChars);
+    ], promptBudget.user);
     const response = await this.createChatCompletion({
       model: this.model,
       temperature: 0,
@@ -299,7 +351,8 @@ export class CuratorService {
     vaultId?: string
   ) {
     CuratorService.circuitBreaker.beforeRequest();
-    const estimatedTokens = Math.max(256, Math.ceil(JSON.stringify(input.messages).length / 4));
+    const requestInput = withSystemPromptPrefix(input);
+    const estimatedTokens = Math.max(256, Math.ceil(JSON.stringify(requestInput.messages).length / 4));
 
     try {
       if (vaultId) {
@@ -309,7 +362,7 @@ export class CuratorService {
         await acquireAiBudget(vaultId, 'curation', estimatedTokens);
       }
 
-      const response = await this.client.chat.completions.create(input);
+      const response = await this.client.chat.completions.create(requestInput);
       if (vaultId && response.usage?.total_tokens) {
         try {
           await settleAiUsage(vaultId, 'curation', estimatedTokens, response.usage.total_tokens);
@@ -319,6 +372,28 @@ export class CuratorService {
             msg: 'settle_ai_usage_overage',
             service: 'curator',
             vaultId,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
+        try {
+          await recordModelUsage({
+            vaultId,
+            provider: this.provider,
+            model: this.model,
+            modelRole: 'curation',
+            requestCount: 1,
+            promptTokens: response.usage.prompt_tokens,
+            completionTokens: response.usage.completion_tokens,
+            totalTokens: response.usage.total_tokens
+          });
+        } catch (error) {
+          console.warn(JSON.stringify({
+            level: 40,
+            msg: 'failed to record model usage',
+            service: 'curator',
+            vaultId,
+            model: this.model,
+            provider: this.provider,
             error: error instanceof Error ? error.message : String(error)
           }));
         }
@@ -346,6 +421,19 @@ export class CuratorService {
       }
       throw error;
     }
+  }
+}
+
+function getProviderLabel(baseURL: string): string {
+  try {
+    const host = new URL(baseURL).hostname.toLowerCase();
+    if (host.includes('anthropic.com')) return 'anthropic';
+    if (host.includes('generativelanguage.googleapis.com')) return 'google';
+    if (host.includes('openai.com')) return 'openai';
+    if (host.includes('ollama')) return 'ollama';
+    return host;
+  } catch {
+    return 'unknown';
   }
 }
 

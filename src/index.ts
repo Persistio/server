@@ -9,6 +9,7 @@ import { getConfig } from './config';
 import { closePool, runMigrations } from './db/client';
 import { httpRequestDurationHistogram } from './metrics';
 import type { JobRecord, JobStore } from './routes/jobs';
+import { createConfiguredEventPublisher, shouldDispatchPlatformEvents } from './events/event-publisher';
 import { registerAdminRoutes } from './routes/admin';
 import { registerHealthRoutes } from './routes/health';
 import { registerIngestRoutes } from './routes/ingest';
@@ -18,8 +19,23 @@ import { registerRecallRoutes } from './routes/recall';
 import { registerStatsRoutes } from './routes/stats';
 import { registerCurationRoutes } from './routes/curation';
 import { initCryptoClient } from './services/crypto';
+import { EventOutboxDispatcher } from './services/event-outbox-dispatcher';
 import { QuotaExceededError, applyRateLimitHeaders } from './services/usage';
 import { getSpanAttributes } from './telemetry';
+
+export type {
+  JsonObject,
+  JsonPrimitive,
+  JsonValue,
+  KnownPlatformEventType,
+  PlatformEvent,
+  PlatformEventPayload,
+  PlatformEventPayloads,
+  PlatformEventStatus,
+  VaultUsagePeriodClosedPayload,
+  VaultUsagePeriodLimitField,
+  VaultUsagePeriodUsageField
+} from './events/platform-event';
 
 class InMemoryJobStore implements JobStore {
   private readonly jobs = new Map<string, JobRecord>();
@@ -80,6 +96,10 @@ async function main() {
       }
     }
   });
+  const eventPublisher = shouldStartWorker
+    ? await createConfiguredEventPublisher(config, app.log)
+    : undefined;
+  const shouldStartEventOutboxDispatcher = shouldDispatchPlatformEvents(config);
 
   app.addHook('onResponse', async (request, reply) => {
     const route = request.routeOptions.url ?? request.url;
@@ -111,6 +131,19 @@ async function main() {
       execArgv: ['--require', path.resolve(__dirname, 'preload.js')]
     })
     : undefined;
+  const eventOutboxDispatcher = shouldStartEventOutboxDispatcher && eventPublisher
+    ? new EventOutboxDispatcher({
+      batchSize: config.EVENT_OUTBOX_BATCH_SIZE,
+      intervalMs: config.EVENT_OUTBOX_DISPATCH_INTERVAL_MS,
+      logger: app.log,
+      maxAttempts: config.EVENT_OUTBOX_MAX_ATTEMPTS,
+      maxRetryDelayMs: config.EVENT_OUTBOX_RETRY_MAX_DELAY_MS,
+      publisher: eventPublisher,
+      retryBaseDelayMs: config.EVENT_OUTBOX_RETRY_BASE_DELAY_MS
+    })
+    : undefined;
+
+  eventOutboxDispatcher?.start();
 
   worker?.on('message', (message: { type: string; jobId?: string; status?: JobRecord['status']; error?: string }) => {
     if (message.type === 'job-status' && message.jobId && message.status) {
@@ -163,6 +196,8 @@ async function main() {
   }
 
   const shutdown = async () => {
+    await eventOutboxDispatcher?.stop();
+    await eventPublisher?.close?.();
     await app.close();
     await closePool();
     await curationWorker?.terminate();

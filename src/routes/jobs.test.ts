@@ -35,7 +35,7 @@ describe('job routes', () => {
         name: 'Example',
         purpose: null,
         settings: {},
-        plan_id: 'pro',
+        plan_id: 'unlimited',
         status: 'active',
         encrypted_dek: null,
         vault_encryption_enabled: false

@@ -5,7 +5,8 @@ const { queryMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('../../db/client', () => ({
-  query: queryMock
+  query: queryMock,
+  withTransaction: async (callback: (client: { query: typeof queryMock }) => Promise<unknown>) => callback({ query: queryMock })
 }));
 
 import { claimEligibleCurationJobs, getCurationStatus, getCuratorPlanBlockReason, mergeCuratorLimits, recordCuratorUsage } from '../curation-capacity';
@@ -32,6 +33,28 @@ describe('curation capacity service', () => {
       curator_jobs_per_run: 2,
       curator_candidates_per_call: 20,
       curator_overage_mode: 'upgrade_only'
+    });
+  });
+
+  it('uses the faster unlimited curator cadence and budget envelope', () => {
+    expect(mergeCuratorLimits('unlimited', null, null)).toMatchObject({
+      curator_enabled: true,
+      curator_schedule_interval_minutes: 15,
+      curator_runs_per_month: 3000,
+      curator_requests_per_month: 6000,
+      curator_tokens_per_month: 25000000,
+      curator_overage_mode: 'payg'
+    });
+  });
+
+  it('does not keep legacy pro as an unlimited curator alias', () => {
+    expect(mergeCuratorLimits('pro', null, null)).toMatchObject({
+      curator_enabled: false,
+      curator_runs_per_month: 0,
+      curator_jobs_per_run: 0,
+      curator_tokens_per_month: 0,
+      curator_requests_per_month: 0,
+      curator_overage_mode: 'disable'
     });
   });
 
@@ -159,6 +182,7 @@ describe('curation capacity service', () => {
   });
 
   it('can count curator requests without counting a new scheduled run', async () => {
+    queryMock.mockResolvedValueOnce({ rowCount: 0, rows: [] });
     queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     await recordCuratorUsage({
@@ -170,7 +194,7 @@ describe('curation capacity service', () => {
       limits: mergeCuratorLimits('unlimited', null, null)
     });
 
-    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(queryMock).toHaveBeenCalledTimes(2);
     expect(queryMock).toHaveBeenCalledWith(
       expect.stringContaining('curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs + EXCLUDED.curator_runs'),
       [
@@ -182,6 +206,66 @@ describe('curation capacity service', () => {
         3
       ]
     );
+  });
+
+  it('writes a closed-period event before curator usage rolls into a new period', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-01T00:00:03.000Z'));
+    queryMock.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{
+        account_id: null,
+        curator_candidates_deferred: '1',
+        curator_candidates_processed: '8',
+        curator_input_tokens: '900',
+        curator_output_tokens: '90',
+        curator_requests: '6',
+        curator_runs: '3',
+        ingest_events: '10',
+        limits: {
+          curator_runs_per_month: 30,
+          curator_requests_per_month: 100,
+          curator_tokens_per_month: 100000
+        },
+        memory_adds: '4',
+        period: '2026-05',
+        plan_id: 'unlimited',
+        rate_limit_override: null,
+        searches: '12'
+      }]
+    });
+    queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await recordCuratorUsage({
+      vaultId: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+      candidatesProcessed: 3,
+      countRun: false,
+      promptTokens: 100,
+      completionTokens: 25,
+      limits: mergeCuratorLimits('unlimited', null, null)
+    });
+
+    expect(queryMock).toHaveBeenCalledTimes(3);
+    expect(queryMock.mock.calls[1]?.[0]).toContain('INSERT INTO platform_event_outbox');
+    expect(JSON.parse(queryMock.mock.calls[1]?.[1]?.[1] as string)).toMatchObject({
+      platform_vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+      period: '2026-05',
+      usage: {
+        curator_runs: 3,
+        curator_requests: 6,
+        curator_input_tokens: 900,
+        curator_output_tokens: 90,
+        curator_candidates_processed: 8,
+        curator_candidates_deferred: 1
+      },
+      limits: {
+        curator_runs_per_month: 30,
+        curator_requests_per_month: 100,
+        curator_tokens_per_month: 100000
+      }
+    });
+    expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO vault_usage');
   });
 
   it('reports zero monthly curator limits as exhausted', async () => {

@@ -1,25 +1,33 @@
 {
   "name": "@persistio/server",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": true,
   "license": "BUSL-1.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/",
+    "build": "tsc -p tsconfig.json && rm -rf dist/db/migrations && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/ && cp -R src/db/migrations/down dist/db/migrations/down",
     "start": "node --require ./dist/preload.js dist/index.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "migrate:raw-chunks": "node ./scripts/migrate-raw-chunks-to-blob.mjs",
+    "migrate:qwen3-embeddings": "node ./scripts/reembed-qwen3.mjs"
   },
   "dependencies": {
     "@azure/identity": "^4.11.0",
     "@azure/keyvault-keys": "^4.10.0",
     "@azure/monitor-opentelemetry-exporter": "^1.0.0-beta.40",
+    "@azure/service-bus": "^7.9.5",
+    "@azure/storage-blob": "^12.31.0",
+    "@google-cloud/kms": "^5.5.0",
+    "@google-cloud/pubsub": "^5.3.0",
+    "@google-cloud/storage": "^7.19.0",
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/auto-instrumentations-node": "^0.75.0",
-    "@opentelemetry/exporter-metrics-otlp-http": "^0.52.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.52.0",
-    "@opentelemetry/sdk-node": "^0.217.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.76.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.218.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.218.0",
+    "@opentelemetry/sdk-node": "^0.218.0",
     "fastify": "^5.0.0",
+    "google-auth-library": "^9.15.1",
     "openai": "^4.0.0",
     "p-limit": "^5.0.0",
     "pg": "^8.0.0",
@@ -27,9 +35,9 @@
     "zod": "^3.0.0"
   },
   "devDependencies": {
-    "@types/pg": "^8.0.0",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.0.0",
     "typescript": "^5.0.0",
-    "vitest": "^2.0.0"
+    "vitest": "^4.1.8"
   }
 }

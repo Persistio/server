@@ -2,10 +2,15 @@ import type { FastifyReply } from 'fastify';
 import type { PoolClient } from 'pg';
 
 import { query, withTransaction } from '../db/client';
+import type {
+  VaultUsagePeriodClosedPayload,
+  VaultUsagePeriodLimitField
+} from '../events/platform-event';
 
 export type UsageField = 'ingest_events' | 'memory_adds' | 'searches';
+export type ModelUsageRole = 'embedding' | 'extraction' | 'escalation' | 'curation';
 
-type PlanId = 'unlimited' | 'free' | 'pro';
+type PlanId = 'unlimited' | 'free';
 export type AiBudgetRole = 'extraction' | 'escalation' | 'curation';
 type AiLimitKey =
   | 'ai_requests_per_minute'
@@ -13,8 +18,9 @@ type AiLimitKey =
   | 'ai_extraction_weight'
   | 'ai_escalation_weight'
   | 'ai_curation_weight';
-type LimitConfig = Partial<Record<UsageFieldLimitKey | AiLimitKey | 'memories_max', number>>;
+type LimitConfig = Partial<Record<UsageFieldLimitKey | AiLimitKey | UsagePeriodEventLimitField | 'memories_max', number>>;
 type UsageFieldLimitKey = 'ingest_events_per_month' | 'memory_adds_per_month' | 'searches_per_month';
+type UsagePeriodEventLimitField = VaultUsagePeriodLimitField;
 
 interface VaultLimitRow {
   limits: LimitConfig | null;
@@ -40,6 +46,23 @@ interface MemoryCapacityRow {
   memories_max: string | null;
 }
 
+interface ClosingUsagePeriodRow {
+  account_id: string | null;
+  curator_candidates_deferred: string;
+  curator_candidates_processed: string;
+  curator_input_tokens: string;
+  curator_output_tokens: string;
+  curator_requests: string;
+  curator_runs: string;
+  ingest_events: string;
+  limits: Record<string, unknown> | null;
+  memory_adds: string;
+  period: string;
+  plan_id: string;
+  rate_limit_override: Record<string, unknown> | null;
+  searches: string;
+}
+
 interface BucketState {
   capacity: number;
   lastRefillMs: number;
@@ -61,6 +84,20 @@ export interface ApiQuotaReservation {
   vaultId: string;
 }
 
+export interface ModelUsageInput {
+  vaultId: string;
+  provider: string;
+  modelRole: ModelUsageRole;
+  model: string;
+  requestCount?: number;
+  embeddingCalls?: number;
+  embeddingInputTokens?: number;
+  embeddingInputChars?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
 const usageLimitKeys: Record<UsageField, UsageFieldLimitKey> = {
   ingest_events: 'ingest_events_per_month',
   memory_adds: 'memory_adds_per_month',
@@ -72,6 +109,14 @@ const fieldColumn: Record<UsageField, string> = {
   searches: 'searches'
 };
 const allowedUsageFields: UsageField[] = ['ingest_events', 'memory_adds', 'searches'];
+const usagePeriodEventLimitFields: UsagePeriodEventLimitField[] = [
+  'ingest_events_per_month',
+  'memory_adds_per_month',
+  'searches_per_month',
+  'curator_runs_per_month',
+  'curator_requests_per_month',
+  'curator_tokens_per_month'
+];
 
 const conservativeAiDefaults: Required<Pick<LimitConfig, AiLimitKey>> = {
   ai_requests_per_minute: 10,
@@ -89,14 +134,7 @@ const aiPlanDefaults: Record<PlanId, Required<Pick<LimitConfig, AiLimitKey>>> = 
     ai_escalation_weight: 2,
     ai_curation_weight: 4
   },
-  free: conservativeAiDefaults,
-  pro: {
-    ai_requests_per_minute: 300,
-    ai_tokens_per_minute: 3_000_000,
-    ai_extraction_weight: 1,
-    ai_escalation_weight: 2,
-    ai_curation_weight: 4
-  }
+  free: conservativeAiDefaults
 };
 
 // TODO: These buckets are in-process only. They reset on restart and do not coordinate across
@@ -154,7 +192,7 @@ export function applyRateLimitHeaders(reply: FastifyReply, snapshot: RateLimitSn
 }
 
 export function isPremiumPlan(planId: string): boolean {
-  return planId === 'pro' || planId === 'unlimited';
+  return planId === 'unlimited';
 }
 
 export function consumeNormalIngestRateLimit(vaultId: string, planId: string, requestsPerMinute: number): RateLimitSnapshot {
@@ -203,21 +241,24 @@ export async function incrementUsage(vaultId: string, field: UsageField) {
     END`;
   }).join(',\n           ');
 
-  await query(
-    `INSERT INTO vault_usage (vault_id, period, ${columns.join(', ')}, updated_at)
-     VALUES ($1, $2, $3, $4, $5, now())
-     ON CONFLICT (vault_id) DO UPDATE
-     SET period = EXCLUDED.period,
-         ${assignments},
-         updated_at = now()`,
-    [
-      vaultId,
-      period,
-      field === 'ingest_events' ? 1 : 0,
-      field === 'memory_adds' ? 1 : 0,
-      field === 'searches' ? 1 : 0
-    ]
-  );
+  await withTransaction(async (client) => {
+    await writeUsagePeriodClosedEventIfNeeded(client, vaultId, period);
+    await client.query(
+      `INSERT INTO vault_usage (vault_id, period, ${columns.join(', ')}, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (vault_id) DO UPDATE
+       SET period = EXCLUDED.period,
+           ${assignments},
+           updated_at = now()`,
+      [
+        vaultId,
+        period,
+        field === 'ingest_events' ? 1 : 0,
+        field === 'memory_adds' ? 1 : 0,
+        field === 'searches' ? 1 : 0
+      ]
+    );
+  });
 }
 
 export async function consumeApiQuota(vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
@@ -286,6 +327,8 @@ async function consumeApiQuotaWithPeriodInTransaction(
     });
   }
 
+  await writeUsagePeriodClosedEventIfNeeded(client, vaultId, period);
+
   const result = await client.query<AtomicQuotaConsumeRow>(
     `INSERT INTO vault_usage (vault_id, period, ingest_events, memory_adds, searches, updated_at)
      VALUES ($1, $2, $3, $4, $5, now())
@@ -327,6 +370,74 @@ async function consumeApiQuotaWithPeriodInTransaction(
       retryAfterSeconds: null
     }
   };
+}
+
+export async function writeUsagePeriodClosedEventIfNeeded(
+  client: PoolClient,
+  vaultId: string,
+  currentPeriod = getCurrentUsagePeriod()
+): Promise<boolean> {
+  const result = await client.query<ClosingUsagePeriodRow>(
+    `SELECT
+       vu.period,
+       vu.ingest_events::text AS ingest_events,
+       vu.memory_adds::text AS memory_adds,
+       vu.searches::text AS searches,
+       vu.curator_runs::text AS curator_runs,
+       vu.curator_requests::text AS curator_requests,
+       vu.curator_input_tokens::text AS curator_input_tokens,
+       vu.curator_output_tokens::text AS curator_output_tokens,
+       vu.curator_candidates_processed::text AS curator_candidates_processed,
+       vu.curator_candidates_deferred::text AS curator_candidates_deferred,
+       v.account_id::text AS account_id,
+       v.plan_id,
+       p.limits,
+       v.rate_limit_override
+     FROM vault_usage AS vu
+     JOIN vaults AS v
+       ON v.id = vu.vault_id
+     JOIN plans AS p
+       ON p.id = v.plan_id
+     WHERE vu.vault_id = $1
+     LIMIT 1
+     FOR UPDATE OF vu`,
+    [vaultId]
+  );
+
+  if (!result.rowCount || result.rows[0].period === currentPeriod) {
+    return false;
+  }
+
+  const row = result.rows[0];
+  const payload: VaultUsagePeriodClosedPayload = {
+    platform_vault_id: vaultId,
+    account_id: row.account_id,
+    period: row.period,
+    plan_id: row.plan_id,
+    usage: {
+      ingest_events: Number(row.ingest_events),
+      memory_adds: Number(row.memory_adds),
+      searches: Number(row.searches),
+      curator_runs: Number(row.curator_runs),
+      curator_requests: Number(row.curator_requests),
+      curator_input_tokens: Number(row.curator_input_tokens),
+      curator_output_tokens: Number(row.curator_output_tokens),
+      curator_candidates_processed: Number(row.curator_candidates_processed),
+      curator_candidates_deferred: Number(row.curator_candidates_deferred)
+    },
+    limits: buildUsagePeriodEventLimits(row.limits, row.rate_limit_override)
+  };
+
+  await client.query(
+    `INSERT INTO platform_event_outbox (
+       event_id, event_type, schema_version, occurred_at, subject, payload
+     )
+     VALUES (gen_random_uuid(), 'vault.usage_period.closed', 1, now(), $1, $2::jsonb)
+     ON CONFLICT DO NOTHING`,
+    [`vault:${vaultId}`, JSON.stringify(payload)]
+  );
+
+  return true;
 }
 
 export async function refundApiQuotaReservation(reservation: ApiQuotaReservation): Promise<void> {
@@ -447,6 +558,51 @@ export async function settleAiUsage(vaultId: string, role: AiBudgetRole, estimat
   consumeTokenBucket(aiTokenBuckets, `${vaultId}:${role}:tokens`, limits.ai_tokens_per_minute, (actualTokens - estimatedTokens) * weight);
 }
 
+export async function recordModelUsage(input: ModelUsageInput, client?: Pick<PoolClient, 'query'>): Promise<void> {
+  const period = getCurrentUsagePeriod();
+  const requestCount = Math.max(0, Math.trunc(input.requestCount ?? 0));
+  const embeddingCalls = Math.max(0, Math.trunc(input.embeddingCalls ?? 0));
+  const embeddingInputTokens = Math.max(0, Math.trunc(input.embeddingInputTokens ?? 0));
+  const embeddingInputChars = Math.max(0, Math.trunc(input.embeddingInputChars ?? 0));
+  const promptTokens = Math.max(0, Math.trunc(input.promptTokens ?? 0));
+  const completionTokens = Math.max(0, Math.trunc(input.completionTokens ?? 0));
+  const totalTokens = Math.max(0, Math.trunc(input.totalTokens ?? promptTokens + completionTokens));
+
+  const execute = client ? client.query.bind(client) : query;
+  await execute(
+    `INSERT INTO vault_model_usage (
+       vault_id, period, provider, model_role, model, request_count,
+       embedding_calls, embedding_input_tokens, embedding_input_chars,
+       prompt_tokens, completion_tokens, total_tokens, updated_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+     ON CONFLICT (vault_id, period, provider, model_role, model)
+     DO UPDATE SET
+       request_count = vault_model_usage.request_count + EXCLUDED.request_count,
+       embedding_calls = vault_model_usage.embedding_calls + EXCLUDED.embedding_calls,
+       embedding_input_tokens = vault_model_usage.embedding_input_tokens + EXCLUDED.embedding_input_tokens,
+       embedding_input_chars = vault_model_usage.embedding_input_chars + EXCLUDED.embedding_input_chars,
+       prompt_tokens = vault_model_usage.prompt_tokens + EXCLUDED.prompt_tokens,
+       completion_tokens = vault_model_usage.completion_tokens + EXCLUDED.completion_tokens,
+       total_tokens = vault_model_usage.total_tokens + EXCLUDED.total_tokens,
+       updated_at = now()`,
+    [
+      input.vaultId,
+      period,
+      input.provider,
+      input.modelRole,
+      input.model,
+      requestCount,
+      embeddingCalls,
+      embeddingInputTokens,
+      embeddingInputChars,
+      promptTokens,
+      completionTokens,
+      totalTokens
+    ]
+  );
+}
+
 async function getMemoryCapacity(vaultId: string): Promise<{ activeMemories: number; limit: number | undefined }> {
   const result = await query<MemoryCapacityRow>(
     `SELECT
@@ -503,6 +659,28 @@ function getAiRoleWeight(limits: LimitConfig, role: AiBudgetRole): number {
     curation: 'ai_curation_weight'
   };
   return Math.max(1, limits[key[role]] ?? 1);
+}
+
+function buildUsagePeriodEventLimits(
+  planLimits: Record<string, unknown> | null,
+  vaultOverride: Record<string, unknown> | null
+): Partial<Record<VaultUsagePeriodLimitField, number>> {
+  const merged = { ...(planLimits ?? {}), ...(vaultOverride ?? {}) };
+  const eventLimits: Partial<Record<VaultUsagePeriodLimitField, number>> = {};
+
+  for (const field of usagePeriodEventLimitFields) {
+    const value = readFiniteNumber(merged[field]);
+    if (value !== undefined) {
+      eventLimits[field] = value;
+    }
+  }
+
+  return eventLimits;
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function getTokenBucketWaitMs(

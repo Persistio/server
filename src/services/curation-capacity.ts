@@ -1,7 +1,7 @@
 import type { PoolClient, QueryResultRow } from 'pg';
 
-import { query } from '../db/client';
-import { getCurrentUsagePeriod } from './usage';
+import { query, withTransaction } from '../db/client';
+import { getCurrentUsagePeriod, writeUsagePeriodClosedEventIfNeeded } from './usage';
 
 export interface CuratorPlanLimits {
   curator_enabled: boolean;
@@ -117,16 +117,16 @@ const disabledCuratorLimits: CuratorPlanLimits = {
 
 const unlimitedCuratorLimits: CuratorPlanLimits = {
   curator_enabled: true,
-  curator_schedule_interval_minutes: 60,
-  curator_runs_per_month: 1000,
+  curator_schedule_interval_minutes: 15,
+  curator_runs_per_month: 3000,
   curator_jobs_per_run: 20,
   curator_candidates_per_run: 400,
   curator_candidates_per_call: 20,
   curator_active_memories_per_call: 80,
   curator_input_tokens_per_call: 12000,
   curator_output_tokens_per_call: 2000,
-  curator_tokens_per_month: 10000000,
-  curator_requests_per_month: 3000,
+  curator_tokens_per_month: 25000000,
+  curator_requests_per_month: 6000,
   curator_max_queue_age_hours: 24,
   curator_backlog_limit: 10000,
   curator_priority_weight: 3,
@@ -135,8 +135,7 @@ const unlimitedCuratorLimits: CuratorPlanLimits = {
 
 const defaultCuratorLimitsByPlan: Record<string, CuratorPlanLimits> = {
   unlimited: unlimitedCuratorLimits,
-  free: disabledCuratorLimits,
-  pro: unlimitedCuratorLimits
+  free: disabledCuratorLimits
 };
 
 function readBoolean(value: unknown, fallback: boolean): boolean {
@@ -327,26 +326,29 @@ export async function recordCuratorUsage(input: {
 }) {
   const period = getCurrentUsagePeriod();
   const curatorRuns = input.countRun === false ? 0 : 1;
-  await query(
-    `INSERT INTO vault_usage (
-       vault_id, period, curator_runs, curator_requests, curator_input_tokens,
-       curator_output_tokens, curator_candidates_processed, updated_at
-     )
-     VALUES ($1, $2, $3, 1, $4, $5, $6, now())
-     ON CONFLICT (vault_id) DO UPDATE
-     SET period = EXCLUDED.period,
-         ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
-         memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
-         searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
-         curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs + EXCLUDED.curator_runs ELSE EXCLUDED.curator_runs END,
-         curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests + 1 ELSE 1 END,
-         curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens + EXCLUDED.curator_input_tokens ELSE EXCLUDED.curator_input_tokens END,
-         curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens + EXCLUDED.curator_output_tokens ELSE EXCLUDED.curator_output_tokens END,
-         curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed + EXCLUDED.curator_candidates_processed ELSE EXCLUDED.curator_candidates_processed END,
-         curator_candidates_deferred = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred ELSE 0 END,
-         updated_at = now()`,
-    [input.vaultId, period, curatorRuns, input.promptTokens, input.completionTokens, input.candidatesProcessed]
-  );
+  await withTransaction(async (client) => {
+    await writeUsagePeriodClosedEventIfNeeded(client, input.vaultId, period);
+    await client.query(
+      `INSERT INTO vault_usage (
+         vault_id, period, curator_runs, curator_requests, curator_input_tokens,
+         curator_output_tokens, curator_candidates_processed, updated_at
+       )
+       VALUES ($1, $2, $3, 1, $4, $5, $6, now())
+       ON CONFLICT (vault_id) DO UPDATE
+       SET period = EXCLUDED.period,
+           ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
+           memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
+           searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
+           curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs + EXCLUDED.curator_runs ELSE EXCLUDED.curator_runs END,
+           curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests + 1 ELSE 1 END,
+           curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens + EXCLUDED.curator_input_tokens ELSE EXCLUDED.curator_input_tokens END,
+           curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens + EXCLUDED.curator_output_tokens ELSE EXCLUDED.curator_output_tokens END,
+           curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed + EXCLUDED.curator_candidates_processed ELSE EXCLUDED.curator_candidates_processed END,
+           curator_candidates_deferred = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred ELSE 0 END,
+           updated_at = now()`,
+      [input.vaultId, period, curatorRuns, input.promptTokens, input.completionTokens, input.candidatesProcessed]
+    );
+  });
 
   if (curatorRuns > 0) {
     await query(
@@ -372,26 +374,29 @@ export async function recordCuratorDeferral(input: {
 }) {
   const period = getCurrentUsagePeriod();
   const candidatesDeferred = input.candidatesDeferred ?? 0;
-  await query(
-    `INSERT INTO vault_usage (vault_id, period, curator_candidates_deferred, updated_at)
-     VALUES ($1, $2, $3, now())
-     ON CONFLICT (vault_id) DO UPDATE
-     SET period = EXCLUDED.period,
-         ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
-         memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
-         searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
-         curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs ELSE 0 END,
-         curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests ELSE 0 END,
-         curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens ELSE 0 END,
-         curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens ELSE 0 END,
-         curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed ELSE 0 END,
-         curator_candidates_deferred = CASE
-           WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred + EXCLUDED.curator_candidates_deferred
-           ELSE EXCLUDED.curator_candidates_deferred
-         END,
-         updated_at = now()`,
-    [input.vaultId, period, candidatesDeferred]
-  );
+  await withTransaction(async (client) => {
+    await writeUsagePeriodClosedEventIfNeeded(client, input.vaultId, period);
+    await client.query(
+      `INSERT INTO vault_usage (vault_id, period, curator_candidates_deferred, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (vault_id) DO UPDATE
+       SET period = EXCLUDED.period,
+           ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
+           memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
+           searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
+           curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs ELSE 0 END,
+           curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests ELSE 0 END,
+           curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens ELSE 0 END,
+           curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens ELSE 0 END,
+           curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed ELSE 0 END,
+           curator_candidates_deferred = CASE
+             WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred + EXCLUDED.curator_candidates_deferred
+             ELSE EXCLUDED.curator_candidates_deferred
+           END,
+           updated_at = now()`,
+      [input.vaultId, period, candidatesDeferred]
+    );
+  });
 
   await query(
     `INSERT INTO vault_curation_state (vault_id, next_curator_run_at, last_curator_defer_reason, updated_at)

@@ -1,24 +1,65 @@
 services:
+  ollama:
+    image: ollama/ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ['CMD', 'ollama', 'list']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-pull-qwen:
+    image: ollama/ollama
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ['pull', 'qwen3-embedding:0.6b']
+    depends_on:
+      ollama:
+        condition: service_healthy
+
   persistio:
-    build: .
+    image: chriscoveyduck/persistio:latest
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      RAW_CHUNK_STORAGE_PROVIDER: ${RAW_CHUNK_STORAGE_PROVIDER:-local}
+      RAW_CHUNK_LOCAL_DIR: /data/raw-chunks
+      EMBEDDER_PROVIDER: ${EMBEDDER_PROVIDER:-ollama}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      STORAGE_EMBEDDING_DIMENSIONS: ${STORAGE_EMBEDDING_DIMENSIONS:-1024}
+    # The published image contains basic public prompts in /prompts.
+    # To use refined local prompts, mount them at runtime instead of baking them into the image:
+    # environment:
+    #   PROMPTS_DIR: /prompts
+    #   EXTRACTOR_PROMPT_FILE: /prompts/extractor.txt
+    #   CURATOR_PROMPT_FILE: /prompts/curator.txt
+    volumes:
+      - raw_chunks:/data/raw-chunks
+    # To mount refined prompts as well, add:
+    #   - ./prompts/extractor.txt:/prompts/extractor.txt:ro
+    #   - ./prompts/curator.txt:/prompts/curator.txt:ro
     ports:
       - "4827:4827"
     depends_on:
       postgres:
         condition: service_healthy
+      ollama-pull-qwen:
+        condition: service_completed_successfully
 
   postgres:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
     environment:
-      POSTGRES_DB: mnemex
-      POSTGRES_USER: mnemex
-      POSTGRES_PASSWORD: mnemex
+      POSTGRES_DB: persistio
+      POSTGRES_USER: persistio
+      POSTGRES_PASSWORD: persistio
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U mnemex -d mnemex']
+      test: ['CMD-SHELL', 'pg_isready -U persistio -d persistio']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -27,3 +68,5 @@ services:
 
 volumes:
   pgdata:
+  raw_chunks:
+  ollama_models:

@@ -11,10 +11,12 @@ vi.mock('openai', () => ({
 
 vi.mock('../usage', () => ({
   acquireAiBudget: vi.fn(),
+  recordModelUsage: vi.fn(),
   settleAiUsage: vi.fn()
 }));
 
 import { ExtractorService, resolveExtractorRoleConfig } from '../extractor';
+import { acquireAiBudget, recordModelUsage, settleAiUsage } from '../usage';
 
 process.env.DATABASE_URL ??= 'postgres://localhost:5432/persistio_test';
 process.env.ADMIN_API_KEY ??= 'test-admin-key';
@@ -24,13 +26,18 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
   beforeEach(() => {
     createMock.mockReset();
     openAiMock.mockReset();
-    openAiMock.mockImplementation(() => ({
-      chat: {
-        completions: {
-          create: createMock
+    vi.mocked(acquireAiBudget).mockReset();
+    vi.mocked(recordModelUsage).mockReset();
+    vi.mocked(settleAiUsage).mockReset();
+    openAiMock.mockImplementation(function OpenAIMock() {
+      return {
+        chat: {
+          completions: {
+            create: createMock
+          }
         }
-      }
-    }));
+      };
+    });
   });
 
   it('returns an empty map for empty input', async () => {
@@ -137,6 +144,36 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
 
     expect(service).toBeInstanceOf(ExtractorService);
   });
+
+  it('routes subject arbitration through the extraction role', async () => {
+    createMock.mockResolvedValue({
+      usage: {
+        prompt_tokens: 20,
+        completion_tokens: 1,
+        total_tokens: 21
+      },
+      choices: [{ message: { content: 'USE_EXISTING' } }]
+    });
+    const service = new ExtractorService();
+
+    const result = await service.arbitrateSubject('Persistio', 'Persistio API', 'vault-1');
+
+    expect(result).toBe('use_existing');
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(createMock.mock.calls[0][0].model).toBe('gpt-4o-mini');
+    expect(acquireAiBudget).toHaveBeenCalledWith('vault-1', 'extraction', expect.any(Number));
+    expect(settleAiUsage).toHaveBeenCalledWith('vault-1', 'extraction', expect.any(Number), 21);
+    expect(recordModelUsage).toHaveBeenCalledWith(expect.objectContaining({
+      vaultId: 'vault-1',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      modelRole: 'extraction',
+      requestCount: 1,
+      promptTokens: 20,
+      completionTokens: 1,
+      totalTokens: 21
+    }));
+  });
 });
 
 describe('resolveExtractorRoleConfig', () => {
@@ -190,7 +227,7 @@ describe('resolveExtractorRoleConfig', () => {
     });
   });
 
-  it('supports partial role overrides by falling back field-by-field', () => {
+  it('ignores incomplete role overrides so provider keys and endpoints are not mixed', () => {
     expect(resolveExtractorRoleConfig({
       ...legacyConfig,
       EXTRACTION_MODEL: 'gemini-2.5-flash'
@@ -198,7 +235,7 @@ describe('resolveExtractorRoleConfig', () => {
       extraction: {
         baseURL: 'https://legacy.example/v1',
         apiKey: 'legacy-key',
-        model: 'gemini-2.5-flash'
+        model: 'legacy-model'
       },
       escalation: {
         baseURL: 'https://legacy.example/v1',

@@ -27,6 +27,7 @@ import {
   releaseCuratorClaim,
   type CuratorPlanLimits
 } from '../services/curation-capacity';
+import type { VaultPromptContext } from '../services/vault-prompts';
 
 interface CurationQueueRow {
   queue_id: string;
@@ -36,6 +37,9 @@ interface CurationQueueRow {
 
 interface VaultRow extends VaultEncryptionContext {
   plan_id: string;
+  type: 'general' | 'custom' | null;
+  custom_extraction_prompt: string | null;
+  custom_curation_prompt: string | null;
 }
 
 interface MemoryRow {
@@ -162,7 +166,8 @@ async function processBatch() {
         job.vault.id,
         {
           maxInputTokens: limits.curator_input_tokens_per_call > 0 ? limits.curator_input_tokens_per_call : undefined,
-          maxOutputTokens: limits.curator_output_tokens_per_call > 0 ? limits.curator_output_tokens_per_call : undefined
+          maxOutputTokens: limits.curator_output_tokens_per_call > 0 ? limits.curator_output_tokens_per_call : undefined,
+          vaultPromptContext: await decryptVaultPromptContext(job.vault)
         }
       );
       await applyActions(job, result, aliasMaps, rawResponse);
@@ -305,9 +310,26 @@ async function deferCapacityBlockedJob(row: CurationQueueRow, limits: CuratorPla
   );
 }
 
+async function decryptVaultPromptContext(vault: VaultRow): Promise<VaultPromptContext> {
+  if (vault.type !== 'custom') {
+    return { type: vault.type };
+  }
+
+  return {
+    type: vault.type,
+    custom_extraction_prompt: vault.custom_extraction_prompt
+      ? await decryptForVault(vault, vault.custom_extraction_prompt)
+      : null,
+    custom_curation_prompt: vault.custom_curation_prompt
+      ? await decryptForVault(vault, vault.custom_curation_prompt)
+      : null
+  };
+}
+
 async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candidateLimit: number): Promise<LoadedCurationJob> {
   const vaultResult = await query<VaultRow>(
-    `SELECT id, encrypted_dek, vault_encryption_enabled, plan_id
+    `SELECT id, encrypted_dek, vault_encryption_enabled, plan_id,
+            type, custom_extraction_prompt, custom_curation_prompt
      FROM vaults
      WHERE id = $1
      LIMIT 1`,
@@ -579,8 +601,8 @@ async function applyActions(
 
     for (const action of actions.edges_to_create) {
       try {
-        const fromId = knownSubjectIds.get(action.from_subject);
-        const toId = knownSubjectIds.get(action.to_subject);
+        const fromId = resolveEdgeEndpoint(action.from_subject, knownSubjectIds, knownById, aliasMaps);
+        const toId = resolveEdgeEndpoint(action.to_subject, knownSubjectIds, knownById, aliasMaps);
         if (!fromId || !toId) {
           throw new Error(`Unable to resolve edge subjects: ${action.from_subject} -> ${action.to_subject}`);
         }
@@ -843,6 +865,19 @@ function resolveAlias(id: string, aliasMaps: CuratorAliasMaps): string {
   return aliasMaps.aliasToId.get(id) ?? id;
 }
 
+function resolveEdgeEndpoint(
+  endpoint: string,
+  knownSubjectIds: Map<string, string>,
+  knownById: Map<string, CuratorMemory>,
+  aliasMaps: CuratorAliasMaps
+): string | undefined {
+  const aliasOrId = resolveAlias(endpoint, aliasMaps);
+  if (knownById.has(aliasOrId)) {
+    return aliasOrId;
+  }
+  return knownSubjectIds.get(endpoint) ?? knownSubjectIds.get(aliasOrId);
+}
+
 async function insertActiveMemory(
   client: PoolClient,
   vault: VaultRow,
@@ -861,7 +896,7 @@ async function insertActiveMemory(
     sourceSegmentId: string;
   }
 ): Promise<{ id: string }> {
-  const embedding = await embedder.embed(input.fact);
+  const embedding = await embedder.embed(input.fact, { vaultId: vault.id, modelRole: 'embedding', inputType: 'document' });
   const storedFact = await encryptForVault(vault, input.fact);
   const encryptedSubject = await encryptSubjectForVault(vault, input.subject);
   const result = await client.query<{ id: string }>(
@@ -913,7 +948,7 @@ async function updateMemoryNode(
     parentId: string | null;
   }
 ) {
-  const embedding = await embedder.embed(input.fact);
+  const embedding = await embedder.embed(input.fact, { vaultId: vault.id, modelRole: 'embedding', inputType: 'document' });
   const storedFact = await encryptForVault(vault, input.fact);
   const encryptedSubject = await encryptSubjectForVault(vault, input.subject);
   await client.query(

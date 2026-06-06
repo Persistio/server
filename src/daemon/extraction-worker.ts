@@ -13,12 +13,15 @@ import { filterMemoryCandidates } from '../services/deterministic-filter';
 import { getEmbedder } from '../services/embedder';
 import { formatConversationForExtraction } from '../services/extraction-formatting';
 import { buildPromptHeader } from '../services/extraction-prompt-header';
+import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 import { ExtractorService } from '../services/extractor';
+import { getRawChunkStorage } from '../services/raw-chunk-storage';
 import type { ConflictResolution } from '../services/extractor';
 import { completePersistentJobIfReady, failPersistentJob, markPersistentJobRunning } from '../services/job-status';
 import { archiveStaleMemories } from '../services/staleness';
 import { AiBudgetDeferredError } from '../services/usage';
 import { isCuratorEnabled } from '../services/curation-capacity';
+import { enqueueCurationIfSegmentReady } from '../services/segment-curation-readiness';
 import {
   getVaultSubjectList,
   normaliseSubject,
@@ -30,6 +33,7 @@ import {
 } from '../services/entity-resolver';
 import { getSpanAttributes, withSpan } from '../telemetry';
 import { matchSecretPattern } from '../utils/secret-filter';
+import type { VaultPromptContext } from '../services/vault-prompts';
 
 interface QueuedWorkRow {
   queue_id: string;
@@ -46,6 +50,9 @@ interface VaultContextRow {
   encrypted_dek: string | null;
   vault_encryption_enabled: boolean;
   purpose: string | null;
+  type: 'general' | 'custom' | null;
+  custom_extraction_prompt: string | null;
+  custom_curation_prompt: string | null;
 }
 
 interface RawChunkRow {
@@ -53,7 +60,8 @@ interface RawChunkRow {
   vault_id: string;
   session_id: string;
   role: string;
-  content: string;
+  blob_store: string | null;
+  blob_key: string | null;
   created_at: string;
 }
 
@@ -85,6 +93,7 @@ interface WorkerRequest {
 const config = getConfig();
 const embedder = getEmbedder();
 const extractor = new ExtractorService();
+const rawChunkStorage = getRawChunkStorage();
 const workerId = crypto.randomUUID();
 const subjectArbitrationLimit = pLimit(5);
 const MAX_EXTRACTION_RATE_LIMIT_RETRIES = 5;
@@ -116,8 +125,7 @@ async function processBatch(vaultId?: string) {
       `WITH claimed AS (
          SELECT eq.id AS queue_id, eq.chunk_id, eq.segment_id, eq.vault_id, eq.retry_count, eq.job_id
          FROM extraction_queue eq
-         WHERE eq.claimed_at IS NULL
-           AND eq.available_at <= now()
+         WHERE ${EXTRACTION_QUEUE_READY_PREDICATE}
            ${vaultClause}
          ORDER BY eq.priority DESC, eq.enqueued_at ASC
          LIMIT $${vaultId ? 2 : 1}
@@ -167,7 +175,7 @@ async function processBatch(vaultId?: string) {
           await markPersistentJobRunning(job.jobId);
           const decryptedChunks = await Promise.all(job.chunks.map(async (chunk) => ({
             ...chunk,
-            decryptedContent: await decryptForVault(job.vault, chunk.content)
+            decryptedContent: await decryptForVault(job.vault, await readRawChunkContent(chunk))
           })));
 
           const conversation = formatConversationForExtraction(decryptedChunks);
@@ -185,7 +193,12 @@ async function processBatch(vaultId?: string) {
           }
           const vaultSubjects = vaultSubjectCache.get(job.vault.id) ?? [];
           const promptHeader = buildPromptHeader(job.vault.purpose, sessionContext, vaultSubjects);
-          const facts = await extractor.extractFacts(conversation, promptHeader, job.vault.id);
+          const facts = await extractor.extractFacts(
+            conversation,
+            promptHeader,
+            job.vault.id,
+            await decryptVaultPromptContext(job.vault)
+          );
           const filteredByScore = facts.filter((fact) => fact.score >= config.EXTRACTION_SCORE_THRESHOLD);
           const afterSecretFilter = filteredByScore.filter((fact) => {
             const match = matchSecretPattern(fact.fact);
@@ -270,7 +283,8 @@ async function processBatch(vaultId?: string) {
           }
 
           const subjectEmbeddings = await embedder.embedBatch(
-            subjectResolutionInputs.map(({ fact }) => fact.subject)
+            subjectResolutionInputs.map(({ fact }) => fact.subject),
+            { vaultId: job.vault.id, modelRole: 'embedding', inputType: 'document' }
           );
           await Promise.all(subjectResolutionInputs.map(async ({ fact, index }, inputIndex) => {
             const subjectEmbedding = subjectEmbeddings[inputIndex];
@@ -337,7 +351,8 @@ async function processBatch(vaultId?: string) {
             resolvedFacts[index] = fact;
           }));
           const factEmbeddings = await embedder.embedBatch(
-            factsToEmbed.map((fact) => fact.fact)
+            factsToEmbed.map((fact) => fact.fact),
+            { vaultId: job.vault.id, modelRole: 'embedding', inputType: 'document' }
           );
 
           const curatorEnabled = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id);
@@ -522,15 +537,13 @@ async function completeExtractionJob(job: LoadedJob): Promise<void> {
       [job.chunkIds]
     );
 
-    if (job.segmentId && config.CURATOR_AUTO_RUN) {
-      if (await isCuratorEnabled(job.vault.id, client)) {
-        await client.query(
-          `INSERT INTO curation_queue (vault_id, segment_id)
-           VALUES ($1, $2)
-           ON CONFLICT (vault_id, segment_id) DO NOTHING`,
-          [job.vault.id, job.segmentId]
-        );
-      }
+    if (job.segmentId) {
+      const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id, client);
+      await enqueueCurationIfSegmentReady(client, {
+        vaultId: job.vault.id,
+        segmentId: job.segmentId,
+        enqueue
+      });
     }
 
     await completePersistentJobIfReady(client, job.jobId);
@@ -545,6 +558,14 @@ async function deadLetterQueuedJob(queuedJob: QueuedWorkRow, retryCount: number,
       [queuedJob.vault_id, queuedJob.chunk_id, queuedJob.segment_id, retryCount, lastError, queuedJob.job_id]
     );
     await client.query(`DELETE FROM extraction_queue WHERE id = $1`, [queuedJob.queue_id]);
+    if (queuedJob.segment_id) {
+      const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(queuedJob.vault_id, client);
+      await enqueueCurationIfSegmentReady(client, {
+        vaultId: queuedJob.vault_id,
+        segmentId: queuedJob.segment_id,
+        enqueue
+      });
+    }
     await failPersistentJob(client, queuedJob.job_id, lastError);
   });
 }
@@ -605,7 +626,8 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   if (queuedJob.segment_id) {
     const segmentResult = await query<SegmentRow & VaultContextRow>(
       `SELECT s.id, s.vault_id, s.session_id, s.chunk_ids, s.created_at,
-              v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id
+              v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id,
+              v.type, v.custom_extraction_prompt, v.custom_curation_prompt
        FROM segments s
        JOIN vaults v ON v.id = s.vault_id
        WHERE s.id = $1
@@ -619,15 +641,19 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
 
     const segment = segmentResult.rows[0];
     const chunksResult = await query<RawChunkRow>(
-      `SELECT id, vault_id, session_id, role, content, created_at
+      `SELECT id, vault_id, session_id, role, blob_store, blob_key, created_at
        FROM raw_chunks
-       WHERE id = ANY($1::uuid[])`,
+       WHERE id = ANY($1::uuid[])
+         AND blob_key IS NOT NULL`,
       [segment.chunk_ids]
     );
     const chunkById = new Map(chunksResult.rows.map((row) => [row.id, row]));
     const orderedChunks = segment.chunk_ids
       .map((chunkId) => chunkById.get(chunkId))
       .filter((chunk): chunk is RawChunkRow => Boolean(chunk));
+    if (orderedChunks.length !== segment.chunk_ids.length) {
+      throw new Error(`Segment ${segment.id} has ${segment.chunk_ids.length - orderedChunks.length} raw chunks without blob storage`);
+    }
 
     return {
       queueId: queuedJob.queue_id,
@@ -638,7 +664,10 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
         plan_id: segment.plan_id,
         encrypted_dek: segment.encrypted_dek,
         vault_encryption_enabled: segment.vault_encryption_enabled,
-        purpose: segment.purpose
+        purpose: segment.purpose,
+        type: segment.type,
+        custom_extraction_prompt: segment.custom_extraction_prompt,
+        custom_curation_prompt: segment.custom_curation_prompt
       },
       sessionId: segment.session_id,
       chunkIds: segment.chunk_ids,
@@ -652,17 +681,19 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   }
 
   const chunkResult = await query<RawChunkRow & VaultContextRow>(
-    `SELECT rc.id, rc.vault_id, rc.session_id, rc.role, rc.content, rc.created_at,
-            v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id
+    `SELECT rc.id, rc.vault_id, rc.session_id, rc.role, rc.blob_store, rc.blob_key, rc.created_at,
+            v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id,
+            v.type, v.custom_extraction_prompt, v.custom_curation_prompt
      FROM raw_chunks rc
      JOIN vaults v ON v.id = rc.vault_id
      WHERE rc.id = $1
+       AND rc.blob_key IS NOT NULL
      LIMIT 1`,
     [queuedJob.chunk_id]
   );
 
   if (!chunkResult.rowCount) {
-    throw new Error(`Chunk ${queuedJob.chunk_id} not found`);
+    throw new Error(`Chunk ${queuedJob.chunk_id} not found or has no blob_key`);
   }
 
   const chunk = chunkResult.rows[0];
@@ -675,13 +706,42 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
       plan_id: chunk.plan_id,
       encrypted_dek: chunk.encrypted_dek,
       vault_encryption_enabled: chunk.vault_encryption_enabled,
-      purpose: chunk.purpose
+      purpose: chunk.purpose,
+      type: chunk.type,
+      custom_extraction_prompt: chunk.custom_extraction_prompt,
+      custom_curation_prompt: chunk.custom_curation_prompt
     },
     sessionId: chunk.session_id,
     chunkIds: [chunk.id],
     chunks: [chunk],
     createdAt: chunk.created_at
   };
+}
+
+async function decryptVaultPromptContext(vault: VaultContextRow): Promise<VaultPromptContext> {
+  if (vault.type !== 'custom') {
+    return { type: vault.type };
+  }
+
+  return {
+    type: vault.type,
+    custom_extraction_prompt: vault.custom_extraction_prompt
+      ? await decryptForVault(vault, vault.custom_extraction_prompt)
+      : null,
+    custom_curation_prompt: vault.custom_curation_prompt
+      ? await decryptForVault(vault, vault.custom_curation_prompt)
+      : null
+  };
+}
+
+async function readRawChunkContent(chunk: RawChunkRow): Promise<string> {
+  if (!chunk.blob_key) {
+    throw new Error(`Raw chunk ${chunk.id} has no blob_key`);
+  }
+  if (chunk.blob_store && chunk.blob_store !== rawChunkStorage.store) {
+    throw new Error(`Raw chunk ${chunk.id} is stored in ${chunk.blob_store}, but configured storage is ${rawChunkStorage.store}`);
+  }
+  return rawChunkStorage.get(chunk.blob_key);
 }
 
 function getLatestChunkTimestamp(chunks: RawChunkRow[]): string | null {

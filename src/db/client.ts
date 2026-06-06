@@ -94,6 +94,11 @@ export async function runMigrations() {
       .filter((filename) => filename.endsWith('.sql'))
       .sort();
 
+    await client.query(
+      `SELECT set_config('persistio.storage_embedding_dimensions', $1, false)`,
+      [String(config.STORAGE_EMBEDDING_DIMENSIONS)]
+    );
+
     for (const filename of filenames) {
       const existing = await client.query<{ filename: string }>(
         `SELECT filename
@@ -109,18 +114,25 @@ export async function runMigrations() {
       const sql = fs.readFileSync(path.join(migrationsDir, filename), 'utf8');
       await client.query('BEGIN');
       try {
+        await client.query(`SELECT set_config('persistio.skip_migration_record', 'false', true)`);
         await client.query(sql);
-        await client.query(
-          `INSERT INTO schema_migrations (filename)
-           VALUES ($1)`,
-          [filename]
+        const skipRecord = await client.query<{ skip_migration_record: string | null }>(
+          `SELECT current_setting('persistio.skip_migration_record', true) AS skip_migration_record`
         );
+        if (skipRecord.rows[0]?.skip_migration_record !== 'true') {
+          await client.query(
+            `INSERT INTO schema_migrations (filename)
+             VALUES ($1)`,
+            [filename]
+          );
+        }
         await client.query('COMMIT');
       } catch (error) {
         await client.query('ROLLBACK');
         throw error;
       }
     }
+    await validateStorageEmbeddingDimensions(client);
     pgvectorTypeRegistrationEnabled = true;
     await registerPgvectorTypes(client);
   } finally {
@@ -133,7 +145,35 @@ export async function closePool() {
 }
 
 export function getConfiguredPoolMax(appConfig = config): number {
-  return Math.min(appConfig.DB_POOL_MAX, appConfig.EXTRACTION_WORKER_CONCURRENCY * 2 + 2);
+  return appConfig.DB_POOL_MAX;
+}
+
+export async function validateStorageEmbeddingDimensions(
+  client: Pick<PoolClient, 'query'>,
+  targetDimensions = config.STORAGE_EMBEDDING_DIMENSIONS
+): Promise<void> {
+  const targetType = `vector(${targetDimensions})`;
+  const result = await client.query<{ table_name: string; column_type: string }>(
+    `SELECT c.relname AS table_name,
+            format_type(a.atttypid, a.atttypmod) AS column_type
+     FROM pg_attribute a
+     JOIN pg_class c ON c.oid = a.attrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relname = ANY($1::text[])
+       AND a.attname = 'embedding'
+       AND NOT a.attisdropped
+     ORDER BY c.relname`,
+    [['raw_chunks', 'memories', 'memory_embeddings', 'entity_aliases']]
+  );
+  const mismatches = result.rows.filter((row) => row.column_type !== targetType);
+  if (mismatches.length > 0) {
+    throw new Error(
+      `Configured STORAGE_EMBEDDING_DIMENSIONS=${targetDimensions} does not match pgvector columns: ${
+        mismatches.map((row) => `${row.table_name}.${row.column_type}`).join(', ')
+      }. Re-embed or restore the matching storage dimension before startup.`
+    );
+  }
 }
 
 export function warnIfPoolNearExhaustion(now = Date.now()) {

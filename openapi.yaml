@@ -1,20 +1,109 @@
 openapi: 3.1.0
 info:
   title: Persistio API
-  version: 0.1.0
+  version: 0.1.17
   description: Self-hosted memory service for AI agents.
 servers:
   - url: http://localhost:4827
 paths:
   /health:
     get:
-      summary: Health check
+      summary: Health probe
+      description: |
+        Returns service health including a live database ping.
+        If `HEALTH_API_KEY` is set on the server, requests must include the header
+        `X-Health-Key: <HEALTH_API_KEY>`. If the env var is unset, the endpoint is
+        unauthenticated (dev/test only).
+      parameters:
+        - in: header
+          name: X-Health-Key
+          required: false
+          schema:
+            type: string
+          description: Required when `HEALTH_API_KEY` is configured on the server.
       responses:
         '200':
           description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, degraded]
+                    description: Overall health status.
+                  version:
+                    type: string
+                    description: Server version.
+                  db:
+                    type: string
+                    enum: [ok, degraded]
+                    description: Database connectivity status.
+                  db_latency_ms:
+                    type: integer
+                    description: Measured latency of the database ping in milliseconds.
+                  extraction_queue_depth:
+                    type:
+                      - integer
+                      - 'null'
+                    description: Number of entries currently in the extraction queue.
+                  curation_queue_depth:
+                    type:
+                      - integer
+                      - 'null'
+                    description: Number of entries currently in the curation queue.
+                  uptime_s:
+                    type: integer
+                    description: Process uptime in whole seconds.
+              example:
+                status: ok
+                version: 0.1.17
+                db: ok
+                db_latency_ms: 12
+                extraction_queue_depth: 2
+                curation_queue_depth: 1
+                uptime_s: 34
+        '503':
+          description: Service is degraded (database check failed or timed out)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [degraded]
+                  version:
+                    type: string
+                  db:
+                    type: string
+                    enum: [degraded]
+                  db_latency_ms:
+                    type: integer
+                  extraction_queue_depth:
+                    type: 'null'
+                  curation_queue_depth:
+                    type: 'null'
+                  uptime_s:
+                    type: integer
+              example:
+                status: degraded
+                version: 0.1.17
+                db: degraded
+                db_latency_ms: 2001
+                extraction_queue_depth: null
+                curation_queue_depth: null
+                uptime_s: 120
   /v1/ingest:
     post:
       summary: Append raw conversation chunks
+      description: |
+        Appends raw conversation chunks for extraction. Each chunk must include
+        the original conversation turn timestamp as an ISO 8601 datetime with
+        UTC `Z` or an explicit offset. The
+        live OpenClaw plugin supplies this automatically; custom clients and
+        backfill tools must provide it explicitly.
       security:
         - bearerAuth: []
       requestBody:
@@ -31,16 +120,104 @@ paths:
                   type: array
                   items:
                     type: object
-                    required: [role, content]
+                    required: [role, content, timestamp]
                     properties:
                       role:
                         type: string
                         enum: [user, assistant, tool]
                       content:
                         type: string
+                        maxLength: 8000
+                      timestamp:
+                        type: string
+                        format: date-time
+                        description: Original conversation turn time, not ingest request time.
       responses:
         '202':
           description: Chunks accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: integer
+                  chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        created_at:
+                          type: string
+                          format: date-time
+  /v1/ingest/bulk:
+    post:
+      summary: Bulk append raw conversation chunks
+      description: |
+        Premium backfill/import endpoint. Accepts up to 2048 chunks, writes raw
+        chunks with one multi-row insert, and queues extraction at bulk priority.
+        Request bodies are accepted up to `BULK_INGEST_BODY_LIMIT_BYTES`
+        bytes, 25 MiB by default.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, chunks]
+              properties:
+                session_id:
+                  type: string
+                chunks:
+                  type: array
+                  maxItems: 2048
+                  items:
+                    type: object
+                    required: [role, content, timestamp]
+                    properties:
+                      role:
+                        type: string
+                        enum: [user, assistant, tool]
+                      content:
+                        type: string
+                        maxLength: 8000
+                      timestamp:
+                        type: string
+                        format: date-time
+                        description: Original conversation turn time, not ingest request time.
+      responses:
+        '202':
+          description: Chunks accepted and extraction job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: integer
+                  job_id:
+                    type: string
+                    format: uuid
+                  chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        created_at:
+                          type: string
+                          format: date-time
+        '403':
+          description: Bulk ingest requires a premium plan
+        '413':
+          description: Too many chunks
   /v1/recall:
     post:
       summary: Semantic recall across memories and optional raw chunks
@@ -58,11 +235,70 @@ paths:
                   type: string
                 top_k:
                   type: integer
+                min_similarity:
+                  type: number
+                  minimum: 0
+                  maximum: 1
                 include_raw:
                   type: boolean
+                include_evidence:
+                  type: boolean
+                mode:
+                  type: string
+                  enum: [agent, factual]
       responses:
         '200':
           description: Recall results
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [memories, evidence_chunks, raw_chunks]
+                    additionalProperties: false
+                    properties:
+                      memories:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RecallMemory'
+                      evidence_chunks:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RecallChunk'
+                      raw_chunks:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RecallRawChunk'
+                  - type: object
+                    required: [bundle]
+                    additionalProperties: false
+                    properties:
+                      bundle:
+                        type: object
+                        additionalProperties:
+                          type: array
+                          items:
+                            type: string
+  /stats:
+    get:
+      summary: Fetch vault plan, quota, and usage stats
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Vault stats
+  /v1/curation:
+    get:
+      summary: Fetch live Curator capacity, queue, and usage state
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Curator capacity status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationStatus'
   /v1/memories:
     get:
       summary: List memories
@@ -88,6 +324,19 @@ paths:
       responses:
         '200':
           description: Paginated memories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Memory'
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
     post:
       summary: Create a memory
       security:
@@ -111,6 +360,73 @@ paths:
       responses:
         '201':
           description: Memory created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
+  /v1/memories/graph:
+    get:
+      summary: Fetch a bounded live memory graph
+      description: Returns visible memory nodes and relationship edges for vault graph visualisation.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: seed_memory_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: Optional visible memory id to expand from.
+        - in: query
+          name: depth
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 3
+            default: 1
+          description: Neighborhood expansion depth from the seed memory.
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Maximum number of nodes to return.
+        - in: query
+          name: direction
+          required: false
+          schema:
+            type: string
+            enum: [out, in, both]
+            default: both
+          description: Direction to traverse from the seed memory.
+        - in: query
+          name: edge_types
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/MemoryEdgeType'
+          style: form
+          explode: false
+          description: Optional comma-separated edge type filter.
+      responses:
+        '200':
+          description: Bounded memory graph
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryGraph'
+        '400':
+          description: Invalid graph query
+        '401':
+          description: Unauthorized
+        '404':
+          description: Seed memory not found
   /v1/memories/{id}:
     get:
       summary: Fetch one memory
@@ -123,9 +439,20 @@ paths:
           schema:
             type: string
             format: uuid
+        - in: query
+          name: include_pending
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Include a fresh pending candidate memory by id when true.
       responses:
         '200':
           description: Memory details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
         '404':
           description: Memory not found
     patch:
@@ -142,6 +469,10 @@ paths:
       responses:
         '200':
           description: Memory updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
         '404':
           description: Memory not found
     delete:
@@ -185,16 +516,16 @@ paths:
           description: Job status
         '404':
           description: Job not found
-  /admin/tenants:
+  /admin/vaults:
     get:
-      summary: List tenants
+      summary: List vaults
       security:
         - adminKey: []
       responses:
         '200':
-          description: Tenant list
+          description: Vault list
     post:
-      summary: Create a tenant
+      summary: Create a vault
       security:
         - adminKey: []
       requestBody:
@@ -207,12 +538,20 @@ paths:
               properties:
                 name:
                   type: string
+                  minLength: 1
+                purpose:
+                  type: string
+                  minLength: 1
+                  maxLength: 500
+                plan:
+                  type: string
+                  enum: [free, unlimited]
       responses:
         '201':
-          description: Tenant created
-  /admin/tenants/{id}:
-    delete:
-      summary: Delete a tenant
+          description: Vault created
+  /admin/vaults/{id}:
+    get:
+      summary: Get vault detail without key material
       security:
         - adminKey: []
       parameters:
@@ -224,10 +563,353 @@ paths:
             format: uuid
       responses:
         '200':
-          description: Tenant deleted
+          description: Vault detail
         '404':
-          description: Tenant not found
+          description: Vault not found
+    patch:
+      summary: Update a vault
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                purpose:
+                  type: string
+                  nullable: true
+                  minLength: 1
+                  maxLength: 500
+                plan:
+                  type: string
+                  enum: [free, unlimited]
+      responses:
+        '200':
+          description: Vault updated
+        '404':
+          description: Vault not found
+    delete:
+      summary: Delete a vault
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Vault deleted
+        '404':
+          description: Vault not found
+  /admin/vaults/{id}/rotate-key:
+    post:
+      summary: Rotate a vault API key
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Vault key rotated
+        '404':
+          description: Vault not found
+  /admin/vaults/{id}/curation:
+    get:
+      summary: Fetch staff Curator capacity, queue, and usage state for a vault
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Curator capacity status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationStatus'
+        '404':
+          description: Vault not found
 components:
+  schemas:
+    Memory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        subject:
+          type: string
+        data:
+          type: string
+        categories:
+          type: array
+          items:
+            type: string
+        confidence:
+          type: number
+        score:
+          type: integer
+        salience:
+          type: string
+          description: Numeric salience value serialized from PostgreSQL numeric.
+        sensitivity:
+          type: string
+        type:
+          type:
+            - string
+            - 'null'
+        scope:
+          type: string
+        evidence:
+          oneOf:
+            - type: object
+            - type: string
+            - type: 'null'
+        polarity:
+          type: string
+        status:
+          type: string
+        valid_from:
+          type:
+            - string
+            - 'null'
+        valid_until:
+          type:
+            - string
+            - 'null'
+        source_timestamp:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Original source conversation event time; distinct from memory creation time.
+        archived_at:
+          type:
+            - string
+            - 'null'
+        created_at:
+          type: string
+          format: date-time
+          description: Memory row creation or extraction time.
+        updated_at:
+          type: string
+          format: date-time
+        parent_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        volatility:
+          type: string
+        edge_count:
+          type: integer
+    RecallMemory:
+      allOf:
+        - $ref: '#/components/schemas/Memory'
+        - type: object
+          properties:
+            similarity:
+              type: number
+            source:
+              type: string
+              enum: [global_behavioral, semantic, graph]
+            edge_type:
+              type:
+                - string
+                - 'null'
+            recall_count:
+              type: integer
+            last_recalled:
+              type:
+                - string
+                - 'null'
+              format: date-time
+    RecallChunk:
+      type: object
+      properties:
+        memory_id:
+          type: string
+          format: uuid
+        id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+        role:
+          type: string
+        content:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          description: Original conversation turn timestamp.
+    RecallRawChunk:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+        role:
+          type: string
+        content:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          description: Original conversation turn timestamp.
+        similarity:
+          type: number
+    MemoryEdgeType:
+      type: string
+      enum: [applies_to, part_of, depends_on, supports, contradicts, supersedes, refines, relevant_when]
+    MemoryGraphNode:
+      allOf:
+        - $ref: '#/components/schemas/Memory'
+        - type: object
+          properties:
+            depth:
+              type: integer
+    MemoryGraphEdge:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        from_memory_id:
+          type: string
+          format: uuid
+        to_memory_id:
+          type: string
+          format: uuid
+        type:
+          $ref: '#/components/schemas/MemoryEdgeType'
+        confidence:
+          type: number
+        reason:
+          type:
+            - string
+            - 'null'
+        created_at:
+          type: string
+        updated_at:
+          type: string
+    MemoryGraph:
+      type: object
+      properties:
+        seed_memory_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        depth:
+          type: integer
+        limit:
+          type: integer
+        direction:
+          type: string
+          enum: [out, in, both]
+        edge_types:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/MemoryEdgeType'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryGraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryGraphEdge'
+    CurationStatus:
+      type: object
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        plan:
+          type: string
+        period:
+          type: string
+          example: '2026-05'
+        limits:
+          type: object
+          additionalProperties: true
+        usage:
+          type: object
+          properties:
+            curator_runs:
+              type: integer
+            curator_requests:
+              type: integer
+            curator_input_tokens:
+              type: integer
+            curator_output_tokens:
+              type: integer
+            curator_candidates_processed:
+              type: integer
+            curator_candidates_deferred:
+              type: integer
+        backlog:
+          type: object
+          properties:
+            pending_queue_rows:
+              type: integer
+            oldest_queue_age_seconds:
+              type: integer
+              nullable: true
+            backlog_limit:
+              type: integer
+            pressure:
+              type: string
+              enum: [ok, warning, over_limit]
+        schedule:
+          type: object
+          properties:
+            last_run_at:
+              type: string
+              nullable: true
+            next_run_at:
+              type: string
+              nullable: true
+            eligible_now:
+              type: boolean
+            defer_reason:
+              type: string
+              nullable: true
+        recent_runs:
+          type: array
+          items:
+            type: object
   securitySchemes:
     bearerAuth:
       type: http

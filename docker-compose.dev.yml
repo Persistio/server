@@ -5,6 +5,20 @@ services:
       - "11434:11434"
     volumes:
       - ollamamodels:/root/.ollama
+    healthcheck:
+      test: ['CMD', 'ollama', 'list']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-pull-qwen:
+    image: ollama/ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ['pull', 'qwen3-embedding:0.6b']
+    depends_on:
+      ollama:
+        condition: service_healthy
 
 volumes:
   ollamamodels:

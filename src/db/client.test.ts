@@ -1,7 +1,7 @@
 import type { PoolClient } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
 
-import { createPgvectorVerifyHook, getConfiguredPoolMax } from './client';
+import { createPgvectorVerifyHook, getConfiguredPoolMax, validateStorageEmbeddingDimensions } from './client';
 
 describe('pgvector pool verification', () => {
   it('skips registration before migrations enable pgvector type loading', () => {
@@ -55,15 +55,47 @@ describe('pgvector pool verification', () => {
 });
 
 describe('pool sizing', () => {
-  it('caps the worker-derived pool size at DB_POOL_MAX', () => {
+  it('uses DB_POOL_MAX directly as the configured pool size', () => {
     expect(getConfiguredPoolMax({
       DB_POOL_MAX: 20,
       EXTRACTION_WORKER_CONCURRENCY: 5
-    } as Parameters<typeof getConfiguredPoolMax>[0])).toBe(12);
+    } as Parameters<typeof getConfiguredPoolMax>[0])).toBe(20);
 
     expect(getConfiguredPoolMax({
-      DB_POOL_MAX: 8,
+      DB_POOL_MAX: 50,
       EXTRACTION_WORKER_CONCURRENCY: 5
-    } as Parameters<typeof getConfiguredPoolMax>[0])).toBe(8);
+    } as Parameters<typeof getConfiguredPoolMax>[0])).toBe(50);
+  });
+});
+
+describe('embedding dimension validation', () => {
+  it('accepts pgvector columns that match the configured storage dimension', async () => {
+    const client = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { table_name: 'entity_aliases', column_type: 'vector(1024)' },
+          { table_name: 'memories', column_type: 'vector(1024)' },
+          { table_name: 'memory_embeddings', column_type: 'vector(1024)' },
+          { table_name: 'raw_chunks', column_type: 'vector(1024)' }
+        ]
+      })
+    };
+
+    await expect(validateStorageEmbeddingDimensions(client as never, 1024)).resolves.toBeUndefined();
+    expect(client.query.mock.calls[0]?.[0]).toContain('format_type');
+  });
+
+  it('rejects pgvector columns that do not match the configured storage dimension', async () => {
+    const client = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { table_name: 'memories', column_type: 'vector(1536)' },
+          { table_name: 'raw_chunks', column_type: 'vector(1536)' }
+        ]
+      })
+    };
+
+    await expect(validateStorageEmbeddingDimensions(client as never, 1024))
+      .rejects.toThrow('Configured STORAGE_EMBEDDING_DIMENSIONS=1024 does not match pgvector columns');
   });
 });

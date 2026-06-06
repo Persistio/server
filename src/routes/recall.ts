@@ -8,6 +8,7 @@ import { requireVaultAuth } from '../middleware/auth';
 import { decryptForVault } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
 import { PENDING_RECALL_WINDOW_MS, pendingRecallCutoff } from '../services/pending-memory';
+import { getRawChunkStorage } from '../services/raw-chunk-storage';
 import { applyRateLimitHeaders, consumeApiQuota } from '../services/usage';
 import { withSpan } from '../telemetry';
 
@@ -18,6 +19,7 @@ const recallSchema = z.object({
   include_raw: z.boolean().optional().default(false),
   include_evidence: z.boolean().optional().default(false),
   include_pending: z.boolean().optional().default(false),
+  include_related: z.boolean().optional().default(true),
   mode: z.enum(['agent', 'factual']).optional().default('agent')
 });
 
@@ -58,12 +60,15 @@ const RECALL_OVERFETCH_MULTIPLIER = 4;
 const MIN_RECALL_CANDIDATE_LIMIT = 25;
 const RECENCY_BOOST_MAX = 0.04;
 const RECENCY_BOOST_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const rawChunkStorage = getRawChunkStorage();
 
 interface RecallRawChunk {
   id: string;
   session_id: string;
   role: string;
-  content: string;
+  blob_store: string | null;
+  blob_key: string | null;
+  content?: string;
   similarity: number;
   created_at: string;
 }
@@ -73,7 +78,9 @@ interface RecallEvidenceChunk {
   id: string;
   session_id: string;
   role: string;
-  content: string;
+  blob_store: string | null;
+  blob_key: string | null;
+  content?: string;
   created_at: string;
 }
 
@@ -361,6 +368,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       'recall.include_raw': body.include_raw,
       'recall.include_evidence': body.include_evidence,
       'recall.include_pending': body.include_pending,
+      'recall.include_related': body.include_related,
       'recall.top_k': topK,
       'recall.mode': body.mode,
       'recall.min_similarity': body.min_similarity ?? config.MIN_RECALL_SIMILARITY
@@ -368,7 +376,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       const start = performance.now();
       const recallTime = new Date();
       const embedder = getEmbedder();
-      const embedding = await embedder.embed(body.query);
+      const embedding = await embedder.embed(body.query, { vaultId: request.vault.id, modelRole: 'embedding', inputType: 'query' });
       const minSimilarity = body.min_similarity ?? config.MIN_RECALL_SIMILARITY;
       const candidateLimit = recallCandidateLimit(topK);
       const pendingCutoff = pendingRecallCutoff(recallTime);
@@ -429,7 +437,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         .filter((row) => getSimilarity(row) >= minSimilarity);
       const directRows = composeRecallRows(semanticRows, topK, body.mode, minSimilarity, recallTime, body.include_pending);
       const semanticIds = directRows.map((row) => row.id);
-      const neighborResult = semanticIds.length
+      const neighborResult = body.include_related && semanticIds.length
         ? await query<RecallMemoryRow>(
           // Directed traversal is intentional here: edges are stored as A -> B, so querying A finds B
           // neighbors, but querying B does not walk back to A in the current retrieval model.
@@ -477,13 +485,14 @@ export async function registerRecallRoutes(app: FastifyInstance) {
              JOIN segments s ON s.id = m.source_segment_id
              WHERE m.id = ANY($1::uuid[])
            ), ranked_chunks AS (
-             SELECT es.memory_id, rc.id, rc.session_id, rc.role, rc.content, rc.created_at,
+             SELECT es.memory_id, rc.id, rc.session_id, rc.role, rc.blob_store, rc.blob_key, rc.created_at,
                     ROW_NUMBER() OVER (PARTITION BY es.memory_id ORDER BY rc.created_at, rc.id) AS rank
              FROM evidence_sources es
              JOIN raw_chunks rc ON rc.id = es.chunk_id
              WHERE rc.vault_id = $2
+               AND rc.blob_key IS NOT NULL
            )
-           SELECT memory_id, id, session_id, role, content, created_at
+           SELECT memory_id, id, session_id, role, blob_store, blob_key, created_at
            FROM ranked_chunks
            WHERE rank <= 6
            ORDER BY memory_id, created_at, id
@@ -497,11 +506,12 @@ export async function registerRecallRoutes(app: FastifyInstance) {
 
       if (body.include_raw && qs.format !== 'bundle') {
         const rawResult = await query<RecallRawChunk>(
-          `SELECT id, session_id, role, content, created_at,
+          `SELECT id, session_id, role, blob_store, blob_key, created_at,
                   1 - (embedding <=> $2::vector) AS similarity
            FROM raw_chunks
            WHERE vault_id = $1
              AND embedding IS NOT NULL
+             AND blob_key IS NOT NULL
            ORDER BY embedding <=> $2::vector
            LIMIT $3`,
           [request.vault.id, JSON.stringify(embedding), candidateLimit]
@@ -525,11 +535,11 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       })));
       const decryptedEvidenceChunks = await Promise.all(evidenceChunks.map(async (row) => ({
         ...row,
-        content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
+        content: await decryptForVault(request.vault, await readRawChunkContent(row))
       })));
       const decryptedRawChunks = await Promise.all(rawChunks.map(async (row) => ({
         ...row,
-        content: typeof row.content === 'string' ? await decryptForVault(request.vault, row.content) : row.content
+        content: await decryptForVault(request.vault, await readRawChunkContent(row))
       })));
 
       const durationMs = performance.now() - start;
@@ -548,10 +558,11 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       span.setAttribute('recall.duration_ms', durationMs);
 
       if (qs.format === 'bundle') {
-        return {
-          ...buildRecallBundle(decryptedMemories, decryptedGlobalUserRules),
-          related_bundle: buildRecallBundle(decryptedRelatedMemories).bundle
-        };
+        const response: RecallBundleResponse = buildRecallBundle(decryptedMemories, decryptedGlobalUserRules);
+        if (body.include_related) {
+          response.related_bundle = buildRecallBundle(decryptedRelatedMemories).bundle;
+        }
+        return response;
       }
 
       const response: RecallResponse = {
@@ -564,4 +575,14 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       return response;
     });
   });
+}
+
+async function readRawChunkContent(row: Pick<RecallRawChunk, 'id' | 'blob_store' | 'blob_key'>): Promise<string> {
+  if (!row.blob_key) {
+    throw new Error(`Raw chunk ${row.id} has no blob_key`);
+  }
+  if (row.blob_store && row.blob_store !== rawChunkStorage.store) {
+    throw new Error(`Raw chunk ${row.id} is stored in ${row.blob_store}, but configured storage is ${rawChunkStorage.store}`);
+  }
+  return rawChunkStorage.get(row.blob_key);
 }

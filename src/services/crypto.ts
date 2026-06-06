@@ -2,22 +2,27 @@ import crypto from 'node:crypto';
 
 import { ManagedIdentityCredential } from '@azure/identity';
 import { CryptographyClient, KeyClient } from '@azure/keyvault-keys';
+import { KeyManagementServiceClient } from '@google-cloud/kms';
 
 import { getConfig } from '../config';
 
 const DEK_CACHE_TTL_MS = 5 * 60 * 1000;
-const credential = new ManagedIdentityCredential();
-let cryptoClient: CryptographyClient | null = null;
-
 
 const dekCache = new Map<string, { dek: Buffer; expiresAt: number }>();
 // In-flight deduplication map: prevents cache stampede under concurrent decryption (Fix 1).
 const dekInflight = new Map<string, Promise<Buffer>>();
+let keyEncryptionProvider: KeyEncryptionProvider | null = null;
 
 export interface VaultEncryptionContext {
   id: string;
   encrypted_dek: string | null;
   vault_encryption_enabled: boolean;
+}
+
+interface KeyEncryptionProvider {
+  init(): Promise<void>;
+  wrapDek(dek: Buffer): Promise<string>;
+  unwrapDek(encryptedDek: string): Promise<Buffer>;
 }
 
 // Keep-alive options: reuse TCP/TLS connections across Key Vault calls.
@@ -26,25 +31,83 @@ export interface VaultEncryptionContext {
 // This avoids the TS2353 error that `pipelineOptions` caused in PR #126.
 const KV_KEEP_ALIVE = { keepAliveOptions: { enable: true } } as const;
 
+class AzureKeyVaultProvider implements KeyEncryptionProvider {
+  private readonly credential = new ManagedIdentityCredential();
+  private cryptoClient: CryptographyClient | null = null;
+
+  async init(): Promise<void> {
+    const { KEY_VAULT_URI, KEK_KEY_NAME } = getConfig();
+    const keyClient = new KeyClient(KEY_VAULT_URI, this.credential, KV_KEEP_ALIVE);
+    const key = await keyClient.getKey(KEK_KEY_NAME);
+    this.cryptoClient = new CryptographyClient(key, this.credential, KV_KEEP_ALIVE);
+    console.log('[persistio] Azure Key Vault crypto provider initialised');
+  }
+
+  async wrapDek(dek: Buffer): Promise<string> {
+    const result = await this.getCryptographyClient().wrapKey('RSA-OAEP-256', dek);
+    return Buffer.from(result.result).toString('base64');
+  }
+
+  async unwrapDek(encryptedDek: string): Promise<Buffer> {
+    const result = await this.getCryptographyClient().unwrapKey('RSA-OAEP-256', Buffer.from(encryptedDek, 'base64'));
+    return Buffer.from(result.result);
+  }
+
+  private getCryptographyClient(): CryptographyClient {
+    if (!this.cryptoClient) {
+      throw new Error('Azure Key Vault crypto provider has not been initialised');
+    }
+
+    return this.cryptoClient;
+  }
+}
+
+class GcpKmsProvider implements KeyEncryptionProvider {
+  private readonly client: KeyManagementServiceClient;
+  private readonly keyName: string;
+
+  constructor() {
+    const config = getConfig();
+    this.client = new KeyManagementServiceClient();
+    this.keyName = config.GCP_KMS_KEY_NAME;
+  }
+
+  async init(): Promise<void> {
+    if (!this.keyName) {
+      throw new Error('GCP_KMS_KEY_NAME is required for GCP KMS crypto provider');
+    }
+    console.log('[persistio] GCP Cloud KMS crypto provider initialised');
+  }
+
+  async wrapDek(dek: Buffer): Promise<string> {
+    const [result] = await this.client.encrypt({
+      name: this.keyName,
+      plaintext: dek
+    });
+    return Buffer.from(result.ciphertext ?? new Uint8Array()).toString('base64');
+  }
+
+  async unwrapDek(encryptedDek: string): Promise<Buffer> {
+    const [result] = await this.client.decrypt({
+      name: this.keyName,
+      ciphertext: Buffer.from(encryptedDek, 'base64')
+    });
+    return Buffer.from(result.plaintext ?? new Uint8Array());
+  }
+}
+
 export async function initCryptoClient(): Promise<void> {
-  const { KEY_VAULT_URI, KEK_KEY_NAME } = getConfig();
-  const keyClient = new KeyClient(KEY_VAULT_URI, credential, KV_KEEP_ALIVE);
-  const key = await keyClient.getKey(KEK_KEY_NAME);
-  cryptoClient = new CryptographyClient(key, credential, KV_KEEP_ALIVE);
-  console.log('[persistio] Key Vault crypto client initialised');
+  keyEncryptionProvider = createKeyEncryptionProvider();
+  await keyEncryptionProvider.init();
 }
 
 export async function generateAndWrapDek(): Promise<{ encryptedDek: string }> {
   const dek = crypto.randomBytes(32);
-  const client = getCryptographyClient();
-  const result = await client.wrapKey('RSA-OAEP-256', dek);
-  return { encryptedDek: Buffer.from(result.result).toString('base64') };
+  return { encryptedDek: await getKeyEncryptionProvider().wrapDek(dek) };
 }
 
 export async function unwrapDek(encryptedDek: string): Promise<Buffer> {
-  const client = getCryptographyClient();
-  const result = await client.unwrapKey('RSA-OAEP-256', Buffer.from(encryptedDek, 'base64'));
-  return Buffer.from(result.result);
+  return getKeyEncryptionProvider().unwrapDek(encryptedDek);
 }
 
 export function encryptField(plaintext: string, dek: Buffer): string {
@@ -141,10 +204,17 @@ async function getVaultDek(vault: VaultEncryptionContext): Promise<Buffer> {
   return promise;
 }
 
-function getCryptographyClient(): CryptographyClient {
-  if (!cryptoClient) {
-    throw new Error('Key Vault crypto client has not been initialised');
+function createKeyEncryptionProvider(): KeyEncryptionProvider {
+  const config = getConfig();
+  return config.KEY_PROVIDER === 'gcp_kms'
+    ? new GcpKmsProvider()
+    : new AzureKeyVaultProvider();
+}
+
+function getKeyEncryptionProvider(): KeyEncryptionProvider {
+  if (!keyEncryptionProvider) {
+    throw new Error('Key encryption provider has not been initialised');
   }
 
-  return cryptoClient;
+  return keyEncryptionProvider;
 }

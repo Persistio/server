@@ -1,0 +1,12 @@
+services:
+  persistio:
+    environment:
+      PROMPTS_DIR: /prompts
+      EXTRACTOR_PROMPT_FILE: /prompts/extractor.txt
+      CURATOR_PROMPT_FILE: /prompts/curator.txt
+    volumes:
+      # The base docker-compose.yml already mounts the persistent raw_chunks
+      # volume at /data/raw-chunks for local raw chunk storage. Keep that
+      # mount when adding local overrides.
+      - ./prompts/extractor.txt:/prompts/extractor.txt:ro
+      - ./prompts/curator.txt:/prompts/curator.txt:ro

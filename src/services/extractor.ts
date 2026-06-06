@@ -3,8 +3,10 @@ import OpenAI from 'openai';
 import { getConfig, type AppConfig } from '../config';
 import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
 import { PromptLoader } from './prompt-loader';
-import { acquireAiBudget, settleAiUsage } from './usage';
+import { acquireAiBudget, recordModelUsage, settleAiUsage } from './usage';
 import { sanitizePromptData } from '../utils/sanitize';
+import { resolveVaultPrompt, type VaultPromptContext } from './vault-prompts';
+import { withSystemPromptPrefix } from './chat-completion';
 
 export interface ExtractedFact {
   fact: string;
@@ -73,6 +75,7 @@ type ModelRole = 'extraction' | 'escalation';
 interface RoleClient {
   client: OpenAI;
   model: string;
+  provider: string;
 }
 
 type ExtractorRoleConfigKeys =
@@ -103,21 +106,33 @@ export interface ResolvedExtractorRoleConfig {
 export function resolveExtractorRoleConfig(
   config: Pick<AppConfig, ExtractorRoleConfigKeys>
 ): ResolvedExtractorRoleConfig {
+  const extractionOverride = getCompleteRoleOverride(config, 'EXTRACTION');
+  const escalationOverride = getCompleteRoleOverride(config, 'ESCALATION');
   const extraction = {
-    baseURL: config.EXTRACTION_BASE_URL || config.EXTRACTOR_BASE_URL,
-    apiKey: config.EXTRACTION_API_KEY || config.EXTRACTOR_API_KEY,
-    model: config.EXTRACTION_MODEL || config.EXTRACTOR_MODEL
+    baseURL: extractionOverride?.baseURL ?? config.EXTRACTOR_BASE_URL,
+    apiKey: extractionOverride?.apiKey ?? config.EXTRACTOR_API_KEY,
+    model: extractionOverride?.model ?? config.EXTRACTOR_MODEL
   };
   const escalation = {
-    baseURL: config.ESCALATION_BASE_URL || config.EXTRACTOR_BASE_URL,
-    apiKey: config.ESCALATION_API_KEY || config.EXTRACTOR_API_KEY,
-    model: config.ESCALATION_MODEL || config.EXTRACTOR_MODEL
+    baseURL: escalationOverride?.baseURL ?? config.EXTRACTOR_BASE_URL,
+    apiKey: escalationOverride?.apiKey ?? config.EXTRACTOR_API_KEY,
+    model: escalationOverride?.model ?? config.EXTRACTOR_MODEL
   };
 
   return {
     extraction,
     escalation
   };
+}
+
+function getCompleteRoleOverride(
+  config: Pick<AppConfig, ExtractorRoleConfigKeys>,
+  prefix: 'EXTRACTION' | 'ESCALATION'
+): { baseURL: string; apiKey: string; model: string } | null {
+  const baseURL = config[`${prefix}_BASE_URL`];
+  const apiKey = config[`${prefix}_API_KEY`];
+  const model = config[`${prefix}_MODEL`];
+  return baseURL && apiKey && model ? { baseURL, apiKey, model } : null;
 }
 
 const SENSITIVITIES: MemorySensitivity[] = ['low', 'medium', 'high', 'restricted'];
@@ -146,14 +161,16 @@ export class ExtractorService {
           apiKey: roleConfig.extraction.apiKey,
           baseURL: roleConfig.extraction.baseURL
         }),
-        model: roleConfig.extraction.model
+        model: roleConfig.extraction.model,
+        provider: getProviderLabel(roleConfig.extraction.baseURL)
       },
       escalation: {
         client: new OpenAI({
           apiKey: roleConfig.escalation.apiKey,
           baseURL: roleConfig.escalation.baseURL
         }),
-        model: roleConfig.escalation.model
+        model: roleConfig.escalation.model,
+        provider: getProviderLabel(roleConfig.escalation.baseURL)
       }
     };
     this.promptLoader = new PromptLoader({
@@ -246,10 +263,11 @@ export class ExtractorService {
   }
 
   async arbitrateSubject(existingCanonical: string, newSubject: string, vaultId?: string): Promise<'use_existing' | 'new_canonical'> {
+    const role: ModelRole = 'extraction';
     const sanitizedExistingCanonical = sanitizePromptData(existingCanonical);
     const sanitizedNewSubject = sanitizePromptData(newSubject);
     const response = await this.createChatCompletion({
-      model: this.roles.escalation.model,
+      model: this.roles[role].model,
       temperature: 0,
       messages: [
         {
@@ -261,15 +279,15 @@ export class ExtractorService {
           content: `Existing canonical: "${sanitizedExistingCanonical}"\n\nNew subject: "${sanitizedNewSubject}"\n\nAre these the same entity?`
         }
       ]
-    }, vaultId, 'escalation');
+    }, vaultId, role);
 
     const usage = response.usage;
     if (usage) {
       console.log(JSON.stringify({
         level: 30,
         msg: 'arbitrate subject token usage',
-        model: this.roles.escalation.model,
-        model_role: 'escalation',
+        model: this.roles[role].model,
+        model_role: role,
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens
@@ -373,14 +391,23 @@ export class ExtractorService {
       });
   }
 
-  async extractFacts(conversation: string, promptHeader?: string, vaultId?: string): Promise<ExtractedFact[]> {
+  async extractFacts(
+    conversation: string,
+    promptHeader?: string,
+    vaultId?: string,
+    vaultPromptContext?: VaultPromptContext | null
+  ): Promise<ExtractedFact[]> {
     const response = await this.createChatCompletion({
       model: this.roles.extraction.model,
       temperature: 0,
       messages: [
         {
           role: 'system',
-          content: this.promptLoader.getPrompt()
+          content: resolveVaultPrompt({
+            role: 'extraction',
+            defaultPrompt: this.promptLoader.getPrompt(),
+            vault: vaultPromptContext
+          })
         },
         {
           role: 'user',
@@ -477,7 +504,8 @@ export class ExtractorService {
     const roleClient = this.roles[role];
     const circuitBreaker = ExtractorService.circuitBreakers[role];
     circuitBreaker.beforeRequest();
-    const estimatedTokens = estimateChatTokens(input.messages);
+    const requestInput = withSystemPromptPrefix(input);
+    const estimatedTokens = estimateChatTokens(requestInput.messages);
 
     try {
       if (vaultId) {
@@ -487,7 +515,7 @@ export class ExtractorService {
         await acquireAiBudget(vaultId, role, estimatedTokens);
       }
 
-      const response = await roleClient.client.chat.completions.create(input);
+      const response = await roleClient.client.chat.completions.create(requestInput);
       if (vaultId && response.usage?.total_tokens) {
         try {
           await settleAiUsage(vaultId, role, estimatedTokens, response.usage.total_tokens);
@@ -497,6 +525,28 @@ export class ExtractorService {
             msg: 'settle_ai_usage_overage',
             service: `extractor.${role}`,
             vaultId,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
+        try {
+          await recordModelUsage({
+            vaultId,
+            provider: roleClient.provider,
+            model: roleClient.model,
+            modelRole: role,
+            requestCount: 1,
+            promptTokens: response.usage.prompt_tokens,
+            completionTokens: response.usage.completion_tokens,
+            totalTokens: response.usage.total_tokens
+          });
+        } catch (error) {
+          console.warn(JSON.stringify({
+            level: 40,
+            msg: 'failed to record model usage',
+            service: `extractor.${role}`,
+            vaultId,
+            model: roleClient.model,
+            provider: roleClient.provider,
             error: error instanceof Error ? error.message : String(error)
           }));
         }
@@ -524,6 +574,19 @@ export class ExtractorService {
       }
       throw error;
     }
+  }
+}
+
+function getProviderLabel(baseURL: string): string {
+  try {
+    const host = new URL(baseURL).hostname.toLowerCase();
+    if (host.includes('anthropic.com')) return 'anthropic';
+    if (host.includes('generativelanguage.googleapis.com')) return 'google';
+    if (host.includes('openai.com')) return 'openai';
+    if (host.includes('ollama')) return 'ollama';
+    return host;
+  } catch {
+    return 'unknown';
   }
 }
 

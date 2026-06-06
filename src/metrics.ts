@@ -1,6 +1,7 @@
 import type { ObservableResultLike } from './telemetry';
 import { meter } from './telemetry';
 import { query } from './db/client';
+import { EXTRACTION_QUEUE_READY_PREDICATE } from './services/extraction-queue-eligibility';
 
 export const httpRequestDurationHistogram = meter.createHistogram('persistio.http.request.duration', {
   description: 'Request latency by route and status',
@@ -48,10 +49,12 @@ export const memoriesTotalGauge = meter.createObservableGauge('persistio.memorie
 });
 
 meter.createObservableGauge('persistio.extraction_queue_depth', {
-  description: 'Number of unclaimed rows in extraction_queue'
+  description: 'Number of claimable rows in extraction_queue'
 }).addCallback(async (result: ObservableResultLike) => {
   const { rows } = await query<{ depth: number }>(
-    'SELECT COUNT(*)::int AS depth FROM extraction_queue WHERE claimed_at IS NULL'
+    `SELECT COUNT(*)::int AS depth
+     FROM extraction_queue eq
+     WHERE ${EXTRACTION_QUEUE_READY_PREDICATE}`
   );
   result.observe(rows[0]?.depth ?? 0);
 });

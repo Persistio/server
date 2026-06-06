@@ -29,7 +29,7 @@ describe('health route', () => {
   it('returns separate queue depths without the legacy aggregate queue_depth field', async () => {
     poolQueryMock
       .mockResolvedValueOnce({ rows: [{ ok: 1 }] })
-      .mockResolvedValueOnce({ rows: [{ extraction_depth: 2, curation_depth: 1 }] });
+      .mockResolvedValueOnce({ rows: [{ extraction_depth: 2, extraction_inflight_depth: 3, curation_depth: 1 }] });
 
     const app = await buildApp();
     const response = await app.inject({ method: 'GET', url: '/health' });
@@ -39,6 +39,7 @@ describe('health route', () => {
       status: 'ok',
       db: 'ok',
       extraction_queue_depth: 2,
+      extraction_inflight_depth: 3,
       curation_queue_depth: 1
     });
     expect(response.json()).not.toHaveProperty('queue_depth');
@@ -49,7 +50,7 @@ describe('health route', () => {
   it('omits queue_depth from degraded responses', async () => {
     poolQueryMock
       .mockRejectedValueOnce(new Error('database unavailable'))
-      .mockResolvedValueOnce({ rows: [{ extraction_depth: 2, curation_depth: 1 }] });
+      .mockResolvedValueOnce({ rows: [{ extraction_depth: 2, extraction_inflight_depth: 3, curation_depth: 1 }] });
 
     const app = await buildApp();
     const response = await app.inject({ method: 'GET', url: '/health' });
@@ -59,6 +60,7 @@ describe('health route', () => {
       status: 'degraded',
       db: 'degraded',
       extraction_queue_depth: null,
+      extraction_inflight_depth: null,
       curation_queue_depth: null
     });
     expect(response.json()).not.toHaveProperty('queue_depth');
