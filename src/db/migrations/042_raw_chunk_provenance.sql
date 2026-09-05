@@ -1,0 +1,2 @@
+ALTER TABLE raw_chunks
+  ADD COLUMN IF NOT EXISTS provenance JSONB;

@@ -5,8 +5,25 @@ export interface JsonObject {
   [key: string]: JsonValue;
 }
 
-export type KnownPlatformEventType = 'vault.usage_period.closed';
+export const platformEventSource = 'io.persistio.platform';
+export const platformEventSchemaBaseUrl = 'https://schemas.persistio.io/events';
+
+export const usagePeriodClosedEventType = 'io.persistio.usage_period.closed.v1';
+export const memoryCreatedEventType = 'io.persistio.memory.created.v1';
+export const memoryArchivedEventType = 'io.persistio.memory.archived.v1';
+export const curatorRunCompletedEventType = 'io.persistio.curator.run.completed.v1';
+
+export const legacyUsagePeriodClosedEventType = 'vault.usage_period.closed';
+
+export type KnownPlatformEventType =
+  | typeof curatorRunCompletedEventType
+  | typeof memoryArchivedEventType
+  | typeof memoryCreatedEventType
+  | typeof usagePeriodClosedEventType;
+
 export type PlatformEventStatus = 'pending' | 'delivered' | 'failed' | 'dead';
+export type PlatformEventCategory = 'activity' | 'operational' | 'security' | 'usage';
+export type PlatformEventSeverity = 'error' | 'info' | 'notice' | 'warning';
 
 export type VaultUsagePeriodUsageField =
   | 'ingest_events'
@@ -27,17 +44,62 @@ export type VaultUsagePeriodLimitField =
   | 'curator_requests_per_month'
   | 'curator_tokens_per_month';
 
-export interface VaultUsagePeriodClosedPayload extends JsonObject {
-  platform_vault_id: string;
+export interface PlatformActor {
+  id: string | null;
+  type: 'api_key' | 'system' | 'user' | 'worker';
+}
+
+export interface PlatformActivityCounts {
+  [key: string]: number;
+}
+
+export interface PlatformActivityData {
+  actor?: PlatformActor;
+  counts?: PlatformActivityCounts;
+  sensitivity: 'metadata_only';
+  summary: string;
+  vault_id?: string;
+  workspace_id: string;
+}
+
+export interface VaultUsagePeriodClosedPayload extends PlatformActivityData {
   account_id: string | null;
+  limits: Partial<Record<VaultUsagePeriodLimitField, number>>;
   period: string;
   plan_id: string;
+  platform_vault_id: string;
   usage: Partial<Record<VaultUsagePeriodUsageField, number>>;
-  limits: Partial<Record<VaultUsagePeriodLimitField, number>>;
+  vault_id: string;
+}
+
+export interface CuratorRunCompletedPayload extends PlatformActivityData {
+  candidates_processed: number;
+  curator_input_tokens: number;
+  curator_output_tokens: number;
+  curator_requests: number;
+  platform_vault_id: string;
+  vault_id: string;
+}
+
+export interface MemoryCreatedPayload extends PlatformActivityData {
+  memory_id: string;
+  platform_vault_id: string;
+  source: 'api' | 'extraction_worker' | 'system';
+  vault_id: string;
+}
+
+export interface MemoryArchivedPayload extends PlatformActivityData {
+  memory_id: string;
+  platform_vault_id: string;
+  source: 'api' | 'curation_worker' | 'system';
+  vault_id: string;
 }
 
 export interface PlatformEventPayloads {
-  'vault.usage_period.closed': VaultUsagePeriodClosedPayload;
+  [curatorRunCompletedEventType]: CuratorRunCompletedPayload;
+  [memoryArchivedEventType]: MemoryArchivedPayload;
+  [memoryCreatedEventType]: MemoryCreatedPayload;
+  [usagePeriodClosedEventType]: VaultUsagePeriodClosedPayload;
 }
 
 export type PlatformEventPayload<TEventType extends string> =
@@ -46,10 +108,58 @@ export type PlatformEventPayload<TEventType extends string> =
     : JsonObject;
 
 export interface PlatformEvent<TEventType extends string = KnownPlatformEventType> {
-  event_id: string;
-  event_type: TEventType;
-  schema_version: number;
-  occurred_at: string;
+  category: PlatformEventCategory;
+  data: PlatformEventPayload<TEventType>;
+  datacontenttype: 'application/json';
+  dataschema: string;
+  id: string;
+  severity: PlatformEventSeverity;
+  source: string;
+  specversion: '1.0';
   subject: string;
-  payload: PlatformEventPayload<TEventType>;
+  time: string;
+  type: TEventType;
+  vaultid?: string;
+  workspaceid: string;
+}
+
+export interface BuildPlatformEventInput<TEventType extends string> {
+  category?: PlatformEventCategory;
+  data: PlatformEventPayload<TEventType>;
+  id: string;
+  occurredAt: Date | string;
+  severity?: PlatformEventSeverity;
+  subject: string;
+  type: TEventType;
+  vaultId?: string | null;
+  workspaceId: string;
+}
+
+export function buildPlatformEvent<TEventType extends string>(
+  input: BuildPlatformEventInput<TEventType>
+): PlatformEvent<TEventType> {
+  const event: PlatformEvent<TEventType> = {
+    category: input.category ?? 'activity',
+    data: input.data,
+    datacontenttype: 'application/json',
+    dataschema: `${platformEventSchemaBaseUrl}/${input.type}.json`,
+    id: input.id,
+    severity: input.severity ?? 'info',
+    source: platformEventSource,
+    specversion: '1.0',
+    subject: input.subject,
+    time: input.occurredAt instanceof Date ? input.occurredAt.toISOString() : new Date(input.occurredAt).toISOString(),
+    type: input.type,
+    workspaceid: input.workspaceId
+  };
+
+  if (input.vaultId) {
+    event.vaultid = input.vaultId;
+  }
+
+  return event;
+}
+
+export function schemaUrlForEventType(eventType: string): string {
+  return `${platformEventSchemaBaseUrl}/${eventType}.json`;
 }

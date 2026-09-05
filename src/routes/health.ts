@@ -5,12 +5,21 @@ import path from 'node:path';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import type { AppConfig } from '../config';
-import { pool } from '../db/client';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 
 const HEALTH_DB_TIMEOUT_MS = 2000;
 const serverPackageJsonPath = path.resolve(__dirname, '..', '..', 'package.json');
 const serverVersion = JSON.parse(fs.readFileSync(serverPackageJsonPath, 'utf8')) as { version?: string };
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => reject(new Error('Health check timed out')), timeoutMs);
+    timeoutHandle.unref();
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutHandle));
+}
 
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) {
@@ -33,10 +42,11 @@ async function requireHealthAuth(request: FastifyRequest, reply: FastifyReply, c
   }
 }
 
-async function checkDatabase() {
+export async function checkDatabase(timeoutMs = HEALTH_DB_TIMEOUT_MS) {
+  const { pool } = await import('../db/client');
   const startedAt = Date.now();
-  const dbCheck = pool.query('SELECT 1');
-  const queueDepthsCheck = pool.query<{
+  const dbCheck = withTimeout(pool.query('SELECT 1'), timeoutMs);
+  const queueDepthsCheck = withTimeout(pool.query<{
     extraction_depth: number;
     extraction_inflight_depth: number;
     curation_depth: number;
@@ -45,46 +55,32 @@ async function checkDatabase() {
        (SELECT COUNT(*) FROM extraction_queue eq WHERE ${EXTRACTION_QUEUE_READY_PREDICATE})::int AS extraction_depth,
        (SELECT COUNT(*) FROM extraction_queue WHERE claimed_at IS NOT NULL)::int AS extraction_inflight_depth,
        (SELECT COUNT(*) FROM curation_queue)::int AS curation_depth`
-  );
-  let timeoutHandle: NodeJS.Timeout | undefined;
+  ), timeoutMs);
 
   void dbCheck.catch(() => undefined);
   void queueDepthsCheck.catch(() => undefined);
 
   try {
-    await Promise.race([
-      dbCheck,
-      new Promise((_, reject) => {
-        timeoutHandle = setTimeout(() => reject(new Error('Health check timed out')), HEALTH_DB_TIMEOUT_MS);
-        timeoutHandle.unref();
-      })
-    ]);
+    await dbCheck;
 
-    clearTimeout(timeoutHandle);
-    let extractionQueueDepth: number | null = null;
-    let extractionInflightDepth: number | null = null;
-    let curationQueueDepth: number | null = null;
-
-    try {
-      const result = await queueDepthsCheck;
-      extractionQueueDepth = result.rows[0]?.extraction_depth ?? 0;
-      extractionInflightDepth = result.rows[0]?.extraction_inflight_depth ?? 0;
-      curationQueueDepth = result.rows[0]?.curation_depth ?? 0;
-    } catch {
-      extractionQueueDepth = null;
-      extractionInflightDepth = null;
-      curationQueueDepth = null;
-    }
+    const result = await queueDepthsCheck.then((queueDepths) => ({
+      extractionQueueDepth: queueDepths.rows[0]?.extraction_depth ?? 0,
+      extractionInflightDepth: queueDepths.rows[0]?.extraction_inflight_depth ?? 0,
+      curationQueueDepth: queueDepths.rows[0]?.curation_depth ?? 0
+    }), () => ({
+      extractionQueueDepth: null,
+      extractionInflightDepth: null,
+      curationQueueDepth: null
+    }));
 
     return {
       db: 'ok',
       db_latency_ms: Date.now() - startedAt,
-      extraction_queue_depth: extractionQueueDepth,
-      extraction_inflight_depth: extractionInflightDepth,
-      curation_queue_depth: curationQueueDepth
+      extraction_queue_depth: result.extractionQueueDepth,
+      extraction_inflight_depth: result.extractionInflightDepth,
+      curation_queue_depth: result.curationQueueDepth
     } as const;
   } catch {
-    clearTimeout(timeoutHandle);
     return {
       db: 'degraded',
       db_latency_ms: Date.now() - startedAt,
@@ -99,8 +95,16 @@ export async function registerHealthRoutes(app: FastifyInstance, config: AppConf
   app.get('/health', {
     preHandler: async (request, reply) => requireHealthAuth(request, reply, config.HEALTH_API_KEY)
   }, async (_request, reply) => {
-    const database = await checkDatabase();
-    const status = database.db === 'ok' ? 'ok' : 'degraded';
+    const database = config.PERSISTIO_MODE === 'analytics-api'
+      ? {
+        curation_queue_depth: null,
+        db: 'not_applicable',
+        db_latency_ms: 0,
+        extraction_inflight_depth: null,
+        extraction_queue_depth: null
+      } as const
+      : await checkDatabase();
+    const status = database.db === 'ok' || database.db === 'not_applicable' ? 'ok' : 'degraded';
 
     return reply.code(status === 'ok' ? 200 : 503).send({
       status,

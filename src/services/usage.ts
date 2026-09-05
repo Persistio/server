@@ -3,9 +3,12 @@ import type { PoolClient } from 'pg';
 
 import { query, withTransaction } from '../db/client';
 import type {
+  PlatformActor,
   VaultUsagePeriodClosedPayload,
   VaultUsagePeriodLimitField
 } from '../events/platform-event';
+import { usagePeriodClosedEventType } from '../events/platform-event';
+import { recordCustomerMetric, type CustomerMetricSource } from './customer-metrics';
 
 export type UsageField = 'ingest_events' | 'memory_adds' | 'searches';
 export type ModelUsageRole = 'embedding' | 'extraction' | 'escalation' | 'curation';
@@ -38,6 +41,7 @@ interface AtomicQuotaConsumeRow {
 }
 
 interface ApiQuotaLimitRow {
+  account_id: string | null;
   quota_limit: string | null;
 }
 
@@ -63,6 +67,10 @@ interface ClosingUsagePeriodRow {
   searches: string;
 }
 
+interface StaleUsagePeriodRow {
+  vault_id: string;
+}
+
 interface BucketState {
   capacity: number;
   lastRefillMs: number;
@@ -78,9 +86,11 @@ export interface RateLimitSnapshot {
 }
 
 export interface ApiQuotaReservation {
+  accountId: string | null;
   field: UsageField;
   period: string;
   snapshot: RateLimitSnapshot;
+  source: CustomerMetricSource;
   vaultId: string;
 }
 
@@ -96,6 +106,17 @@ export interface ModelUsageInput {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  source: CustomerMetricSource;
+}
+
+export interface UsagePeriodSweepResult {
+  closed: number;
+  currentPeriod: string;
+  selected: number;
+}
+
+interface ModelUsageScopeRow {
+  account_id: string | null;
 }
 
 const usageLimitKeys: Record<UsageField, UsageFieldLimitKey> = {
@@ -229,7 +250,11 @@ export function consumeNormalIngestRateLimit(vaultId: string, planId: string, re
 
 // NOTE: incrementUsage is intended for low-volume internal adjustments. Hot API paths
 // use consumeApiQuota so quota checks and increments stay atomic.
-export async function incrementUsage(vaultId: string, field: UsageField) {
+export async function incrementUsage(
+  vaultId: string,
+  field: UsageField,
+  source: CustomerMetricSource = 'system'
+) {
   const period = getCurrentUsagePeriod();
   const columns: UsageField[] = ['ingest_events', 'memory_adds', 'searches'];
   const assignments = columns.map((column) => {
@@ -241,7 +266,15 @@ export async function incrementUsage(vaultId: string, field: UsageField) {
     END`;
   }).join(',\n           ');
 
-  await withTransaction(async (client) => {
+  const accountId = await withTransaction(async (client) => {
+    const vaultResult = await client.query<{ account_id: string | null }>(
+      `SELECT account_id::text AS account_id
+       FROM vaults
+       WHERE id = $1
+       LIMIT 1
+       FOR KEY SHARE`,
+      [vaultId]
+    );
     await writeUsagePeriodClosedEventIfNeeded(client, vaultId, period);
     await client.query(
       `INSERT INTO vault_usage (vault_id, period, ${columns.join(', ')}, updated_at)
@@ -258,20 +291,45 @@ export async function incrementUsage(vaultId: string, field: UsageField) {
         field === 'searches' ? 1 : 0
       ]
     );
+    return vaultResult.rows[0]?.account_id ?? null;
+  });
+  recordUsageQuotaDelta({
+    accountId,
+    delta: 1,
+    field,
+    source,
+    vaultId
   });
 }
 
-export async function consumeApiQuota(vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
-  const reservation = await reserveApiQuota(vaultId, field);
+export async function consumeApiQuota(
+  vaultId: string,
+  field: UsageField,
+  source: CustomerMetricSource = 'api'
+): Promise<RateLimitSnapshot> {
+  const reservation = await reserveApiQuota(vaultId, field, source);
   return reservation.snapshot;
 }
 
-export async function reserveApiQuota(vaultId: string, field: UsageField): Promise<ApiQuotaReservation> {
+export async function reserveApiQuota(
+  vaultId: string,
+  field: UsageField,
+  source: CustomerMetricSource = 'api'
+): Promise<ApiQuotaReservation> {
   const result = await withTransaction((client) => consumeApiQuotaWithPeriodInTransaction(client, vaultId, field));
+  recordUsageQuotaDelta({
+    accountId: result.accountId,
+    delta: 1,
+    field,
+    source,
+    vaultId
+  });
   return {
+    accountId: result.accountId,
     field,
     period: result.period,
     snapshot: result.snapshot,
+    source,
     vaultId
   };
 }
@@ -285,7 +343,7 @@ async function consumeApiQuotaWithPeriodInTransaction(
   client: PoolClient,
   vaultId: string,
   field: UsageField
-): Promise<{ period: string; snapshot: RateLimitSnapshot }> {
+): Promise<{ accountId: string | null; period: string; snapshot: RateLimitSnapshot }> {
   if (!allowedUsageFields.includes(field)) {
     throw new Error(`Invalid usage field: ${field}`);
   }
@@ -303,7 +361,8 @@ async function consumeApiQuotaWithPeriodInTransaction(
   }).join(',\n           ');
   const resetAtEpochSeconds = getNextUsageResetEpochSeconds();
   const limitResult = await client.query<ApiQuotaLimitRow>(
-    `SELECT COALESCE((v.rate_limit_override->>$2), (p.limits->>$2)) AS quota_limit
+    `SELECT v.account_id::text AS account_id,
+            COALESCE((v.rate_limit_override->>$2), (p.limits->>$2)) AS quota_limit
      FROM vaults AS v
      JOIN plans AS p
        ON p.id = v.plan_id
@@ -362,6 +421,7 @@ async function consumeApiQuotaWithPeriodInTransaction(
   const consumed = Number(result.rows[0].consumed);
 
   return {
+    accountId: limitResult.rows[0].account_id,
     period,
     snapshot: {
       limit: limit ?? null,
@@ -409,11 +469,26 @@ export async function writeUsagePeriodClosedEventIfNeeded(
   }
 
   const row = result.rows[0];
+  const actor: PlatformActor = {
+    id: null,
+    type: 'system'
+  };
   const payload: VaultUsagePeriodClosedPayload = {
     platform_vault_id: vaultId,
     account_id: row.account_id,
+    workspace_id: row.account_id ?? '',
+    vault_id: vaultId,
     period: row.period,
     plan_id: row.plan_id,
+    actor,
+    counts: {
+      ingest_events: Number(row.ingest_events),
+      memory_adds: Number(row.memory_adds),
+      searches: Number(row.searches),
+      curator_runs: Number(row.curator_runs)
+    },
+    sensitivity: 'metadata_only',
+    summary: `Usage period ${row.period} closed`,
     usage: {
       ingest_events: Number(row.ingest_events),
       memory_adds: Number(row.memory_adds),
@@ -432,12 +507,62 @@ export async function writeUsagePeriodClosedEventIfNeeded(
     `INSERT INTO platform_event_outbox (
        event_id, event_type, schema_version, occurred_at, subject, payload
      )
-     VALUES (gen_random_uuid(), 'vault.usage_period.closed', 1, now(), $1, $2::jsonb)
+     VALUES (gen_random_uuid(), $2, 1, now(), $1, $3::jsonb)
      ON CONFLICT DO NOTHING`,
-    [`vault:${vaultId}`, JSON.stringify(payload)]
+    [`vault:${vaultId}`, usagePeriodClosedEventType, JSON.stringify(payload)]
   );
 
   return true;
+}
+
+export async function closeStaleUsagePeriods(
+  batchSize = 100,
+  currentPeriod = getCurrentUsagePeriod()
+): Promise<UsagePeriodSweepResult> {
+  return await withTransaction(async (client) => {
+    const result = await client.query<StaleUsagePeriodRow>(
+      `SELECT vu.vault_id::text AS vault_id
+       FROM vault_usage AS vu
+       WHERE vu.period < $1
+       ORDER BY vu.period ASC, vu.updated_at ASC, vu.vault_id ASC
+       LIMIT $2
+       FOR UPDATE SKIP LOCKED`,
+      [currentPeriod, batchSize]
+    );
+
+    let closed = 0;
+    for (const row of result.rows) {
+      if (await writeUsagePeriodClosedEventIfNeeded(client, row.vault_id, currentPeriod)) {
+        closed += 1;
+      }
+    }
+
+    if (result.rows.length) {
+      await client.query(
+        `UPDATE vault_usage
+         SET period = $1,
+             ingest_events = 0,
+             memory_adds = 0,
+             searches = 0,
+             curator_runs = 0,
+             curator_requests = 0,
+             curator_input_tokens = 0,
+             curator_output_tokens = 0,
+             curator_candidates_processed = 0,
+             curator_candidates_deferred = 0,
+             updated_at = now()
+         WHERE vault_id = ANY($2::uuid[])
+           AND period < $1`,
+        [currentPeriod, result.rows.map((row) => row.vault_id)]
+      );
+    }
+
+    return {
+      closed,
+      currentPeriod,
+      selected: result.rows.length
+    };
+  });
 }
 
 export async function refundApiQuotaReservation(reservation: ApiQuotaReservation): Promise<void> {
@@ -446,15 +571,25 @@ export async function refundApiQuotaReservation(reservation: ApiQuotaReservation
   }
 
   const column = fieldColumn[reservation.field];
-  await query(
+  const result = await query(
     `UPDATE vault_usage
      SET ${column} = GREATEST(${column} - 1, 0),
          updated_at = now()
      WHERE vault_id = $1
        AND period = $2
-       AND ${column} > 0`,
+       AND ${column} > 0
+     RETURNING vault_id`,
     [reservation.vaultId, reservation.period]
   );
+  if (result.rowCount) {
+    recordUsageQuotaDelta({
+      accountId: reservation.accountId,
+      delta: -1,
+      field: reservation.field,
+      source: reservation.source,
+      vaultId: reservation.vaultId
+    });
+  }
 }
 
 export async function checkQuota(vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
@@ -499,7 +634,7 @@ export async function checkQuota(vaultId: string, field: UsageField): Promise<Ra
   };
 }
 
-export async function enforceMemoryCreationLimit(vaultId: string): Promise<void> {
+export async function enforceMemoryCreationLimit(vaultId: string, source: CustomerMetricSource = 'api'): Promise<void> {
   const capacity = await getMemoryCapacity(vaultId);
 
   if (capacity.limit !== undefined && capacity.activeMemories >= capacity.limit) {
@@ -512,7 +647,23 @@ export async function enforceMemoryCreationLimit(vaultId: string): Promise<void>
     });
   }
 
-  await consumeApiQuota(vaultId, 'memory_adds');
+  await consumeApiQuota(vaultId, 'memory_adds', source);
+}
+
+export function recordMemoryCountDelta(
+  vaultId: string,
+  accountId: string | null,
+  delta: number,
+  source: CustomerMetricSource = 'api'
+): void {
+  if (delta === 0) return;
+  recordQuotaDelta({
+    accountId,
+    delta,
+    operation: 'memory_count',
+    source,
+    vaultId
+  });
 }
 
 export async function canCreateMemory(vaultId: string): Promise<boolean> {
@@ -569,23 +720,30 @@ export async function recordModelUsage(input: ModelUsageInput, client?: Pick<Poo
   const totalTokens = Math.max(0, Math.trunc(input.totalTokens ?? promptTokens + completionTokens));
 
   const execute = client ? client.query.bind(client) : query;
-  await execute(
-    `INSERT INTO vault_model_usage (
-       vault_id, period, provider, model_role, model, request_count,
-       embedding_calls, embedding_input_tokens, embedding_input_chars,
-       prompt_tokens, completion_tokens, total_tokens, updated_at
+  const result = await execute(
+    `WITH upsert AS (
+       INSERT INTO vault_model_usage (
+         vault_id, period, provider, model_role, model, request_count,
+         embedding_calls, embedding_input_tokens, embedding_input_chars,
+         prompt_tokens, completion_tokens, total_tokens, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+       ON CONFLICT (vault_id, period, provider, model_role, model)
+       DO UPDATE SET
+         request_count = vault_model_usage.request_count + EXCLUDED.request_count,
+         embedding_calls = vault_model_usage.embedding_calls + EXCLUDED.embedding_calls,
+         embedding_input_tokens = vault_model_usage.embedding_input_tokens + EXCLUDED.embedding_input_tokens,
+         embedding_input_chars = vault_model_usage.embedding_input_chars + EXCLUDED.embedding_input_chars,
+         prompt_tokens = vault_model_usage.prompt_tokens + EXCLUDED.prompt_tokens,
+         completion_tokens = vault_model_usage.completion_tokens + EXCLUDED.completion_tokens,
+         total_tokens = vault_model_usage.total_tokens + EXCLUDED.total_tokens,
+         updated_at = now()
+       RETURNING vault_id
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
-     ON CONFLICT (vault_id, period, provider, model_role, model)
-     DO UPDATE SET
-       request_count = vault_model_usage.request_count + EXCLUDED.request_count,
-       embedding_calls = vault_model_usage.embedding_calls + EXCLUDED.embedding_calls,
-       embedding_input_tokens = vault_model_usage.embedding_input_tokens + EXCLUDED.embedding_input_tokens,
-       embedding_input_chars = vault_model_usage.embedding_input_chars + EXCLUDED.embedding_input_chars,
-       prompt_tokens = vault_model_usage.prompt_tokens + EXCLUDED.prompt_tokens,
-       completion_tokens = vault_model_usage.completion_tokens + EXCLUDED.completion_tokens,
-       total_tokens = vault_model_usage.total_tokens + EXCLUDED.total_tokens,
-       updated_at = now()`,
+     SELECT v.account_id::text AS account_id
+     FROM upsert
+     JOIN vaults AS v
+       ON v.id = upsert.vault_id`,
     [
       input.vaultId,
       period,
@@ -600,7 +758,90 @@ export async function recordModelUsage(input: ModelUsageInput, client?: Pick<Poo
       completionTokens,
       totalTokens
     ]
-  );
+  ) as { rows: ModelUsageScopeRow[] };
+
+  const accountId = result.rows[0]?.account_id ?? null;
+  if (!accountId) return;
+
+  recordCustomerMetric({
+    event_type: 'model_usage',
+    model: input.model,
+    model_request_count: requestCount,
+    model_role: input.modelRole,
+    provider: input.provider,
+    source: input.source,
+    vault_id: input.vaultId,
+    workspace_id: accountId,
+    ...(completionTokens ? { completion_tokens: completionTokens } : {}),
+    ...(embeddingInputChars ? { embedding_input_chars: embeddingInputChars } : {}),
+    ...(embeddingInputTokens ? { embedding_input_tokens: embeddingInputTokens } : {}),
+    ...(promptTokens ? { prompt_tokens: promptTokens } : {}),
+    ...(totalTokens ? { total_tokens: totalTokens } : {})
+  });
+}
+
+function recordUsageQuotaDelta(input: {
+  accountId: string | null;
+  delta: number;
+  field: UsageField;
+  source: CustomerMetricSource;
+  vaultId: string;
+}): void {
+  recordQuotaDelta({
+    accountId: input.accountId,
+    delta: input.delta,
+    operation: input.field,
+    source: input.source,
+    vaultId: input.vaultId
+  });
+}
+
+function recordQuotaDelta(input: {
+  accountId: string | null;
+  delta: number;
+  operation: UsageField | 'memory_count';
+  source: CustomerMetricSource;
+  vaultId: string;
+}): void {
+  if (!input.accountId || input.delta === 0) return;
+
+  const base = {
+    event_type: 'quota_delta' as const,
+    source: input.source,
+    vault_id: input.vaultId,
+    workspace_id: input.accountId
+  };
+
+  switch (input.operation) {
+    case 'ingest_events':
+      recordCustomerMetric({
+        ...base,
+        ingest_events_delta: input.delta,
+        operation: 'ingest_events'
+      });
+      return;
+    case 'memory_adds':
+      recordCustomerMetric({
+        ...base,
+        memory_adds_delta: input.delta,
+        operation: 'memory_adds'
+      });
+      return;
+    case 'memory_count':
+      recordCustomerMetric({
+        ...base,
+        memory_count_delta: input.delta,
+        operation: 'memory_count'
+      });
+      return;
+    case 'searches':
+      recordCustomerMetric({
+        ...base,
+        operation: 'searches',
+        searches_delta: input.delta
+      });
+      return;
+  }
 }
 
 async function getMemoryCapacity(vaultId: string): Promise<{ activeMemories: number; limit: number | undefined }> {

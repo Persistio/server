@@ -53,6 +53,25 @@ describe('database migration guardrails', () => {
     expect(script).toContain('class GcsRawChunkReader');
   });
 
+  it('persists raw chunk storage bytes for customer metric accounting', () => {
+    const sql = migration('039_customer_metric_storage_bytes.sql');
+    const rawChunkMigration = repoFile('scripts', 'migrate-raw-chunks-to-blob.mjs');
+
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS storage_bytes BIGINT');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS workspace_id UUID');
+    expect(sql).toContain('information_schema.columns');
+    expect(sql).toContain('octet_length(content::text)');
+    expect(rawChunkMigration).toContain('storage_bytes = $5');
+    expect(rawChunkMigration).toContain("Buffer.byteLength(row.content, 'utf8')");
+  });
+
+  it('seeds the memory graph entitlement for unlimited plans', () => {
+    const sql = migration('041_memory_graph_plan_entitlement.sql');
+
+    expect(sql).toContain('"graphEnabled": true');
+    expect(sql).toContain("WHERE id = 'unlimited'");
+  });
+
   it('keeps operator migrations provider-portable for GCP deployments', () => {
     const rawChunkMigration = repoFile('scripts', 'migrate-raw-chunks-to-blob.mjs');
     const reembedMigration = repoFile('scripts', 'reembed-qwen3.mjs');

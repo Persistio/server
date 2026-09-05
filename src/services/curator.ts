@@ -43,6 +43,7 @@ export interface CuratorCreateNodeAction {
   polarity?: CuratorMemory['polarity'];
   evidence?: string;
   parent_subject?: string;
+  consumed_candidate_ids?: string[];
 }
 
 export interface CuratorUpdateNodeAction {
@@ -54,6 +55,7 @@ export interface CuratorUpdateNodeAction {
   confidence?: number;
   volatility?: CuratorMemory['volatility'];
   reason?: string;
+  consumed_candidate_ids?: string[];
 }
 
 export interface CuratorEdgeAction {
@@ -93,7 +95,7 @@ export interface CuratorUsage {
   totalTokens: number;
 }
 
-const HARDCODED_PROMPT = `You are a memory curator. Build a behavioral memory graph and respond only with JSON using the nodes_to_create, nodes_to_update, edges_to_create, nodes_to_archive, and discarded_candidates schema. For every memory id field, use the provided short aliases instead of raw UUIDs: existing active memories are M1, M2, ... and candidate memories are C1, C2, ....`;
+const HARDCODED_PROMPT = `You are a memory curator. Build a behavioral memory graph and respond only with JSON using the nodes_to_create, nodes_to_update, edges_to_create, nodes_to_archive, and discarded_candidates schema. For every memory id field, use the provided short aliases instead of raw UUIDs: existing active memories are M1, M2, ... and candidate memories are C1, C2, .... When a create or update absorbs candidate memories, include consumed_candidate_ids on that action so absorbed candidates are not also promoted.`;
 const CURATOR_SYSTEM_OVERHEAD_CHARS = 1000;
 const MIN_CURATOR_SYSTEM_PROMPT_CHARS = 2000;
 const MIN_CURATOR_USER_CONTENT_CHARS = 4000;
@@ -381,6 +383,7 @@ export class CuratorService {
             provider: this.provider,
             model: this.model,
             modelRole: 'curation',
+            source: 'curation_worker',
             requestCount: 1,
             promptTokens: response.usage.prompt_tokens,
             completionTokens: response.usage.completion_tokens,
@@ -467,7 +470,8 @@ function parseNodeCreates(value: unknown): CuratorCreateNodeAction[] {
       sensitivity: isSensitivity(node.sensitivity) ? node.sensitivity : undefined,
       polarity: isPolarity(node.polarity) ? node.polarity : undefined,
       evidence: typeof node.evidence === 'string' ? node.evidence : undefined,
-      parent_subject: typeof node.parent_subject === 'string' ? node.parent_subject : undefined
+      parent_subject: typeof node.parent_subject === 'string' ? node.parent_subject : undefined,
+      consumed_candidate_ids: parseStringArray(node.consumed_candidate_ids)
     }];
   });
 }
@@ -486,7 +490,8 @@ function parseNodeUpdates(value: unknown): CuratorUpdateNodeAction[] {
       salience: typeof node.salience === 'number' ? node.salience : undefined,
       confidence: typeof node.confidence === 'number' ? node.confidence : undefined,
       volatility: isVolatility(node.volatility) ? node.volatility : undefined,
-      reason: typeof node.reason === 'string' ? node.reason : undefined
+      reason: typeof node.reason === 'string' ? node.reason : undefined,
+      consumed_candidate_ids: parseStringArray(node.consumed_candidate_ids)
     }];
   });
 }
@@ -527,6 +532,17 @@ function parseDiscards(value: unknown): CuratorDiscardCandidateAction[] {
     if (typeof node.id !== 'string') return [];
     return [{ id: node.id, reason: typeof node.reason === 'string' ? node.reason : undefined }];
   });
+}
+
+function parseStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const values = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return values.length > 0 ? Array.from(new Set(values)) : undefined;
 }
 
 function isMemoryType(value: unknown): value is MemoryType {

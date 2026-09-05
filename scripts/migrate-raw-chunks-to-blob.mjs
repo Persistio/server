@@ -232,9 +232,10 @@ try {
              SET blob_store = $2,
                  blob_key = $3,
                  content_sha256 = $4,
+                 storage_bytes = $5,
                  blob_migrated_at = now()
              WHERE id = $1`,
-            [row.id, storage.store, blobKey, contentSha256]
+            [row.id, storage.store, blobKey, contentSha256, Buffer.byteLength(row.content, 'utf8')]
           );
           if (updateResult.rowCount !== 1) {
             throw new Error(`Failed to mark raw chunk ${row.id} as migrated`);

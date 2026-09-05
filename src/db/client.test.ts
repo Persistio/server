@@ -1,7 +1,14 @@
 import type { PoolClient } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
 
-import { createPgvectorVerifyHook, getConfiguredPoolMax, validateStorageEmbeddingDimensions } from './client';
+import {
+  createPgvectorVerifyHook,
+  createPoolErrorHandler,
+  getConfiguredPoolConnectionTimeout,
+  getConfiguredPoolMax,
+  pool,
+  validateStorageEmbeddingDimensions
+} from './client';
 
 describe('pgvector pool verification', () => {
   it('skips registration before migrations enable pgvector type loading', () => {
@@ -65,6 +72,40 @@ describe('pool sizing', () => {
       DB_POOL_MAX: 50,
       EXTRACTION_WORKER_CONCURRENCY: 5
     } as Parameters<typeof getConfiguredPoolMax>[0])).toBe(50);
+  });
+
+  it('uses the configured connection acquisition timeout', () => {
+    expect(getConfiguredPoolConnectionTimeout({
+      DB_POOL_CONNECTION_TIMEOUT_MS: 5000
+    } as Parameters<typeof getConfiguredPoolConnectionTimeout>[0])).toBe(5000);
+  });
+});
+
+describe('pool error recovery', () => {
+  it('registers a listener for idle client errors', () => {
+    expect(pool.listenerCount('error')).toBeGreaterThan(0);
+  });
+
+  it('logs an idle client error without throwing', () => {
+    const log = vi.fn();
+    const handler = createPoolErrorHandler({
+      totalCount: 4,
+      idleCount: 2,
+      waitingCount: 1
+    }, log);
+    const error = Object.assign(new Error('Connection terminated unexpectedly'), { code: 'ECONNRESET' });
+
+    expect(() => handler(error)).not.toThrow();
+    expect(log).toHaveBeenCalledOnce();
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+      level: 50,
+      msg: 'postgres idle connection failed; removed from pool',
+      error: 'Connection terminated unexpectedly',
+      code: 'ECONNRESET',
+      total: 4,
+      idle: 2,
+      waiting: 1
+    });
   });
 });
 

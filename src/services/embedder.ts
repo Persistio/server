@@ -6,6 +6,7 @@ import type { PoolClient } from 'pg';
 import { getConfig, getStorageEmbeddingDimensions } from '../config';
 import { embeddingDurationHistogram } from '../metrics';
 import { withSpan } from '../telemetry';
+import type { CustomerMetricSource } from './customer-metrics';
 import { recordModelUsage, type ModelUsageRole } from './usage';
 
 export interface Embedder {
@@ -19,6 +20,7 @@ export const OPENAI_EMBEDDING_MAX_TOKENS_PER_INPUT = 8192;
 export interface EmbedderTelemetry {
   inputType?: 'document' | 'query';
   modelRole?: ModelUsageRole;
+  source?: CustomerMetricSource;
   usageClient?: Pick<PoolClient, 'query'>;
   vaultId?: string;
 }
@@ -511,6 +513,7 @@ async function recordEmbeddingUsage(input: {
         provider: input.provider,
         model: input.model,
         modelRole: input.telemetry.modelRole ?? 'embedding',
+        source: input.telemetry.source ?? 'api',
         requestCount: input.requestCount,
         embeddingCalls: input.texts.length,
         embeddingInputTokens: input.texts.reduce((sum, text) => sum + estimateEmbeddingTokens(text), 0),

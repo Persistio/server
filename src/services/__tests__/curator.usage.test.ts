@@ -90,6 +90,7 @@ describe('CuratorService usage telemetry', () => {
         provider: 'curator.example',
         model: 'test-curator-model',
         modelRole: 'curation',
+        source: 'curation_worker',
         requestCount: 1,
         promptTokens: 120,
         completionTokens: 30,
@@ -278,5 +279,63 @@ describe('CuratorService usage telemetry', () => {
     expect(systemContent).toContain('[truncated]');
     expect(userTextLength).toBeGreaterThan(0);
     expect(userContent[0].text).toContain('Candidate memories');
+  });
+
+  it('preserves consumed candidate aliases from create and update actions', async () => {
+    createMock.mockResolvedValue({
+      usage: undefined,
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              nodes_to_create: [{
+                type: 'workflow',
+                statement: 'Persistio consolidates related candidate memories before promotion.',
+                subject: 'Persistio memory curation',
+                consumed_candidate_ids: ['C1', 'C2']
+              }],
+              nodes_to_update: [{
+                id: 'M1',
+                statement: 'Persistio curator updates canonical memories with newly supported detail.',
+                consumed_candidate_ids: ['C3']
+              }],
+              edges_to_create: [],
+              nodes_to_archive: [],
+              discarded_candidates: []
+            })
+          }
+        }
+      ]
+    });
+    const service = new CuratorService();
+    const candidates: CuratorMemory[] = Array.from({ length: 3 }, (_, index) => ({
+      id: `candidate-${index + 1}`,
+      subject: 'Persistio',
+      data: `Candidate ${index + 1}`,
+      type: 'system_fact',
+      scope: 'project',
+      salience: 0.8,
+      sensitivity: 'low',
+      polarity: 'neutral',
+      volatility: 'low',
+      parent_id: null
+    }));
+    const activeMemories: CuratorMemory[] = [{
+      id: 'active-1',
+      subject: 'Persistio',
+      data: 'Persistio has an existing curator memory.',
+      type: 'system_fact',
+      scope: 'project',
+      salience: 0.8,
+      sensitivity: 'low',
+      polarity: 'neutral',
+      volatility: 'low',
+      parent_id: null
+    }];
+
+    const { result } = await service.curate(candidates, activeMemories, null, 'vault-1');
+
+    expect(result.nodes_to_create[0].consumed_candidate_ids).toEqual(['C1', 'C2']);
+    expect(result.nodes_to_update[0].consumed_candidate_ids).toEqual(['C3']);
   });
 });

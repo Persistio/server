@@ -1,9 +1,10 @@
 import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { queryMock, rawChunkDeleteMock } = vi.hoisted(() => ({
+const { queryMock, rawChunkDeleteMock, recordCustomerMetricMock } = vi.hoisted(() => ({
   queryMock: vi.fn(),
-  rawChunkDeleteMock: vi.fn()
+  rawChunkDeleteMock: vi.fn(),
+  recordCustomerMetricMock: vi.fn()
 }));
 
 vi.mock('../db/client', () => ({
@@ -18,6 +19,10 @@ vi.mock('../services/raw-chunk-storage', () => ({
   })
 }));
 
+vi.mock('../services/customer-metrics', () => ({
+  recordCustomerMetric: recordCustomerMetricMock
+}));
+
 import { registerAdminRoutes } from './admin';
 
 describe('admin vault updates', () => {
@@ -27,6 +32,7 @@ describe('admin vault updates', () => {
     process.env.OPENAI_API_KEY ??= 'test-openai-key';
     queryMock.mockReset();
     rawChunkDeleteMock.mockReset();
+    recordCustomerMetricMock.mockReset();
     rawChunkDeleteMock.mockResolvedValue(undefined);
   });
 
@@ -170,6 +176,100 @@ describe('admin vault updates', () => {
       2,
       expect.stringContaining('INSERT INTO vaults'),
       expect.arrayContaining(['unlimited'])
+    );
+
+    await app.close();
+  });
+
+  it('returns vault stats through the admin vault stats endpoint', async () => {
+    queryMock.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{
+        plan_id: 'unlimited',
+        period: '2026-06',
+        ingest_events: '20',
+        memory_adds: '8',
+        searches: '40',
+        limits: {
+          memories_max: 1000,
+          ingest_events_per_month: 100,
+          memory_adds_per_month: 50,
+          searches_per_month: 200
+        }
+      }]
+    });
+    queryMock.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{
+        active: '120',
+        candidate: '0',
+        needs_review: '0',
+        contradicted: '0',
+        superseded: '0',
+        archived: '0'
+      }]
+    });
+    queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [{ count: '3' }] });
+    queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [{ last_run: null, arbitrations_this_week: '0' }] });
+
+    const app = await buildApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/admin/vaults/dff718f2-9d97-43b2-a3cc-a14099ed42c3/stats',
+      headers: { 'x-admin-key': 'test-admin-key' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+      plan: 'unlimited',
+      memories: { active: 120, limit: 1000 },
+      usage: {
+        ingest_events: { consumed: 20, limit: 100 },
+        memory_adds: { consumed: 8, limit: 50 },
+        searches: { consumed: 40, limit: 200 }
+      }
+    });
+    expect(queryMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining('FROM vaults AS v'),
+      ['dff718f2-9d97-43b2-a3cc-a14099ed42c3', expect.any(String)]
+    );
+
+    await app.close();
+  });
+
+  it('stores account_id when creating an App-owned vault', async () => {
+    queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'unlimited' }] });
+    queryMock.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{
+        id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+        name: 'Example',
+        purpose: null,
+        plan_id: 'unlimited',
+        status: 'active',
+        created_at: '2026-05-15T00:00:00.000Z',
+        type: null
+      }]
+    });
+
+    const app = await buildApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/admin/vaults',
+      headers: { 'x-admin-key': 'test-admin-key' },
+      payload: {
+        name: 'Example',
+        account_id: 'd934b9cf-05b2-476d-a7b8-ef6c36b9f3ef'
+      }
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(queryMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('account_id'),
+      expect.arrayContaining(['d934b9cf-05b2-476d-a7b8-ef6c36b9f3ef'])
     );
 
     await app.close();
@@ -598,8 +698,8 @@ describe('admin vault updates', () => {
     queryMock.mockResolvedValueOnce({
       rowCount: 2,
       rows: [
-        { blob_store: 'local', blob_key: 'vaults/example/sessions/one/chunks/a.txt' },
-        { blob_store: 'local', blob_key: 'vaults/example/sessions/one/chunks/b.txt' }
+        { blob_store: 'local', blob_key: 'vaults/example/sessions/one/chunks/a.txt', storage_bytes: '5' },
+        { blob_store: 'local', blob_key: 'vaults/example/sessions/one/chunks/b.txt', storage_bytes: '7' }
       ]
     });
     queryMock.mockResolvedValueOnce({
@@ -608,20 +708,24 @@ describe('admin vault updates', () => {
         {
           id: '9f758322-d29d-49a3-a2e3-11a4497b3671',
           vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+          workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee',
           blob_store: 'local',
-          blob_key: 'vaults/example/sessions/one/chunks/a.txt'
+          blob_key: 'vaults/example/sessions/one/chunks/a.txt',
+          storage_bytes: '5'
         },
         {
           id: '2b24d5e4-cb2f-4311-84de-d029137ca9fb',
           vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+          workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee',
           blob_store: 'local',
-          blob_key: 'vaults/example/sessions/one/chunks/b.txt'
+          blob_key: 'vaults/example/sessions/one/chunks/b.txt',
+          storage_bytes: '7'
         }
       ]
     });
     queryMock.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3' }]
+      rows: [{ id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3', account_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee' }]
     });
 
     const app = await buildApp();
@@ -640,6 +744,18 @@ describe('admin vault updates', () => {
       'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
       'local'
     ]);
+    expect(recordCustomerMetricMock).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      event_type: 'storage_delta',
+      operation: 'raw_chunk_blob_delete',
+      storage_bytes_delta: -5,
+      workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee'
+    }));
+    expect(recordCustomerMetricMock).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      event_type: 'storage_delta',
+      operation: 'raw_chunk_blob_delete',
+      storage_bytes_delta: -7,
+      workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee'
+    }));
 
     await app.close();
   });
@@ -672,8 +788,10 @@ describe('admin vault updates', () => {
       rows: [{
         id: '9f758322-d29d-49a3-a2e3-11a4497b3671',
         vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+        workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee',
         blob_store: 'local',
-        blob_key: 'vaults/example/sessions/one/chunks/a.txt'
+        blob_key: 'vaults/example/sessions/one/chunks/a.txt',
+        storage_bytes: '11'
       }]
     });
 
@@ -690,6 +808,12 @@ describe('admin vault updates', () => {
     expect(queryMock).toHaveBeenCalledWith(expect.stringContaining('SET deleted_at = now()'), [
       '9f758322-d29d-49a3-a2e3-11a4497b3671'
     ]);
+    expect(recordCustomerMetricMock).toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'storage_delta',
+      operation: 'raw_chunk_blob_delete',
+      storage_bytes_delta: -11,
+      workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee'
+    }));
 
     await app.close();
   });
@@ -698,15 +822,21 @@ describe('admin vault updates', () => {
     queryMock.mockResolvedValue({ rowCount: 1, rows: [] });
     queryMock.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ blob_store: 'local', blob_key: 'vaults/example/sessions/one/chunks/a.txt' }]
+      rows: [{
+        blob_store: 'local',
+        blob_key: 'vaults/example/sessions/one/chunks/a.txt',
+        storage_bytes: '17'
+      }]
     });
     queryMock.mockResolvedValueOnce({
       rowCount: 1,
       rows: [{
         id: '9f758322-d29d-49a3-a2e3-11a4497b3671',
         vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+        workspace_id: '1f3b47e1-c0e9-4b76-bb93-88ef62d788ee',
         blob_store: 'local',
-        blob_key: 'vaults/example/sessions/one/chunks/a.txt'
+        blob_key: 'vaults/example/sessions/one/chunks/a.txt',
+        storage_bytes: '17'
       }]
     });
     queryMock.mockResolvedValueOnce({

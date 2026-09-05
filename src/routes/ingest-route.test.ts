@@ -41,7 +41,7 @@ vi.mock('../db/client', () => ({
 }));
 
 vi.mock('../middleware/auth', () => ({
-  requireVaultAuth: async (request: FastifyRequest, _reply: FastifyReply) => {
+  requireVaultWriteAuth: async (request: FastifyRequest, _reply: FastifyReply) => {
     request.vault = {
       id: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
       name: 'Premium Eval',
@@ -150,7 +150,8 @@ describe('bulk ingest route body limit', () => {
     expect(response.json()).toMatchObject({ accepted: 160 });
     expect(reserveApiQuotaMock).toHaveBeenCalledWith(
       '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
-      'ingest_events'
+      'ingest_events',
+      'api'
     );
     expect(reserveApiQuotaMock.mock.invocationCallOrder[0]).toBeLessThan(embedBatchMock.mock.invocationCallOrder[0]);
     expect(refundApiQuotaReservationMock).not.toHaveBeenCalled();
@@ -247,10 +248,15 @@ describe('bulk ingest route body limit', () => {
 
     expect(response.statusCode).toBe(202);
     expect(response.json()).toMatchObject({ accepted: 1 });
-    expect(reserveApiQuotaMock).toHaveBeenCalledWith('5a3b3e77-cbd8-48f3-98fd-095f8fcb6070', 'ingest_events');
+    expect(reserveApiQuotaMock).toHaveBeenCalledWith(
+      '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
+      'ingest_events',
+      'api'
+    );
     expect(embedBatchMock).toHaveBeenCalledWith([chunk.content], {
       vaultId: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
       modelRole: 'embedding',
+      source: 'api',
       inputType: 'document'
     });
     expect(refundApiQuotaReservationMock).not.toHaveBeenCalled();

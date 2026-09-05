@@ -2,8 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const { queryMock } = vi.hoisted(() => ({
-  queryMock: vi.fn()
+const { queryMock, recordCustomerMetricMock } = vi.hoisted(() => ({
+  queryMock: vi.fn(),
+  recordCustomerMetricMock: vi.fn()
 }));
 
 vi.mock('../../db/client', () => ({
@@ -11,14 +12,20 @@ vi.mock('../../db/client', () => ({
   withTransaction: async (callback: (client: { query: typeof queryMock }) => Promise<unknown>) => callback({ query: queryMock })
 }));
 
+vi.mock('../customer-metrics', () => ({
+  recordCustomerMetric: recordCustomerMetricMock
+}));
+
 import {
   AiBudgetDeferredError,
   QuotaExceededError,
   acquireAiBudget,
+  closeStaleUsagePeriods,
   consumeApiQuota,
   consumeNormalIngestRateLimit,
   incrementUsage,
   recordModelUsage,
+  recordMemoryCountDelta,
   refundApiQuotaReservation,
   reserveApiQuota,
   settleAiUsage,
@@ -30,6 +37,7 @@ const noClosingUsagePeriod = { rowCount: 0, rows: [] };
 describe('usage service', () => {
   beforeEach(() => {
     queryMock.mockReset();
+    recordCustomerMetricMock.mockReset();
     usageTestInternals.clearAiBuckets();
     vi.useRealTimers();
   });
@@ -51,7 +59,8 @@ describe('usage service', () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          quota_limit: '5'
+          quota_limit: '5',
+          account_id: 'account-1'
         }]
       });
       queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
@@ -68,6 +77,7 @@ describe('usage service', () => {
         })
       });
       expect(queryMock).toHaveBeenCalledTimes(3);
+      expect(recordCustomerMetricMock).not.toHaveBeenCalled();
       expect(queryMock.mock.calls[1]?.[0]).toContain('FOR UPDATE OF vu');
       expect(queryMock.mock.calls[2]?.[0]).toContain('vault_usage.memory_adds < $6::int');
     });
@@ -76,7 +86,8 @@ describe('usage service', () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          quota_limit: '10'
+          quota_limit: '10',
+          account_id: 'account-1'
         }]
       });
       queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
@@ -103,13 +114,22 @@ describe('usage service', () => {
         0,
         10
       ]);
+      expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        event_type: 'quota_delta',
+        memory_adds_delta: 1,
+        operation: 'memory_adds',
+        source: 'api',
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
     });
 
     it('returns a reservation that can be refunded against the reserved period', async () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          quota_limit: '10'
+          quota_limit: '10',
+          account_id: 'account-1'
         }]
       });
       queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
@@ -126,6 +146,7 @@ describe('usage service', () => {
 
       const reservation = await reserveApiQuota('vault-1', 'ingest_events');
       expect(reservation).toMatchObject({
+        accountId: 'account-1',
         field: 'ingest_events',
         period: expect.stringMatching(/^\d{4}-\d{2}$/),
         snapshot: {
@@ -133,6 +154,7 @@ describe('usage service', () => {
           remaining: 7,
           retryAfterSeconds: null
         },
+        source: 'api',
         vaultId: 'vault-1'
       });
 
@@ -142,6 +164,22 @@ describe('usage service', () => {
       expect(queryMock.mock.calls[3]?.[0]).toContain('SET ingest_events = GREATEST(ingest_events - 1, 0)');
       expect(queryMock.mock.calls[3]?.[0]).toContain('AND period = $2');
       expect(queryMock.mock.calls[3]?.[1]).toEqual(['vault-1', reservation.period]);
+      expect(recordCustomerMetricMock).toHaveBeenNthCalledWith(1, {
+        event_type: 'quota_delta',
+        ingest_events_delta: 1,
+        operation: 'ingest_events',
+        source: 'api',
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
+      expect(recordCustomerMetricMock).toHaveBeenNthCalledWith(2, {
+        event_type: 'quota_delta',
+        ingest_events_delta: -1,
+        operation: 'ingest_events',
+        source: 'api',
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
     });
 
     it('writes a closed-period event before rolling usage into a new period', async () => {
@@ -150,7 +188,8 @@ describe('usage service', () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          quota_limit: '4'
+          quota_limit: '4',
+          account_id: 'account-1'
         }]
       });
       queryMock.mockResolvedValueOnce({
@@ -199,9 +238,12 @@ describe('usage service', () => {
       expect(queryMock).toHaveBeenCalledTimes(4);
       expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO platform_event_outbox');
       expect(queryMock.mock.calls[2]?.[1]?.[0]).toBe('vault:vault-1');
-      expect(JSON.parse(queryMock.mock.calls[2]?.[1]?.[1] as string)).toEqual({
+      expect(queryMock.mock.calls[2]?.[1]?.[1]).toBe('io.persistio.usage_period.closed.v1');
+      expect(JSON.parse(queryMock.mock.calls[2]?.[1]?.[2] as string)).toMatchObject({
         platform_vault_id: 'vault-1',
         account_id: 'account-1',
+        workspace_id: 'account-1',
+        vault_id: 'vault-1',
         period: '2026-05',
         plan_id: 'unlimited',
         usage: {
@@ -232,13 +274,22 @@ describe('usage service', () => {
         1,
         4
       ]);
+      expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        event_type: 'quota_delta',
+        operation: 'searches',
+        searches_delta: 1,
+        source: 'api',
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
     });
 
     it('does not roll over usage when the closed-period event insert fails', async () => {
       queryMock.mockResolvedValueOnce({
         rowCount: 1,
         rows: [{
-          quota_limit: '4'
+          quota_limit: '4',
+          account_id: 'account-1'
         }]
       });
       queryMock.mockResolvedValueOnce({
@@ -266,38 +317,122 @@ describe('usage service', () => {
 
       expect(queryMock).toHaveBeenCalledTimes(3);
       expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO platform_event_outbox');
+      expect(recordCustomerMetricMock).not.toHaveBeenCalled();
+    });
+
+    it('sweeps stale usage rows into closed-period events and resets current counters', async () => {
+      queryMock.mockResolvedValueOnce({
+        rowCount: 2,
+        rows: [{ vault_id: 'vault-1' }, { vault_id: 'vault-2' }]
+      });
+      for (const vaultId of ['vault-1', 'vault-2']) {
+        queryMock.mockResolvedValueOnce({
+          rowCount: 1,
+          rows: [{
+            account_id: `${vaultId}-account`,
+            curator_candidates_deferred: '0',
+            curator_candidates_processed: '2',
+            curator_input_tokens: '50',
+            curator_output_tokens: '10',
+            curator_requests: '1',
+            curator_runs: '1',
+            ingest_events: '7',
+            limits: { ingest_events_per_month: 10 },
+            memory_adds: '3',
+            period: '2026-06',
+            plan_id: 'unlimited',
+            rate_limit_override: null,
+            searches: '4'
+          }]
+        });
+        queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      }
+      queryMock.mockResolvedValueOnce({ rowCount: 2, rows: [] });
+
+      await expect(closeStaleUsagePeriods(50, '2026-07')).resolves.toEqual({
+        closed: 2,
+        currentPeriod: '2026-07',
+        selected: 2
+      });
+
+      expect(queryMock).toHaveBeenCalledTimes(6);
+      expect(queryMock.mock.calls[0]?.[0]).toMatch(
+        /ORDER BY vu\.period ASC, vu\.updated_at ASC, vu\.vault_id ASC\s+LIMIT \$2\s+FOR UPDATE SKIP LOCKED/
+      );
+      expect(queryMock.mock.calls[0]?.[1]).toEqual(['2026-07', 50]);
+      expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO platform_event_outbox');
+      expect(queryMock.mock.calls[4]?.[0]).toContain('INSERT INTO platform_event_outbox');
+      expect(queryMock.mock.calls[5]?.[0]).toContain('curator_candidates_deferred = 0');
+      expect(queryMock.mock.calls[5]?.[1]).toEqual(['2026-07', ['vault-1', 'vault-2']]);
+    });
+  });
+
+  describe('recordMemoryCountDelta', () => {
+    it('emits an active memory-count delta with vault account attribution', async () => {
+      recordMemoryCountDelta('vault-1', 'account-1', -1, 'api');
+
+      expect(queryMock).not.toHaveBeenCalled();
+      expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        event_type: 'quota_delta',
+        memory_count_delta: -1,
+        operation: 'memory_count',
+        source: 'api',
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
+    });
+
+    it('skips memory-count deltas when a vault has no workspace attribution', async () => {
+      recordMemoryCountDelta('vault-1', null, 1, 'api');
+
+      expect(queryMock).not.toHaveBeenCalled();
+      expect(recordCustomerMetricMock).not.toHaveBeenCalled();
     });
   });
 
   describe('incrementUsage', () => {
     it('checks for a closed period in the same transaction before incrementing', async () => {
+      queryMock.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ account_id: 'account-1' }]
+      });
       queryMock.mockResolvedValueOnce(noClosingUsagePeriod);
       queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
       await incrementUsage('vault-1', 'memory_adds');
 
-      expect(queryMock).toHaveBeenCalledTimes(2);
-      expect(queryMock.mock.calls[0]?.[0]).toContain('FOR UPDATE OF vu');
-      expect(queryMock.mock.calls[1]?.[0]).toContain('INSERT INTO vault_usage');
-      expect(queryMock.mock.calls[1]?.[1]).toEqual([
+      expect(queryMock).toHaveBeenCalledTimes(3);
+      expect(queryMock.mock.calls[0]?.[0]).toContain('FOR KEY SHARE');
+      expect(queryMock.mock.calls[1]?.[0]).toContain('FOR UPDATE OF vu');
+      expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO vault_usage');
+      expect(queryMock.mock.calls[2]?.[1]).toEqual([
         'vault-1',
         expect.stringMatching(/^\d{4}-\d{2}$/),
         0,
         1,
         0
       ]);
+      expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        event_type: 'quota_delta',
+        memory_adds_delta: 1,
+        operation: 'memory_adds',
+        source: 'system',
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
     });
   });
 
   describe('recordModelUsage', () => {
     it('rolls up durable per-vault provider/model-role usage', async () => {
-      queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [{ account_id: 'account-1' }] });
 
       await recordModelUsage({
         vaultId: 'vault-1',
         provider: 'google',
         modelRole: 'extraction',
         model: 'gemini-2.5-flash',
+        source: 'extraction_worker',
         requestCount: 1,
         promptTokens: 100,
         completionTokens: 25,
@@ -321,6 +456,60 @@ describe('usage service', () => {
         25,
         125
       ]);
+      expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        completion_tokens: 25,
+        event_type: 'model_usage',
+        model: 'gemini-2.5-flash',
+        model_request_count: 1,
+        model_role: 'extraction',
+        prompt_tokens: 100,
+        provider: 'google',
+        source: 'extraction_worker',
+        total_tokens: 125,
+        vault_id: 'vault-1',
+        workspace_id: 'account-1'
+      });
+    });
+
+    it('skips customer model metrics for accountless vaults', async () => {
+      queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [{ account_id: null }] });
+
+      await recordModelUsage({
+        vaultId: 'vault-1',
+        provider: 'openai',
+        modelRole: 'embedding',
+        model: 'text-embedding-3-small',
+        source: 'api',
+        requestCount: 1,
+        embeddingCalls: 2,
+        embeddingInputTokens: 12,
+        embeddingInputChars: 42
+      });
+
+      expect(queryMock).toHaveBeenCalledTimes(1);
+      expect(recordCustomerMetricMock).not.toHaveBeenCalled();
+    });
+
+    it('preserves explicit runtime source for embedding usage', async () => {
+      queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [{ account_id: 'account-1' }] });
+
+      await recordModelUsage({
+        vaultId: 'vault-1',
+        provider: 'openai',
+        modelRole: 'embedding',
+        model: 'text-embedding-3-small',
+        source: 'curation_worker',
+        requestCount: 1,
+        embeddingCalls: 2,
+        embeddingInputTokens: 12,
+        embeddingInputChars: 42
+      });
+
+      expect(recordCustomerMetricMock).toHaveBeenCalledWith(expect.objectContaining({
+        event_type: 'model_usage',
+        model_role: 'embedding',
+        source: 'curation_worker'
+      }));
     });
   });
 

@@ -9,7 +9,14 @@ vi.mock('../../db/client', () => ({
   withTransaction: async (callback: (client: { query: typeof queryMock }) => Promise<unknown>) => callback({ query: queryMock })
 }));
 
-import { claimEligibleCurationJobs, getCurationStatus, getCuratorPlanBlockReason, mergeCuratorLimits, recordCuratorUsage } from '../curation-capacity';
+import {
+  claimEligibleCurationJobs,
+  getCurationStatus,
+  getCuratorPlanBlockReason,
+  mergeCuratorLimits,
+  recordCuratorRunCompletedActivity,
+  recordCuratorUsage
+} from '../curation-capacity';
 
 describe('curation capacity service', () => {
   beforeEach(() => {
@@ -248,7 +255,8 @@ describe('curation capacity service', () => {
 
     expect(queryMock).toHaveBeenCalledTimes(3);
     expect(queryMock.mock.calls[1]?.[0]).toContain('INSERT INTO platform_event_outbox');
-    expect(JSON.parse(queryMock.mock.calls[1]?.[1]?.[1] as string)).toMatchObject({
+    expect(queryMock.mock.calls[1]?.[1]?.[1]).toBe('io.persistio.usage_period.closed.v1');
+    expect(JSON.parse(queryMock.mock.calls[1]?.[1]?.[2] as string)).toMatchObject({
       platform_vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
       period: '2026-05',
       usage: {
@@ -266,6 +274,58 @@ describe('curation capacity service', () => {
       }
     });
     expect(queryMock.mock.calls[2]?.[0]).toContain('INSERT INTO vault_usage');
+  });
+
+  it('writes one aggregate curator completed activity event', async () => {
+    queryMock.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{ account_id: 'workspace-1' }]
+    });
+    queryMock.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await expect(recordCuratorRunCompletedActivity({
+      vaultId: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+      totalCandidatesProcessed: 8,
+      totalCuratorRequests: 2,
+      totalCuratorRuns: 1,
+      totalPromptTokens: 300,
+      totalCompletionTokens: 75
+    })).resolves.toBe(true);
+
+    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(queryMock.mock.calls[1]?.[0]).toContain('INSERT INTO platform_event_outbox');
+    expect(queryMock.mock.calls[1]?.[1]?.[0]).toBe('io.persistio.curator.run.completed.v1');
+    expect(JSON.parse(queryMock.mock.calls[1]?.[1]?.[2] as string)).toMatchObject({
+      candidates_processed: 8,
+      counts: {
+        candidates_processed: 8,
+        curator_requests: 2,
+        curator_runs: 1
+      },
+      curator_input_tokens: 300,
+      curator_output_tokens: 75,
+      curator_requests: 2,
+      platform_vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+      workspace_id: 'workspace-1'
+    });
+  });
+
+  it('treats curator completed activity writes as best effort', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    queryMock.mockRejectedValueOnce(new Error('outbox unavailable'));
+
+    try {
+      await expect(recordCuratorRunCompletedActivity({
+        vaultId: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+        totalCandidatesProcessed: 1,
+        totalCuratorRequests: 1,
+        totalCuratorRuns: 1,
+        totalPromptTokens: 10,
+        totalCompletionTokens: 2
+      })).resolves.toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('reports zero monthly curator limits as exhausted', async () => {

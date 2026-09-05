@@ -10,22 +10,29 @@ import {
   createConfiguredEventPublisher,
   shouldDispatchPlatformEvents
 } from './event-publisher';
-import type { PlatformEvent } from './platform-event';
+import { buildPlatformEvent, usagePeriodClosedEventType, type PlatformEvent } from './platform-event';
 
-const event: PlatformEvent<string> = {
-  event_id: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
-  event_type: 'vault.usage_period.closed',
-  schema_version: 1,
-  occurred_at: '2026-06-01T00:00:03.000Z',
-  subject: 'vault:vault-1',
-  payload: {
+const event: PlatformEvent<string> = buildPlatformEvent({
+  category: 'usage',
+  data: {
+    account_id: 'workspace-1',
     period: '2026-05',
     platform_vault_id: 'vault-1',
     plan_id: 'unlimited',
     usage: { ingest_events: 1 },
-    limits: { ingest_events_per_month: 10 }
-  }
-};
+    limits: { ingest_events_per_month: 10 },
+    sensitivity: 'metadata_only',
+    summary: 'Usage period 2026-05 closed',
+    vault_id: 'vault-1',
+    workspace_id: 'workspace-1'
+  },
+  id: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
+  occurredAt: '2026-06-01T00:00:03.000Z',
+  subject: 'vault/vault-1',
+  type: usagePeriodClosedEventType,
+  vaultId: 'vault-1',
+  workspaceId: 'workspace-1'
+});
 
 function appConfig(overrides: Partial<AppConfig>): AppConfig {
   return {
@@ -52,8 +59,8 @@ describe('event publishers', () => {
 
     expect(logger.info).toHaveBeenCalledWith(
       {
-        event_id: event.event_id,
-        event_type: event.event_type,
+        event_id: event.id,
+        event_type: event.type,
         subject: event.subject
       },
       'No-op platform event publisher accepted event'
@@ -75,8 +82,8 @@ describe('event publishers', () => {
       body,
       headers: {
         'Content-Type': 'application/json',
-        'X-Persistio-Event-Id': event.event_id,
-        'X-Persistio-Event-Type': event.event_type,
+        'X-Persistio-Event-Id': event.id,
+        'X-Persistio-Event-Type': event.type,
         'X-Persistio-Signature': crypto.createHmac('sha256', 'secret').update(body).digest('hex')
       },
       method: 'POST',
@@ -149,11 +156,11 @@ describe('event publishers', () => {
     expect(sendMessages).toHaveBeenCalledWith({
       body: event,
       contentType: 'application/json',
-      messageId: event.event_id,
-      subject: event.event_type,
+      messageId: event.id,
+      subject: event.type,
       applicationProperties: {
-        event_type: event.event_type,
-        schema_version: event.schema_version,
+        event_type: event.type,
+        specversion: event.specversion,
         subject: event.subject
       }
     });
@@ -191,11 +198,14 @@ describe('event publishers', () => {
 
     expect(client.topic).toHaveBeenCalledWith('platform-events');
     expect(publishMessage).toHaveBeenCalledWith({
-      json: event,
+      json: {
+        ...event,
+        data_json: JSON.stringify(event.data)
+      },
       attributes: {
-        event_id: event.event_id,
-        event_type: event.event_type,
-        schema_version: String(event.schema_version),
+        event_id: event.id,
+        event_type: event.type,
+        specversion: event.specversion,
         subject: event.subject
       }
     });

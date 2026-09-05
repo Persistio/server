@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { parsePlatformOAuthClientPolicies } from './oauth-client-policies';
 import { RAW_CHUNK_LOCAL_DIR_DEFAULT } from './services/raw-chunk-storage-config';
 
 const booleanFlag = z.preprocess((value) => {
@@ -16,11 +17,15 @@ const booleanFlag = z.preprocess((value) => {
 
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  DATABASE_URL: z.string().min(1),
+  DATABASE_URL: z.string().default(''),
   PORT: z.coerce.number().int().positive().default(4827),
-  ADMIN_API_KEY: z.string().min(1),
+  ADMIN_API_KEY: z.string().default(''),
   HEALTH_API_KEY: z.string().default(''),
-  PERSISTIO_MODE: z.enum(['api', 'worker', 'combined']).default('combined'),
+  PLATFORM_AUTH_MODE: z.enum(['api_key', 'dual', 'oauth']).default('api_key'),
+  PLATFORM_OAUTH_ISSUER: z.string().default(''),
+  PLATFORM_OAUTH_AUDIENCE: z.string().default(''),
+  PLATFORM_OAUTH_CLIENT_POLICIES: z.string().default(''),
+  PERSISTIO_MODE: z.enum(['api', 'worker', 'combined', 'analytics-api']).default('combined'),
   EMBEDDER_PROVIDER: z.enum(['openai', 'ollama', 'tei', 'vertex']).default('openai'),
   STORAGE_EMBEDDING_DIMENSIONS: z.coerce.number().int().positive().max(2000).default(1536),
   OPENAI_API_KEY: z.string().default(''),
@@ -82,9 +87,30 @@ const configSchema = z.object({
   EVENT_OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   EVENT_OUTBOX_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(1000),
   EVENT_OUTBOX_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(300000),
+  EVENT_OUTBOX_WARN_DEPTH_THRESHOLD: z.coerce.number().int().nonnegative().default(100),
+  EVENT_OUTBOX_WARN_OLDEST_AGE_MS: z.coerce.number().int().nonnegative().default(15 * 60 * 1000),
+  USAGE_PERIOD_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  USAGE_PERIOD_SWEEP_BATCH_SIZE: z.coerce.number().int().positive().default(100),
+  CUSTOMER_METRICS_PUBLISHER: z.enum(['noop', 'log', 'gcp_pubsub']).default('noop'),
+  CUSTOMER_METRICS_GCP_PUBSUB_PROJECT_ID: z.string().default(''),
+  CUSTOMER_METRICS_GCP_PUBSUB_TOPIC: z.string().default(''),
+  CUSTOMER_METRICS_BATCH_SIZE: z.coerce.number().int().positive().max(1000).default(100),
+  CUSTOMER_METRICS_FLUSH_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  ANALYTICS_BIGQUERY_PROJECT_ID: z.string().default(''),
+  ANALYTICS_BIGQUERY_LOCATION: z.string().default('EU'),
+  ANALYTICS_BIGQUERY_ROLLUP_DATASET: z.string().default('persistio_analytics_rollup'),
+  ANALYTICS_BIGQUERY_MAXIMUM_BYTES_BILLED: z.coerce.number().int().positive().default(10 * 1024 * 1024),
+  ANALYTICS_HOURLY_MAX_RANGE_DAYS: z.coerce.number().int().positive().default(14),
+  ANALYTICS_DAILY_MAX_RANGE_DAYS: z.coerce.number().int().positive().default(90),
+  ANALYTICS_FIRESTORE_SNAPSHOT_ENABLED: booleanFlag,
+  ANALYTICS_FIRESTORE_PROJECT_ID: z.string().default(''),
+  ANALYTICS_FIRESTORE_DATABASE_ID: z.string().default('(default)'),
+  ANALYTICS_FIRESTORE_SNAPSHOT_COLLECTION: z.string().default('customer_metric_snapshots'),
+  ANALYTICS_FIRESTORE_SNAPSHOT_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60),
   EXTRACTION_WORKER_CONCURRENCY: z.coerce.number().int().positive().max(20).default(5),
   ARBITRATION_BATCH_SIZE: z.coerce.number().int().positive().default(15),
   DB_POOL_MAX: z.coerce.number().int().positive().default(20),
+  DB_POOL_CONNECTION_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   MAX_INGEST_CHUNKS: z.coerce.number().int().positive().default(100),
   INGEST_EMBEDDING_CONCURRENCY: z.coerce.number().int().positive().default(4),
   INGEST_RATE_LIMIT_RPM: z.coerce.number().int().positive().default(60),
@@ -116,7 +142,25 @@ const configSchema = z.object({
   KEK_KEY_NAME: z.string().default(''),
   GCP_KMS_KEY_NAME: z.string().default('')
 }).superRefine((value, ctx) => {
-  if (value.EMBEDDER_PROVIDER === 'openai' && !value.OPENAI_API_KEY) {
+  const isAnalyticsApi = value.PERSISTIO_MODE === 'analytics-api';
+
+  if (!isAnalyticsApi && !value.DATABASE_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'DATABASE_URL is required unless PERSISTIO_MODE=analytics-api',
+      path: ['DATABASE_URL']
+    });
+  }
+
+  if (!isAnalyticsApi && !value.ADMIN_API_KEY) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'ADMIN_API_KEY is required unless PERSISTIO_MODE=analytics-api',
+      path: ['ADMIN_API_KEY']
+    });
+  }
+
+  if (!isAnalyticsApi && value.EMBEDDER_PROVIDER === 'openai' && !value.OPENAI_API_KEY) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'OPENAI_API_KEY is required when EMBEDDER_PROVIDER=openai',
@@ -124,7 +168,7 @@ const configSchema = z.object({
     });
   }
 
-  if (value.EMBEDDER_PROVIDER === 'vertex' && !value.VERTEX_PROJECT_ID) {
+  if (!isAnalyticsApi && value.EMBEDDER_PROVIDER === 'vertex' && !value.VERTEX_PROJECT_ID) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'VERTEX_PROJECT_ID is required when EMBEDDER_PROVIDER=vertex',
@@ -135,7 +179,62 @@ const configSchema = z.object({
   validateRoleOverrideTriplet(ctx, value, 'EXTRACTION');
   validateRoleOverrideTriplet(ctx, value, 'ESCALATION');
 
-  if (value.ENCRYPTION_ENABLED && value.KEY_PROVIDER === 'azure_key_vault' && !value.KEY_VAULT_URI) {
+  const platformOAuthConfigPresent = Boolean(
+    value.PLATFORM_OAUTH_ISSUER ||
+    value.PLATFORM_OAUTH_AUDIENCE ||
+    value.PLATFORM_OAUTH_CLIENT_POLICIES
+  );
+  const shouldRequirePlatformOAuthConfig = value.PLATFORM_AUTH_MODE === 'oauth' ||
+    (value.PLATFORM_AUTH_MODE === 'dual' && platformOAuthConfigPresent) ||
+    isAnalyticsApi;
+
+  if (isAnalyticsApi && value.PLATFORM_AUTH_MODE === 'api_key') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'PLATFORM_AUTH_MODE must be oauth or dual when PERSISTIO_MODE=analytics-api',
+      path: ['PLATFORM_AUTH_MODE']
+    });
+  }
+
+  if (shouldRequirePlatformOAuthConfig) {
+    if (!value.PLATFORM_OAUTH_ISSUER) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'PLATFORM_OAUTH_ISSUER is required when platform OAuth is enabled',
+        path: ['PLATFORM_OAUTH_ISSUER']
+      });
+    }
+    if (!value.PLATFORM_OAUTH_AUDIENCE) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'PLATFORM_OAUTH_AUDIENCE is required when platform OAuth is enabled',
+        path: ['PLATFORM_OAUTH_AUDIENCE']
+      });
+    }
+    if (!value.PLATFORM_OAUTH_CLIENT_POLICIES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'PLATFORM_OAUTH_CLIENT_POLICIES is required when platform OAuth is enabled',
+        path: ['PLATFORM_OAUTH_CLIENT_POLICIES']
+      });
+    }
+  }
+
+  if (value.PLATFORM_OAUTH_CLIENT_POLICIES) {
+    try {
+      parsePlatformOAuthClientPolicies(value.PLATFORM_OAUTH_CLIENT_POLICIES);
+    } catch (error) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: error instanceof Error ? error.message : 'Invalid PLATFORM_OAUTH_CLIENT_POLICIES',
+        path: ['PLATFORM_OAUTH_CLIENT_POLICIES']
+      });
+    }
+  }
+
+  validateOptionalHttpUrl(ctx, value.PLATFORM_OAUTH_ISSUER, 'PLATFORM_OAUTH_ISSUER');
+
+  if (!isAnalyticsApi && value.ENCRYPTION_ENABLED && value.KEY_PROVIDER === 'azure_key_vault' && !value.KEY_VAULT_URI) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'KEY_VAULT_URI is required when ENCRYPTION_ENABLED=true and KEY_PROVIDER=azure_key_vault',
@@ -143,7 +242,7 @@ const configSchema = z.object({
     });
   }
 
-  if (value.ENCRYPTION_ENABLED && value.KEY_PROVIDER === 'azure_key_vault' && !value.KEK_KEY_NAME) {
+  if (!isAnalyticsApi && value.ENCRYPTION_ENABLED && value.KEY_PROVIDER === 'azure_key_vault' && !value.KEK_KEY_NAME) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'KEK_KEY_NAME is required when ENCRYPTION_ENABLED=true and KEY_PROVIDER=azure_key_vault',
@@ -151,7 +250,7 @@ const configSchema = z.object({
     });
   }
 
-  if (value.ENCRYPTION_ENABLED && value.KEY_PROVIDER === 'gcp_kms' && !value.GCP_KMS_KEY_NAME) {
+  if (!isAnalyticsApi && value.ENCRYPTION_ENABLED && value.KEY_PROVIDER === 'gcp_kms' && !value.GCP_KMS_KEY_NAME) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'GCP_KMS_KEY_NAME is required when ENCRYPTION_ENABLED=true and KEY_PROVIDER=gcp_kms',
@@ -176,6 +275,7 @@ const configSchema = z.object({
   }
 
   if (
+    !isAnalyticsApi &&
     value.RAW_CHUNK_STORAGE_PROVIDER === 'azure_blob' &&
     !value.AZURE_STORAGE_CONNECTION_STRING &&
     !value.AZURE_STORAGE_ACCOUNT_NAME
@@ -187,7 +287,7 @@ const configSchema = z.object({
     });
   }
 
-  if (value.RAW_CHUNK_STORAGE_PROVIDER === 'gcs' && !value.RAW_CHUNK_GCS_BUCKET) {
+  if (!isAnalyticsApi && value.RAW_CHUNK_STORAGE_PROVIDER === 'gcs' && !value.RAW_CHUNK_GCS_BUCKET) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'RAW_CHUNK_GCS_BUCKET is required when RAW_CHUNK_STORAGE_PROVIDER=gcs',
@@ -207,7 +307,7 @@ const configSchema = z.object({
   validateOptionalHttpUrl(ctx, value.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT');
   validateOptionalHttpUrl(ctx, value.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, 'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT');
 
-  const shouldValidateEventPublisher = value.PERSISTIO_MODE !== 'api';
+  const shouldValidateEventPublisher = value.PERSISTIO_MODE === 'combined' || value.PERSISTIO_MODE === 'worker';
 
   if (shouldValidateEventPublisher && value.EVENT_PUBLISHER === 'webhook') {
     if (!value.PLATFORM_EVENTS_WEBHOOK_URL) {
@@ -263,6 +363,22 @@ const configSchema = z.object({
       code: z.ZodIssueCode.custom,
       message: 'GCP_PUBSUB_TOPIC is required when EVENT_PUBLISHER=gcp_pubsub',
       path: ['GCP_PUBSUB_TOPIC']
+    });
+  }
+
+  if (value.CUSTOMER_METRICS_PUBLISHER === 'gcp_pubsub' && !value.CUSTOMER_METRICS_GCP_PUBSUB_TOPIC) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'CUSTOMER_METRICS_GCP_PUBSUB_TOPIC is required when CUSTOMER_METRICS_PUBLISHER=gcp_pubsub',
+      path: ['CUSTOMER_METRICS_GCP_PUBSUB_TOPIC']
+    });
+  }
+
+  if (isAnalyticsApi && !value.ANALYTICS_BIGQUERY_PROJECT_ID && !value.GCP_PUBSUB_PROJECT_ID && !value.VERTEX_PROJECT_ID) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'ANALYTICS_BIGQUERY_PROJECT_ID is required when PERSISTIO_MODE=analytics-api unless a GCP project id is already configured',
+      path: ['ANALYTICS_BIGQUERY_PROJECT_ID']
     });
   }
 });

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getConfig } from '../config';
 import { query } from '../db/client';
 import { recallDurationHistogram } from '../metrics';
-import { requireVaultAuth } from '../middleware/auth';
+import { requireVaultReadAuth } from '../middleware/auth';
 import { decryptForVault } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
 import { PENDING_RECALL_WINDOW_MS, pendingRecallCutoff } from '../services/pending-memory';
@@ -355,12 +355,12 @@ export function buildRecallBundle(memories: RecallMemory[], globalUserRules: Rec
 }
 
 export async function registerRecallRoutes(app: FastifyInstance) {
-  app.post('/v1/recall', { preHandler: requireVaultAuth }, async (request, reply) => {
+  app.post('/v1/recall', { preHandler: requireVaultReadAuth }, async (request, reply) => {
     const body = recallSchema.parse(request.body);
     const qs = recallQuerySchema.parse(request.query);
     const config = getConfig();
     const topK = body.top_k ?? config.DEFAULT_RECALL_TOP_K;
-    const rateLimit = await consumeApiQuota(request.vault.id, 'searches');
+    const rateLimit = await consumeApiQuota(request.vault.id, 'searches', 'api');
     applyRateLimitHeaders(reply, rateLimit);
 
     return withSpan('recall.request', {
@@ -376,7 +376,7 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       const start = performance.now();
       const recallTime = new Date();
       const embedder = getEmbedder();
-      const embedding = await embedder.embed(body.query, { vaultId: request.vault.id, modelRole: 'embedding', inputType: 'query' });
+      const embedding = await embedder.embed(body.query, { vaultId: request.vault.id, modelRole: 'embedding', source: 'api', inputType: 'query' });
       const minSimilarity = body.min_similarity ?? config.MIN_RECALL_SIMILARITY;
       const candidateLimit = recallCandidateLimit(topK);
       const pendingCutoff = pendingRecallCutoff(recallTime);

@@ -13,6 +13,11 @@ import { filterMemoryCandidates } from '../services/deterministic-filter';
 import { getEmbedder } from '../services/embedder';
 import { formatConversationForExtraction } from '../services/extraction-formatting';
 import { buildPromptHeader } from '../services/extraction-prompt-header';
+import {
+  formatProvenanceForPrompt,
+  getProvenancePreGate,
+  inferExtractionProvenance
+} from '../services/extraction-provenance';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 import { ExtractorService } from '../services/extractor';
 import { getRawChunkStorage } from '../services/raw-chunk-storage';
@@ -21,6 +26,7 @@ import { completePersistentJobIfReady, failPersistentJob, markPersistentJobRunni
 import { archiveStaleMemories } from '../services/staleness';
 import { AiBudgetDeferredError } from '../services/usage';
 import { isCuratorEnabled } from '../services/curation-capacity';
+import { initCustomerMetrics, shutdownCustomerMetrics } from '../services/customer-metrics';
 import { enqueueCurationIfSegmentReady } from '../services/segment-curation-readiness';
 import {
   getVaultSubjectList,
@@ -63,6 +69,7 @@ interface RawChunkRow {
   blob_store: string | null;
   blob_key: string | null;
   created_at: string;
+  provenance: unknown;
 }
 
 interface SegmentRow {
@@ -84,11 +91,17 @@ interface LoadedJob {
   createdAt: string;
 }
 
-interface WorkerRequest {
+interface WorkerRunOnceRequest {
   type: 'run-once';
   jobId?: string;
   vaultId?: string;
 }
+
+interface WorkerShutdownRequest {
+  type: 'shutdown';
+}
+
+type WorkerRequest = WorkerRunOnceRequest | WorkerShutdownRequest;
 
 const config = getConfig();
 const embedder = getEmbedder();
@@ -99,6 +112,52 @@ const subjectArbitrationLimit = pLimit(5);
 const MAX_EXTRACTION_RATE_LIMIT_RETRIES = 5;
 const EXTRACTION_RATE_LIMIT_BASE_DELAY_MS = 1_000;
 const EXTRACTION_RATE_LIMIT_MAX_DELAY_MS = 32_000;
+const activeWorkerTasks = new Set<Promise<unknown>>();
+let isShuttingDown = false;
+let resolveWorkerSleep: (() => void) | null = null;
+let shutdownPromise: Promise<void> | null = null;
+
+function trackWorkerTask<T>(task: Promise<T>): Promise<T> {
+  const tracked = task.finally(() => {
+    activeWorkerTasks.delete(tracked);
+  });
+  activeWorkerTasks.add(tracked);
+  return tracked;
+}
+
+function sleepUntilNextBatch(ms: number): Promise<void> {
+  if (isShuttingDown) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolveWorkerSleep = null;
+      resolve();
+    }, ms);
+    resolveWorkerSleep = () => {
+      clearTimeout(timeout);
+      resolveWorkerSleep = null;
+      resolve();
+    };
+  });
+}
+
+async function shutdownWorker() {
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      isShuttingDown = true;
+      resolveWorkerSleep?.();
+      await Promise.allSettled(Array.from(activeWorkerTasks));
+      await shutdownCustomerMetrics();
+      await closePool();
+      if (parentPort) {
+        parentPort.postMessage({ type: 'shutdown-complete' });
+        parentPort.close();
+      }
+    })();
+  }
+
+  await shutdownPromise;
+}
 
 async function processBatch(vaultId?: string) {
   return withSpan('extraction.process_batch', {
@@ -178,6 +237,40 @@ async function processBatch(vaultId?: string) {
             decryptedContent: await decryptForVault(job.vault, await readRawChunkContent(chunk))
           })));
 
+          const provenance = inferExtractionProvenance({
+            sessionId: job.sessionId,
+            chunks: decryptedChunks
+          });
+          const provenanceGate = getProvenancePreGate(provenance);
+          if (provenanceGate) {
+            span.setAttribute('extraction.candidates.extracted', 0);
+            span.setAttribute('extraction.candidates.accepted', 0);
+            span.setAttribute('extraction.candidates.dropped', 0);
+            span.setAttribute('extraction.provenance.pre_gate', true);
+            span.setAttribute('extraction.provenance.source_class', provenance.source_class);
+            extractionCandidatesCounter.add(1, {
+              status: 'dropped',
+              reason: 'provenance_pre_gate',
+              vault_id: job.vault.id,
+              session_id: job.sessionId
+            });
+            console.log(JSON.stringify({
+              level: 30,
+              msg: 'extraction provenance pre-gate noop',
+              vault_id: job.vault.id,
+              session_id: job.sessionId,
+              source_class: provenance.source_class,
+              actor_type: provenance.actor_type,
+              trigger_type: provenance.trigger_type,
+              artifact_type: provenance.artifact_type,
+              authorship: provenance.authorship,
+              cadence: provenance.cadence,
+              reason: provenanceGate.reason
+            }));
+            await completeExtractionJob(job);
+            return;
+          }
+
           const conversation = formatConversationForExtraction(decryptedChunks);
           const sessionContextCacheKey = `${job.vault.id}:${job.sessionId}`;
           if (!sessionContextCache.has(sessionContextCacheKey)) {
@@ -192,7 +285,10 @@ async function processBatch(vaultId?: string) {
             await upsertEntityAliases(job.vault.id, sessionAliases);
           }
           const vaultSubjects = vaultSubjectCache.get(job.vault.id) ?? [];
-          const promptHeader = buildPromptHeader(job.vault.purpose, sessionContext, vaultSubjects);
+          const promptHeader = [
+            buildPromptHeader(job.vault.purpose, sessionContext, vaultSubjects),
+            formatProvenanceForPrompt(provenance)
+          ].filter(Boolean).join('\n\n');
           const facts = await extractor.extractFacts(
             conversation,
             promptHeader,
@@ -284,7 +380,7 @@ async function processBatch(vaultId?: string) {
 
           const subjectEmbeddings = await embedder.embedBatch(
             subjectResolutionInputs.map(({ fact }) => fact.subject),
-            { vaultId: job.vault.id, modelRole: 'embedding', inputType: 'document' }
+            { vaultId: job.vault.id, modelRole: 'embedding', source: 'extraction_worker', inputType: 'document' }
           );
           await Promise.all(subjectResolutionInputs.map(async ({ fact, index }, inputIndex) => {
             const subjectEmbedding = subjectEmbeddings[inputIndex];
@@ -352,7 +448,7 @@ async function processBatch(vaultId?: string) {
           }));
           const factEmbeddings = await embedder.embedBatch(
             factsToEmbed.map((fact) => fact.fact),
-            { vaultId: job.vault.id, modelRole: 'embedding', inputType: 'document' }
+            { vaultId: job.vault.id, modelRole: 'embedding', source: 'extraction_worker', inputType: 'document' }
           );
 
           const curatorEnabled = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id);
@@ -641,7 +737,7 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
 
     const segment = segmentResult.rows[0];
     const chunksResult = await query<RawChunkRow>(
-      `SELECT id, vault_id, session_id, role, blob_store, blob_key, created_at
+      `SELECT id, vault_id, session_id, role, blob_store, blob_key, created_at, provenance
        FROM raw_chunks
        WHERE id = ANY($1::uuid[])
          AND blob_key IS NOT NULL`,
@@ -681,7 +777,7 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   }
 
   const chunkResult = await query<RawChunkRow & VaultContextRow>(
-    `SELECT rc.id, rc.vault_id, rc.session_id, rc.role, rc.blob_store, rc.blob_key, rc.created_at,
+    `SELECT rc.id, rc.vault_id, rc.session_id, rc.role, rc.blob_store, rc.blob_key, rc.created_at, rc.provenance,
             v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id,
             v.type, v.custom_extraction_prompt, v.custom_curation_prompt
      FROM raw_chunks rc
@@ -875,20 +971,30 @@ async function runLoop() {
   if (config.ENCRYPTION_ENABLED) {
     await initCryptoClient();
   }
+  await initCustomerMetrics(config);
 
-  while (true) {
+  while (!isShuttingDown) {
     try {
-      await processBatch();
+      await trackWorkerTask(processBatch());
     } catch (error) {
-      console.error('Extraction loop iteration failed', error);
+      if (!isShuttingDown) {
+        console.error('Extraction loop iteration failed', error);
+      }
     }
 
-    await new Promise((resolve) => setTimeout(resolve, config.EXTRACTION_INTERVAL_MS));
+    await sleepUntilNextBatch(config.EXTRACTION_INTERVAL_MS);
   }
 }
 
-async function handleRunOnce(message: WorkerRequest) {
+async function handleRunOnce(message: WorkerRunOnceRequest) {
   if (!parentPort) {
+    return;
+  }
+
+  if (isShuttingDown) {
+    if (message.jobId) {
+      parentPort.postMessage({ type: 'job-status', jobId: message.jobId, status: 'failed', error: 'Extraction worker is shutting down' });
+    }
     return;
   }
 
@@ -897,7 +1003,7 @@ async function handleRunOnce(message: WorkerRequest) {
   }
 
   try {
-    await processBatch(message.vaultId);
+    await trackWorkerTask(processBatch(message.vaultId));
     extractionJobsCounter.add(1, {
       status: 'success',
       vault_id: message.vaultId ?? 'all'
@@ -925,12 +1031,14 @@ if (parentPort) {
   parentPort.on('message', (message: WorkerRequest) => {
     if (message.type === 'run-once') {
       void handleRunOnce(message);
+    } else if (message.type === 'shutdown') {
+      void shutdownWorker();
     }
   });
 }
 
 void runLoop().catch(async (error) => {
   console.error(getSpanAttributes({ error }), 'Extraction worker terminated');
-  await closePool();
+  await shutdownWorker();
   process.exit(1);
 });

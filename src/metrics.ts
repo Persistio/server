@@ -3,11 +3,6 @@ import { meter } from './telemetry';
 import { query } from './db/client';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from './services/extraction-queue-eligibility';
 
-export const httpRequestDurationHistogram = meter.createHistogram('persistio.http.request.duration', {
-  description: 'Request latency by route and status',
-  unit: 'ms'
-});
-
 export const recallDurationHistogram = meter.createHistogram('persistio.recall.duration', {
   description: 'Recall latency',
   unit: 'ms'
@@ -41,6 +36,19 @@ export const aiBudgetThrottledJobsCounter = meter.createCounter('persistio.ai_bu
 
 export const embeddingDurationHistogram = meter.createHistogram('persistio.embedding.duration', {
   description: 'Embedding call latency',
+  unit: 'ms'
+});
+
+export const eventOutboxDispatchCounter = meter.createCounter('persistio.event_outbox.dispatch.total', {
+  description: 'Event outbox dispatch cycle and row outcomes'
+});
+
+export const eventOutboxPublishFailureCounter = meter.createCounter('persistio.event_outbox.publish_failures.total', {
+  description: 'Event outbox publish failures by adapter and event type'
+});
+
+export const eventOutboxLagHistogram = meter.createHistogram('persistio.event_outbox.lag_ms', {
+  description: 'Age of oldest pending platform event outbox row during dispatch',
   unit: 'ms'
 });
 

@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { decryptForVaultMock, enforceMemoryCreationLimitMock, extractorMock } = vi.hoisted(() => ({
+const { decryptForVaultMock, enforceMemoryCreationLimitMock, extractorMock, recordMemoryCountDeltaMock } = vi.hoisted(() => ({
   decryptForVaultMock: vi.fn(),
   enforceMemoryCreationLimitMock: vi.fn(),
   extractorMock: {
     arbitrateConflict: vi.fn()
-  }
+  },
+  recordMemoryCountDeltaMock: vi.fn()
 }));
 
 vi.mock('../crypto', () => ({
@@ -22,7 +23,8 @@ vi.mock('../entity-resolver', () => ({
 }));
 
 vi.mock('../usage', () => ({
-  enforceMemoryCreationLimit: enforceMemoryCreationLimitMock
+  enforceMemoryCreationLimit: enforceMemoryCreationLimitMock,
+  recordMemoryCountDelta: recordMemoryCountDeltaMock
 }));
 
 vi.mock('../../telemetry', () => ({
@@ -55,13 +57,14 @@ function input(): DedupInput {
   };
 }
 
-function createDb() {
+function createDb(options: { hasSubjectMatch?: boolean } = {}) {
+  const { hasSubjectMatch = true } = options;
   return {
     query: vi.fn(async (sql: string) => {
       if (sql.includes('FROM vaults')) {
         return {
           rowCount: 1,
-          rows: [{ id: 'vault-1', encrypted_dek: null, vault_encryption_enabled: false }]
+          rows: [{ id: 'vault-1', account_id: 'account-1', encrypted_dek: null, vault_encryption_enabled: false }]
         };
       }
 
@@ -70,9 +73,14 @@ function createDb() {
       }
 
       if (sql.includes('FROM memories AS m')) {
+        if (!hasSubjectMatch) {
+          return { rowCount: 0, rows: [] };
+        }
+
         return {
           rowCount: 1,
           rows: [{
+            account_id: 'account-1',
             id: 'memory-1',
             data: 'Existing fact',
             confidence: 1,
@@ -104,6 +112,7 @@ describe('deduplicateMemory precomputed conflict decisions', () => {
     decryptForVaultMock.mockResolvedValue('Existing fact');
     enforceMemoryCreationLimitMock.mockReset();
     extractorMock.arbitrateConflict.mockReset();
+    recordMemoryCountDeltaMock.mockReset();
   });
 
   it('uses a precomputed decision when it matches the current best memory', async () => {
@@ -147,5 +156,19 @@ describe('deduplicateMemory precomputed conflict decisions', () => {
       .find((sql) => sql.includes('FROM memories AS m'));
 
     expect(similarityQuery).toMatch(/ORDER BY similarity DESC\s+LIMIT 1/);
+  });
+
+  it('emits a worker memory count delta after inserting a durable memory', async () => {
+    const db = createDb({ hasSubjectMatch: false });
+
+    await deduplicateMemory(input(), db, extractorMock as never);
+
+    expect(recordMemoryCountDeltaMock).toHaveBeenCalledWith('vault-1', 'account-1', 1, 'extraction_worker');
+
+    const insertCallIndex = db.query.mock.calls.findIndex(([sql]) => String(sql).includes('INSERT INTO memories'));
+    expect(insertCallIndex).toBeGreaterThanOrEqual(0);
+    expect(recordMemoryCountDeltaMock.mock.invocationCallOrder[0]).toBeGreaterThan(
+      db.query.mock.invocationCallOrder[insertCallIndex]
+    );
   });
 });

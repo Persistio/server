@@ -168,6 +168,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
       provider: 'openai',
       model: 'gpt-4o-mini',
       modelRole: 'extraction',
+      source: 'extraction_worker',
       requestCount: 1,
       promptTokens: 20,
       completionTokens: 1,

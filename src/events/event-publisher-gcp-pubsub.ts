@@ -31,12 +31,16 @@ export class GcpPubSubEventPublisher implements EventPublisher {
   }
 
   async publish(event: PlatformEvent<string>): Promise<void> {
+    const bigQueryProjection = {
+      ...event,
+      data_json: JSON.stringify(event.data)
+    };
     await this.topic.publishMessage({
-      json: event,
+      json: bigQueryProjection,
       attributes: {
-        event_id: event.event_id,
-        event_type: event.event_type,
-        schema_version: String(event.schema_version),
+        event_id: event.id,
+        event_type: event.type,
+        specversion: event.specversion,
         subject: event.subject
       }
     });

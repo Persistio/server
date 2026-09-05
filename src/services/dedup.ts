@@ -13,7 +13,7 @@ import {
 import { normaliseSubject, resolveCanonical } from './entity-resolver';
 import { decideEscalation, defaultDecisionWithoutEscalator } from './escalation-routing';
 import { ExtractorService, type ConflictResolution } from './extractor';
-import { enforceMemoryCreationLimit } from './usage';
+import { enforceMemoryCreationLimit, recordMemoryCountDelta } from './usage';
 import { withSpan } from '../telemetry';
 
 export interface DedupInput {
@@ -38,6 +38,7 @@ export interface DedupInput {
 }
 
 interface MemoryRow {
+  account_id: string | null;
   id: string;
   data: string;
   confidence: number;
@@ -76,10 +77,14 @@ export interface DedupEscalationRequest {
 
 interface DedupMatchResolution {
   hash: string;
-  vault: VaultEncryptionContext;
+  vault: DedupVaultContext;
   canonicalSubject: string;
   exactMatchId?: string;
   bestMatch?: MemoryRow & { similarity: number };
+}
+
+interface DedupVaultContext extends VaultEncryptionContext {
+  account_id: string | null;
 }
 
 export async function deduplicateMemory(
@@ -96,7 +101,7 @@ export async function deduplicateMemory(
     const { hash, vault, canonicalSubject, exactMatchId, bestMatch } = await resolveDedupMatch(input, db);
 
     if (input.status === 'candidate') {
-      await enforceMemoryCreationLimit(input.vaultId);
+      await enforceMemoryCreationLimit(input.vaultId, 'extraction_worker');
       const inserted = await insertMemory(db, vault, input, hash, canonicalSubject);
       await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
       span.setAttribute('dedup.result', 'inserted');
@@ -245,7 +250,7 @@ export async function deduplicateMemory(
       span.setAttribute('dedup.conflict_decision', decision);
 
       if (decision === 'keep_both') {
-        await enforceMemoryCreationLimit(input.vaultId);
+        await enforceMemoryCreationLimit(input.vaultId, 'extraction_worker');
         const inserted = await insertMemory(db, bestMatchVault, input, hash, canonicalSubject);
         await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
         span.setAttribute('dedup.result', 'inserted');
@@ -329,14 +334,14 @@ export async function deduplicateMemory(
         );
       }
 
-      await enforceMemoryCreationLimit(input.vaultId);
+      await enforceMemoryCreationLimit(input.vaultId, 'extraction_worker');
       const inserted = await insertMemory(db, bestMatchVault, input, hash, canonicalSubject);
       await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
       span.setAttribute('dedup.result', 'inserted');
       return { action: 'inserted', memoryId: inserted.rows[0].id };
     }
 
-    await enforceMemoryCreationLimit(input.vaultId);
+    await enforceMemoryCreationLimit(input.vaultId, 'extraction_worker');
     const inserted = await insertMemory(db, vault, input, hash, canonicalSubject);
     await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
 
@@ -395,8 +400,8 @@ async function resolveDedupMatch(
   const hash = crypto.createHash('md5').update(input.fact).digest('hex');
   const normalisedSubject = normaliseSubject(input.subject);
   const canonicalSubject = await resolveCanonical(input.vaultId, normalisedSubject) ?? normalisedSubject;
-  const vaultResult = await db.query<VaultEncryptionContext>(
-    `SELECT id, encrypted_dek, vault_encryption_enabled
+  const vaultResult = await db.query<DedupVaultContext>(
+    `SELECT id, account_id::text AS account_id, encrypted_dek, vault_encryption_enabled
      FROM vaults
      WHERE id = $1
      LIMIT 1`,
@@ -430,6 +435,7 @@ async function resolveDedupMatch(
   const subjectMatchColumn = isVaultEncryptionActive(vault) ? 'm.subject_hmac' : 'm.subject';
   const subjectMatches = await db.query<(MemoryRow & { similarity: number })>(
     `SELECT m.id, m.data, m.confidence, m.score, m.salience, m.type, m.polarity, m.status, m.volatility,
+            v.account_id::text AS account_id,
             v.encrypted_dek, v.vault_encryption_enabled,
             1 - (m.embedding <=> $3::vector) AS similarity
      FROM memories AS m
@@ -452,8 +458,9 @@ async function resolveDedupMatch(
   };
 }
 
-function getVaultContext(row: MemoryRow, vaultId: string): VaultEncryptionContext {
+function getVaultContext(row: MemoryRow, vaultId: string): DedupVaultContext {
   return {
+    account_id: row.account_id,
     id: vaultId,
     encrypted_dek: row.encrypted_dek,
     vault_encryption_enabled: row.vault_encryption_enabled
@@ -471,14 +478,14 @@ async function unwrapVaultDek(vault: VaultEncryptionContext): Promise<Buffer> {
 
 async function insertMemory(
   db: Queryable,
-  vault: VaultEncryptionContext,
+  vault: DedupVaultContext,
   input: DedupInput,
   hash: string,
   canonicalSubject: string
 ) {
   const storedFact = await encryptForVault(vault, input.fact);
   const encryptedSubject = await encryptSubjectForVault(vault, canonicalSubject);
-  return db.query<{ id: string }>(
+  const result = await db.query<{ id: string }>(
      `INSERT INTO memories (
        vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding,
        source_chunks, score, salience, sensitivity, type, scope, polarity, status, volatility, evidence, valid_from, valid_until, source_segment_id, source_timestamp
@@ -509,6 +516,8 @@ async function insertMemory(
       input.sourceTimestamp ?? null
     ]
   );
+  recordMemoryCountDelta(input.vaultId, vault.account_id, 1, 'extraction_worker');
+  return result;
 }
 
 async function syncEmbeddingRecord(db: Queryable, memoryId: string, embedding: number[]) {

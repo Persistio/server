@@ -13,7 +13,7 @@ vi.mock('../db/client', () => ({
   }
 }));
 
-import { registerHealthRoutes } from './health';
+import { checkDatabase, registerHealthRoutes } from './health';
 
 describe('health route', () => {
   beforeEach(() => {
@@ -43,6 +43,7 @@ describe('health route', () => {
       curation_queue_depth: 1
     });
     expect(response.json()).not.toHaveProperty('queue_depth');
+    expect(poolQueryMock).toHaveBeenCalledTimes(2);
 
     await app.close();
   });
@@ -66,5 +67,51 @@ describe('health route', () => {
     expect(response.json()).not.toHaveProperty('queue_depth');
 
     await app.close();
+  });
+
+  it('keeps database health available when optional queue depths fail', async () => {
+    poolQueryMock
+      .mockResolvedValueOnce({ rows: [{ ok: 1 }] })
+      .mockRejectedValueOnce(new Error('queue telemetry unavailable'));
+
+    const app = await buildApp();
+    const response = await app.inject({ method: 'GET', url: '/health' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: 'ok',
+      db: 'ok',
+      extraction_queue_depth: null,
+      extraction_inflight_depth: null,
+      curation_queue_depth: null
+    });
+
+    await app.close();
+  });
+
+  it('keeps database health available when optional queue depths time out', async () => {
+    poolQueryMock
+      .mockResolvedValueOnce({ rows: [{ ok: 1 }] })
+      .mockReturnValueOnce(new Promise(() => undefined));
+
+    await expect(checkDatabase(1)).resolves.toMatchObject({
+      db: 'ok',
+      extraction_queue_depth: null,
+      extraction_inflight_depth: null,
+      curation_queue_depth: null
+    });
+  });
+
+  it('degrades database health when the connectivity check times out', async () => {
+    poolQueryMock
+      .mockReturnValueOnce(new Promise(() => undefined))
+      .mockResolvedValueOnce({ rows: [{ extraction_depth: 2, extraction_inflight_depth: 3, curation_depth: 1 }] });
+
+    await expect(checkDatabase(1)).resolves.toMatchObject({
+      db: 'degraded',
+      extraction_queue_depth: null,
+      extraction_inflight_depth: null,
+      curation_queue_depth: null
+    });
   });
 });

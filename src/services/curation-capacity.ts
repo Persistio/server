@@ -1,6 +1,11 @@
 import type { PoolClient, QueryResultRow } from 'pg';
 
 import { query, withTransaction } from '../db/client';
+import {
+  curatorRunCompletedEventType,
+  type CuratorRunCompletedPayload,
+  type PlatformActor
+} from '../events/platform-event';
 import { getCurrentUsagePeriod, writeUsagePeriodClosedEventIfNeeded } from './usage';
 
 export interface CuratorPlanLimits {
@@ -363,6 +368,66 @@ export async function recordCuratorUsage(input: {
            updated_at = now()`,
       [input.vaultId, input.limits.curator_schedule_interval_minutes]
     );
+  }
+}
+
+export async function recordCuratorRunCompletedActivity(input: {
+  vaultId: string;
+  totalCandidatesProcessed: number;
+  totalCuratorRequests: number;
+  totalCuratorRuns: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+}): Promise<boolean> {
+  if (input.totalCuratorRequests <= 0 && input.totalCandidatesProcessed <= 0 && input.totalCuratorRuns <= 0) {
+    return false;
+  }
+
+  try {
+    const vaultResult = await query<{ account_id: string | null }>(
+      `SELECT account_id::text AS account_id
+       FROM vaults
+       WHERE id = $1
+       LIMIT 1`,
+      [input.vaultId]
+    );
+    const accountId = vaultResult.rows[0]?.account_id ?? null;
+    if (!accountId) return false;
+
+    const actor: PlatformActor = { id: null, type: 'worker' };
+    const payload: CuratorRunCompletedPayload = {
+      actor,
+      candidates_processed: input.totalCandidatesProcessed,
+      counts: {
+        candidates_processed: input.totalCandidatesProcessed,
+        curator_requests: input.totalCuratorRequests,
+        curator_runs: input.totalCuratorRuns
+      },
+      curator_input_tokens: input.totalPromptTokens,
+      curator_output_tokens: input.totalCompletionTokens,
+      curator_requests: input.totalCuratorRequests,
+      platform_vault_id: input.vaultId,
+      sensitivity: 'metadata_only',
+      summary: 'Curator run complete',
+      vault_id: input.vaultId,
+      workspace_id: accountId
+    };
+    await query(
+      `INSERT INTO platform_event_outbox (
+         event_id, event_type, schema_version, occurred_at, subject, payload
+       )
+       VALUES (gen_random_uuid(), $1, 1, now(), $2, $3::jsonb)`,
+      [curatorRunCompletedEventType, `vault:${input.vaultId}`, JSON.stringify(payload)]
+    );
+    return true;
+  } catch (error) {
+    console.warn(JSON.stringify({
+      err: error instanceof Error ? error.message : String(error),
+      event_type: curatorRunCompletedEventType,
+      msg: 'failed to write curator activity event outbox row',
+      vault_id: input.vaultId
+    }));
+    return false;
   }
 }
 

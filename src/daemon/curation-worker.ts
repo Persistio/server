@@ -17,12 +17,14 @@ import { getEmbedder } from '../services/embedder';
 import { CuratorService, type CuratorAliasMaps, type CuratorMemory, type CuratorResult, type EdgeType, type MemoryType } from '../services/curator';
 import { getSpanAttributes } from '../telemetry';
 import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram } from '../metrics';
-import { AiBudgetDeferredError } from '../services/usage';
+import { AiBudgetDeferredError, recordMemoryCountDelta } from '../services/usage';
+import { initCustomerMetrics, shutdownCustomerMetrics } from '../services/customer-metrics';
 import {
   claimEligibleCurationJobs,
   getCuratorPlanBlockReason,
   getCuratorLimits,
   recordCuratorDeferral,
+  recordCuratorRunCompletedActivity,
   recordCuratorUsage,
   releaseCuratorClaim,
   type CuratorPlanLimits
@@ -36,6 +38,7 @@ interface CurationQueueRow {
 }
 
 interface VaultRow extends VaultEncryptionContext {
+  account_id: string | null;
   plan_id: string;
   type: 'general' | 'custom' | null;
   custom_extraction_prompt: string | null;
@@ -77,12 +80,71 @@ interface LoadedCurationJob {
   deferredCandidates: number;
 }
 
+interface WorkerShutdownRequest {
+  type: 'shutdown';
+}
+
+interface CuratorRunActivityTotals {
+  totalCandidatesProcessed: number;
+  totalCompletionTokens: number;
+  totalCuratorRequests: number;
+  totalCuratorRuns: number;
+  totalPromptTokens: number;
+}
+
 const config = getConfig();
 const curator = new CuratorService();
 const embedder = getEmbedder();
 const workerId = crypto.randomUUID();
 const MAX_CURATION_RETRIES = Number(process.env.MAX_CURATION_RETRIES ?? 5);
 const AUTO_PROMOTE_DUPLICATE_SIMILARITY = 0.90;
+const RELEVANT_ACTIVE_MEMORY_MIN_SIMILARITY = 0.72;
+const activeWorkerTasks = new Set<Promise<unknown>>();
+let isShuttingDown = false;
+let resolveWorkerSleep: (() => void) | null = null;
+let shutdownPromise: Promise<void> | null = null;
+
+function trackWorkerTask<T>(task: Promise<T>): Promise<T> {
+  const tracked = task.finally(() => {
+    activeWorkerTasks.delete(tracked);
+  });
+  activeWorkerTasks.add(tracked);
+  return tracked;
+}
+
+function sleepUntilNextBatch(ms: number): Promise<void> {
+  if (isShuttingDown) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolveWorkerSleep = null;
+      resolve();
+    }, ms);
+    resolveWorkerSleep = () => {
+      clearTimeout(timeout);
+      resolveWorkerSleep = null;
+      resolve();
+    };
+  });
+}
+
+async function shutdownWorker() {
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      isShuttingDown = true;
+      resolveWorkerSleep?.();
+      await Promise.allSettled(Array.from(activeWorkerTasks));
+      await shutdownCustomerMetrics();
+      await closePool();
+      if (parentPort) {
+        parentPort.postMessage({ type: 'shutdown-complete' });
+        parentPort.close();
+      }
+    })();
+  }
+
+  await shutdownPromise;
+}
 
 async function processBatch() {
   await query(
@@ -102,6 +164,7 @@ async function processBatch() {
   const claimedVaults = new Set(claimed.map((row) => row.vault_id));
   const remainingCandidatesByVault = new Map<string, number>();
   const runRecordedVaults = new Set<string>();
+  const runActivityTotalsByVault = new Map<string, CuratorRunActivityTotals>();
 
   for (const row of claimed) {
     try {
@@ -203,6 +266,13 @@ async function processBatch() {
       } else {
         await query(`DELETE FROM curation_queue WHERE id = $1`, [job.queueId]);
       }
+      addCuratorRunActivityTotals(runActivityTotalsByVault, job.vault.id, {
+        totalCandidatesProcessed: job.candidates.length,
+        totalCompletionTokens: usage?.completionTokens ?? 0,
+        totalCuratorRequests: 1,
+        totalCuratorRuns: countRun ? 1 : 0,
+        totalPromptTokens: usage?.promptTokens ?? 0
+      });
     } catch (error) {
       if (error instanceof AiBudgetDeferredError) {
         aiBudgetWaitHistogram.record(error.waitMs, { role: error.role, queue: 'curation', vault_id: row.vault_id });
@@ -266,9 +336,38 @@ async function processBatch() {
     }
   }
 
+  for (const [vaultId, totals] of runActivityTotalsByVault) {
+    await recordCuratorRunCompletedActivity({
+      vaultId,
+      ...totals
+    });
+  }
+
   for (const vaultId of claimedVaults) {
     await releaseCuratorClaim(vaultId, workerId);
   }
+}
+
+function addCuratorRunActivityTotals(
+  totalsByVault: Map<string, CuratorRunActivityTotals>,
+  vaultId: string,
+  delta: CuratorRunActivityTotals
+): void {
+  const current = totalsByVault.get(vaultId) ?? {
+    totalCandidatesProcessed: 0,
+    totalCompletionTokens: 0,
+    totalCuratorRequests: 0,
+    totalCuratorRuns: 0,
+    totalPromptTokens: 0
+  };
+
+  totalsByVault.set(vaultId, {
+    totalCandidatesProcessed: current.totalCandidatesProcessed + delta.totalCandidatesProcessed,
+    totalCompletionTokens: current.totalCompletionTokens + delta.totalCompletionTokens,
+    totalCuratorRequests: current.totalCuratorRequests + delta.totalCuratorRequests,
+    totalCuratorRuns: current.totalCuratorRuns + delta.totalCuratorRuns,
+    totalPromptTokens: current.totalPromptTokens + delta.totalPromptTokens
+  });
 }
 
 function getNextCapacityAvailableAt(limits: CuratorPlanLimits): Date {
@@ -328,7 +427,7 @@ async function decryptVaultPromptContext(vault: VaultRow): Promise<VaultPromptCo
 
 async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candidateLimit: number): Promise<LoadedCurationJob> {
   const vaultResult = await query<VaultRow>(
-    `SELECT id, encrypted_dek, vault_encryption_enabled, plan_id,
+    `SELECT id, account_id::text AS account_id, encrypted_dek, vault_encryption_enabled, plan_id,
             type, custom_extraction_prompt, custom_curation_prompt
      FROM vaults
      WHERE id = $1
@@ -375,9 +474,11 @@ async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candida
   const candidates = await Promise.all(candidateRows.rows.slice(0, candidateLimit).map((memory) => decryptMemory(vault, memory)));
   const totalCandidates = candidateRows.rows[0]?.total_candidates ? Number(candidateRows.rows[0].total_candidates) : candidates.length;
   const candidateIds = new Set(candidates.map((memory) => memory.id));
-  const subjects = Array.from(new Set(candidates.map((memory) => memory.subject)));
-  const activeMemories = (await loadActiveMemoriesForSubjects(vault, subjects))
-    .slice(0, Math.max(0, limits.curator_active_memories_per_call));
+  const activeMemories = await loadRelevantActiveMemories(
+    vault,
+    candidates,
+    Math.max(0, limits.curator_active_memories_per_call)
+  );
 
   return {
     queueId: row.queue_id,
@@ -393,32 +494,117 @@ async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candida
   };
 }
 
-async function loadActiveMemoriesForSubjects(vault: VaultRow, subjects: string[]): Promise<CuratorMemory[]> {
-  if (subjects.length === 0) {
+async function loadRelevantActiveMemories(
+  vault: VaultRow,
+  candidates: CuratorMemory[],
+  limit: number
+): Promise<CuratorMemory[]> {
+  if (candidates.length === 0 || limit <= 0) {
     return [];
   }
 
+  const subjects = Array.from(new Set(candidates.map((memory) => memory.subject)));
   const plaintextSubjects = isVaultEncryptionActive(vault) ? [] : subjects;
   const subjectHmacs = isVaultEncryptionActive(vault)
     ? (await Promise.all(subjects.map(async (subject) => (await encryptSubjectForVault(vault, subject))?.hmac ?? null)))
         .filter((value): value is string => Boolean(value))
     : [];
+  const candidateIds = candidates.map((candidate) => candidate.id);
+  const semanticLimitPerCandidate = Math.max(1, Math.min(5, limit));
 
   const result = await query<MemoryRow>(
-    `SELECT id, vault_id, data, subject, subject_encrypted, subject_hmac, confidence, salience, sensitivity, type,
-            scope, polarity, volatility, evidence, parent_id, source_chunks, archived_at, status
-     FROM memories
-     WHERE vault_id = $1
-       AND archived_at IS NULL
-       AND status = 'active'
-       AND (
-         subject = ANY($2::text[])
-         OR subject_hmac = ANY($3::text[])
-       )
-     ORDER BY updated_at DESC, created_at DESC`,
-    [vault.id, plaintextSubjects, subjectHmacs]
+    `WITH candidate_context AS (
+       SELECT candidate.id,
+              candidate.subject,
+              candidate.subject_hmac,
+              candidate_embedding.embedding
+       FROM memories candidate
+       LEFT JOIN memory_embeddings candidate_embedding
+         ON candidate_embedding.memory_id = candidate.id
+       WHERE candidate.vault_id = $1
+         AND candidate.id = ANY($2::uuid[])
+         AND candidate.archived_at IS NULL
+         AND candidate.status = 'candidate'
+     ),
+     exact_matches AS (
+       SELECT active.id, active.vault_id, active.data, active.subject, active.subject_encrypted,
+              active.subject_hmac, active.confidence, active.salience, active.sensitivity, active.type,
+              active.scope, active.polarity, active.volatility, active.evidence, active.parent_id,
+              active.source_chunks, active.archived_at, active.status, active.updated_at,
+              1 AS exact_subject_rank,
+              NULL::double precision AS similarity
+       FROM memories active
+       WHERE active.vault_id = $1
+         AND active.archived_at IS NULL
+         AND active.status = 'active'
+         AND (
+           active.subject = ANY($3::text[])
+           OR active.subject_hmac = ANY($4::text[])
+         )
+       ORDER BY active.updated_at DESC, active.created_at DESC
+       LIMIT $6
+     ),
+     semantic_matches AS (
+       SELECT nearest.id, nearest.vault_id, nearest.data, nearest.subject, nearest.subject_encrypted,
+              nearest.subject_hmac, nearest.confidence, nearest.salience, nearest.sensitivity, nearest.type,
+              nearest.scope, nearest.polarity, nearest.volatility, nearest.evidence, nearest.parent_id,
+              nearest.source_chunks, nearest.archived_at, nearest.status, nearest.updated_at,
+              0 AS exact_subject_rank,
+              1 - (nearest.embedding <=> candidate_context.embedding) AS similarity
+       FROM candidate_context
+       CROSS JOIN LATERAL (
+         SELECT active.id, active.vault_id, active.data, active.subject, active.subject_encrypted,
+                active.subject_hmac, active.confidence, active.salience, active.sensitivity, active.type,
+                active.scope, active.polarity, active.volatility, active.evidence, active.parent_id,
+                active.source_chunks, active.archived_at, active.status, active.updated_at,
+                active_embedding.embedding
+         FROM memory_embeddings active_embedding
+         JOIN memories active
+           ON active.id = active_embedding.memory_id
+         WHERE candidate_context.embedding IS NOT NULL
+           AND active.vault_id = $1
+           AND active.archived_at IS NULL
+           AND active.status = 'active'
+         ORDER BY active_embedding.embedding <=> candidate_context.embedding
+         LIMIT $7
+       ) nearest
+       WHERE candidate_context.embedding IS NOT NULL
+         AND 1 - (nearest.embedding <=> candidate_context.embedding) >= $5
+     ),
+     ranked AS (
+       SELECT DISTINCT ON (matches.id)
+              matches.id, matches.vault_id, matches.data, matches.subject, matches.subject_encrypted,
+              matches.subject_hmac, matches.confidence, matches.salience, matches.sensitivity, matches.type,
+              matches.scope, matches.polarity, matches.volatility, matches.evidence, matches.parent_id,
+              matches.source_chunks, matches.archived_at, matches.status, matches.updated_at,
+              matches.exact_subject_rank, matches.similarity
+       FROM (
+         SELECT * FROM exact_matches
+         UNION ALL
+         SELECT * FROM semantic_matches
+       ) matches
+       ORDER BY matches.id,
+                matches.exact_subject_rank DESC,
+                matches.similarity DESC NULLS LAST,
+                matches.updated_at DESC
+     )
+     SELECT id, vault_id, data, subject, subject_encrypted, subject_hmac, confidence, salience,
+            sensitivity, type, scope, polarity, volatility, evidence, parent_id, source_chunks,
+            archived_at, status
+     FROM ranked
+     ORDER BY exact_subject_rank DESC, similarity DESC NULLS LAST, updated_at DESC
+     LIMIT $8`,
+    [
+      vault.id,
+      candidateIds,
+      plaintextSubjects,
+      subjectHmacs,
+      RELEVANT_ACTIVE_MEMORY_MIN_SIMILARITY,
+      limit,
+      semanticLimitPerCandidate,
+      limit
+    ]
   );
-
   return Promise.all(result.rows.map((memory) => decryptMemory(vault, memory)));
 }
 
@@ -464,6 +650,7 @@ async function applyActions(
   }
 
   const touchedCandidates = new Set<string>();
+  let memoryCountDelta = 0;
 
   await withTransaction(async (client) => {
     for (const action of actions.nodes_to_create) {
@@ -482,6 +669,7 @@ async function applyActions(
           parentId: action.parent_subject ? knownSubjectIds.get(action.parent_subject) ?? null : null,
           sourceSegmentId: job.segmentId
         });
+        memoryCountDelta += 1;
         knownSubjectIds.set(action.subject, inserted.id);
         knownById.set(inserted.id, {
           id: inserted.id,
@@ -507,6 +695,16 @@ async function applyActions(
           newValue: action.statement,
           rawResponse,
           applied: true
+        });
+        memoryCountDelta -= await archiveConsumedCandidates(client, {
+          job,
+          knownById,
+          aliasMaps,
+          touchedCandidates,
+          consumedAliases: action.consumed_candidate_ids,
+          targetMemoryId: inserted.id,
+          rawResponse,
+          reason: `absorbed into curator-created memory ${inserted.id}`
         });
       } catch (error) {
         await insertActionLog(client, {
@@ -582,6 +780,16 @@ async function applyActions(
           rawResponse,
           applied: true
         });
+        memoryCountDelta -= await archiveConsumedCandidates(client, {
+          job,
+          knownById,
+          aliasMaps,
+          touchedCandidates,
+          consumedAliases: action.consumed_candidate_ids,
+          targetMemoryId: resolvedId,
+          rawResponse,
+          reason: `absorbed into curator-updated memory ${resolvedId}`
+        });
       } catch (error) {
         await insertActionLog(client, {
           vaultId: job.vault.id,
@@ -654,7 +862,10 @@ async function applyActions(
       }
 
       try {
-        await archiveMemory(client, resolvedId, job.vault.id);
+        const archived = await archiveMemory(client, resolvedId, job.vault.id);
+        if (archived) {
+          memoryCountDelta -= 1;
+        }
         if (job.candidateIds.has(resolvedId)) {
           touchedCandidates.add(resolvedId);
         }
@@ -705,7 +916,10 @@ async function applyActions(
       }
 
       try {
-        await archiveMemory(client, resolvedId, job.vault.id);
+        const archived = await archiveMemory(client, resolvedId, job.vault.id);
+        if (archived) {
+          memoryCountDelta -= 1;
+        }
         touchedCandidates.add(resolvedId);
         await insertActionLog(client, {
           vaultId: job.vault.id,
@@ -737,6 +951,7 @@ async function applyActions(
     }
 
     const duplicateResult = await archiveDuplicatePromotionCandidates(client, job, Array.from(touchedCandidates));
+    memoryCountDelta -= duplicateResult.length;
     for (const duplicate of duplicateResult) {
       touchedCandidates.add(duplicate.candidate_id);
       const memory = knownById.get(duplicate.candidate_id);
@@ -785,6 +1000,116 @@ async function applyActions(
       });
     }
   });
+
+  recordMemoryCountDelta(job.vault.id, job.vault.account_id, memoryCountDelta, 'curation_worker');
+}
+
+async function archiveConsumedCandidates(
+  client: PoolClient,
+  input: {
+    job: LoadedCurationJob;
+    knownById: Map<string, CuratorMemory>;
+    aliasMaps: CuratorAliasMaps;
+    touchedCandidates: Set<string>;
+    consumedAliases: string[] | undefined;
+    targetMemoryId: string;
+    rawResponse: unknown;
+    reason: string;
+  }
+): Promise<number> {
+  const consumedCandidateIds = resolveCandidateAliases(input.consumedAliases, input.aliasMaps, input.job.candidateIds);
+  const candidatesToArchive = consumedCandidateIds.filter((candidateId) =>
+    candidateId !== input.targetMemoryId && !input.touchedCandidates.has(candidateId)
+  );
+  let archivedCount = 0;
+
+  if (candidatesToArchive.length > 0) {
+    await mergeCandidateSourceChunksIntoTarget(
+      client,
+      input.job.vault.id,
+      input.targetMemoryId,
+      candidatesToArchive
+    );
+  }
+
+  for (const candidateId of consumedCandidateIds) {
+    if (candidateId === input.targetMemoryId) {
+      input.touchedCandidates.add(candidateId);
+      continue;
+    }
+    if (input.touchedCandidates.has(candidateId)) {
+      continue;
+    }
+
+    const memory = input.knownById.get(candidateId);
+    const archived = await archiveMemory(client, candidateId, input.job.vault.id);
+    if (archived) {
+      archivedCount += 1;
+    }
+    input.touchedCandidates.add(candidateId);
+    await insertActionLog(client, {
+      vaultId: input.job.vault.id,
+      vault: input.job.vault,
+      segmentId: input.job.segmentId,
+      actionType: 'archive_duplicate',
+      memoryId: candidateId,
+      newMemoryId: input.targetMemoryId,
+      subject: memory?.subject,
+      oldValue: memory?.data,
+      newValue: input.reason,
+      rawResponse: input.rawResponse,
+      applied: true
+    });
+  }
+
+  return archivedCount;
+}
+
+async function mergeCandidateSourceChunksIntoTarget(
+  client: PoolClient,
+  vaultId: string,
+  targetMemoryId: string,
+  candidateIds: string[]
+): Promise<void> {
+  await client.query(
+    `UPDATE memories target
+     SET source_chunks = (
+           SELECT COALESCE(array_agg(DISTINCT chunk_id), target.source_chunks)
+           FROM unnest(array_cat(
+             COALESCE(target.source_chunks, '{}'::uuid[]),
+             COALESCE((
+               SELECT array_agg(DISTINCT candidate_chunk_id)
+               FROM memories candidate,
+                    unnest(candidate.source_chunks) AS candidate_chunk(candidate_chunk_id)
+               WHERE candidate.vault_id = $1
+                 AND candidate.id = ANY($3::uuid[])
+             ), '{}'::uuid[])
+           )) AS merged_chunk(chunk_id)
+         ),
+         updated_at = now()
+     WHERE target.vault_id = $1
+       AND target.id = $2`,
+    [vaultId, targetMemoryId, candidateIds]
+  );
+}
+
+function resolveCandidateAliases(
+  aliases: string[] | undefined,
+  aliasMaps: CuratorAliasMaps,
+  candidateIds: Set<string>
+): string[] {
+  if (!aliases?.length) {
+    return [];
+  }
+
+  const resolved = new Set<string>();
+  for (const alias of aliases) {
+    const id = resolveAlias(alias, aliasMaps);
+    if (candidateIds.has(id)) {
+      resolved.add(id);
+    }
+  }
+  return Array.from(resolved);
 }
 
 async function archiveDuplicatePromotionCandidates(
@@ -896,7 +1221,7 @@ async function insertActiveMemory(
     sourceSegmentId: string;
   }
 ): Promise<{ id: string }> {
-  const embedding = await embedder.embed(input.fact, { vaultId: vault.id, modelRole: 'embedding', inputType: 'document' });
+  const embedding = await embedder.embed(input.fact, { vaultId: vault.id, modelRole: 'embedding', source: 'curation_worker', inputType: 'document' });
   const storedFact = await encryptForVault(vault, input.fact);
   const encryptedSubject = await encryptSubjectForVault(vault, input.subject);
   const result = await client.query<{ id: string }>(
@@ -948,7 +1273,7 @@ async function updateMemoryNode(
     parentId: string | null;
   }
 ) {
-  const embedding = await embedder.embed(input.fact, { vaultId: vault.id, modelRole: 'embedding', inputType: 'document' });
+  const embedding = await embedder.embed(input.fact, { vaultId: vault.id, modelRole: 'embedding', source: 'curation_worker', inputType: 'document' });
   const storedFact = await encryptForVault(vault, input.fact);
   const encryptedSubject = await encryptSubjectForVault(vault, input.subject);
   await client.query(
@@ -1030,15 +1355,18 @@ async function insertEdge(
   }
 }
 
-async function archiveMemory(client: PoolClient, memoryId: string, vaultId: string): Promise<void> {
-  await client.query(
+async function archiveMemory(client: PoolClient, memoryId: string, vaultId: string): Promise<boolean> {
+  const result = await client.query<{ id: string }>(
     `UPDATE memories
      SET archived_at = now(),
          updated_at = now()
      WHERE id = $1
-       AND vault_id = $2`,
+       AND vault_id = $2
+       AND archived_at IS NULL
+     RETURNING id`,
     [memoryId, vaultId]
   );
+  return (result.rowCount ?? 0) > 0;
 }
 
 async function insertActionLog(
@@ -1097,24 +1425,31 @@ async function runLoop() {
   if (config.ENCRYPTION_ENABLED) {
     await initCryptoClient();
   }
+  await initCustomerMetrics(config);
 
-  while (true) {
+  while (!isShuttingDown) {
     try {
-      await processBatch();
+      await trackWorkerTask(processBatch());
     } catch (error) {
-      console.error('Curation loop iteration failed', error);
+      if (!isShuttingDown) {
+        console.error('Curation loop iteration failed', error);
+      }
     }
 
-    await new Promise((resolve) => setTimeout(resolve, config.CURATION_INTERVAL_MS));
+    await sleepUntilNextBatch(config.CURATION_INTERVAL_MS);
   }
 }
 
 if (parentPort) {
-  parentPort.on('message', () => {});
+  parentPort.on('message', (message: WorkerShutdownRequest) => {
+    if (message.type === 'shutdown') {
+      void shutdownWorker();
+    }
+  });
 }
 
 void runLoop().catch(async (error) => {
   console.error(getSpanAttributes({ error }), 'Curation worker terminated');
-  await closePool();
+  await shutdownWorker();
   process.exit(1);
 });

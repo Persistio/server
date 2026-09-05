@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Persistio API
-  version: 0.1.18
+  version: 0.1.19
   description: Self-hosted memory service for AI agents.
 servers:
   - url: http://localhost:4827
@@ -58,7 +58,7 @@ paths:
                     description: Process uptime in whole seconds.
               example:
                 status: ok
-                version: 0.1.18
+                version: 0.1.19
                 db: ok
                 db_latency_ms: 12
                 extraction_queue_depth: 2
@@ -89,7 +89,7 @@ paths:
                     type: integer
               example:
                 status: degraded
-                version: 0.1.18
+                version: 0.1.19
                 db: degraded
                 db_latency_ms: 2001
                 extraction_queue_depth: null

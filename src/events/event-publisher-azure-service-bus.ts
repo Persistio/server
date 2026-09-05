@@ -27,11 +27,11 @@ export class AzureServiceBusEventPublisher implements EventPublisher {
     await this.sender.sendMessages({
       body: event,
       contentType: 'application/json',
-      messageId: event.event_id,
-      subject: event.event_type,
+      messageId: event.id,
+      subject: event.type,
       applicationProperties: {
-        event_type: event.event_type,
-        schema_version: event.schema_version,
+        event_type: event.type,
+        specversion: event.specversion,
         subject: event.subject
       }
     });

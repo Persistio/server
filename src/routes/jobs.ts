@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import { query } from '../db/client';
-import { requireVaultAuth } from '../middleware/auth';
+import { requireVaultReadAuth, requireVaultWriteAuth } from '../middleware/auth';
 
 export interface JobRecord {
   id: string;
@@ -20,13 +20,13 @@ export interface JobStore {
 }
 
 export async function registerJobRoutes(app: FastifyInstance, jobs: JobStore, triggerExtraction: (jobId: string, vaultId?: string) => void) {
-  app.post('/v1/extract', { preHandler: requireVaultAuth }, async (request, reply) => {
+  app.post('/v1/extract', { preHandler: requireVaultWriteAuth }, async (request, reply) => {
     const job = jobs.create(request.vault.id);
     triggerExtraction(job.id, request.vault.id);
     return reply.code(202).send({ job_id: job.id });
   });
 
-  app.get('/v1/jobs/:id', { preHandler: requireVaultAuth }, async (request, reply) => {
+  app.get('/v1/jobs/:id', { preHandler: requireVaultReadAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const job = jobs.get(params.id);
 

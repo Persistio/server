@@ -50,9 +50,31 @@ export function createPgvectorVerifyHook(
 
 export const pool = new Pool({
   connectionString: config.DATABASE_URL,
+  connectionTimeoutMillis: config.DB_POOL_CONNECTION_TIMEOUT_MS,
   max: getConfiguredPoolMax(config),
   verify: createPgvectorVerifyHook()
 } as PoolConfigWithVerify);
+
+export function createPoolErrorHandler(
+  poolState: Pick<Pool, 'totalCount' | 'idleCount' | 'waitingCount'>,
+  log: (message: string) => void = console.error
+): (error: Error) => void {
+  return (error) => {
+    const code = (error as Error & { code?: unknown }).code;
+    log(JSON.stringify({
+      level: 50,
+      msg: 'postgres idle connection failed; removed from pool',
+      error: error.message,
+      stack: error.stack,
+      code: typeof code === 'string' ? code : undefined,
+      total: poolState.totalCount,
+      idle: poolState.idleCount,
+      waiting: poolState.waitingCount
+    }));
+  };
+}
+
+pool.on('error', createPoolErrorHandler(pool));
 
 export async function query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]) {
   warnIfPoolNearExhaustion();
@@ -146,6 +168,10 @@ export async function closePool() {
 
 export function getConfiguredPoolMax(appConfig = config): number {
   return appConfig.DB_POOL_MAX;
+}
+
+export function getConfiguredPoolConnectionTimeout(appConfig = config): number {
+  return appConfig.DB_POOL_CONNECTION_TIMEOUT_MS;
 }
 
 export async function validateStorageEmbeddingDimensions(

@@ -6,6 +6,7 @@ import { EventOutboxDispatcher, calculateRetryDelayMs } from './event-outbox-dis
 function createClient(rows: unknown[]) {
   const query = vi.fn()
     .mockResolvedValueOnce({ rowCount: 1, rows: [{ locked: true }] })
+    .mockResolvedValueOnce({ rowCount: 1, rows: [{ depth: String(rows.length), oldest_pending_age_ms: rows.length ? '3000' : null }] })
     .mockResolvedValueOnce({ rowCount: rows.length, rows })
     .mockResolvedValue({ rowCount: 1, rows: [] });
 
@@ -26,6 +27,7 @@ function outboxRow(overrides: Record<string, unknown> = {}) {
     id: 'row-1',
     occurred_at: new Date('2026-06-01T00:00:03.000Z'),
     payload: {
+      account_id: 'workspace-1',
       period: '2026-05',
       platform_vault_id: 'vault-1',
       plan_id: 'unlimited',
@@ -39,8 +41,11 @@ function outboxRow(overrides: Record<string, unknown> = {}) {
 }
 
 function createDispatcher(input: {
+  logger?: ConstructorParameters<typeof EventOutboxDispatcher>[0]['logger'];
   publisher: EventPublisher;
   rows: unknown[];
+  warnDepthThreshold?: number;
+  warnOldestAgeMs?: number;
 }) {
   const { client, connect } = createClient(input.rows);
   connect.mockResolvedValue(client);
@@ -49,8 +54,12 @@ function createDispatcher(input: {
     intervalMs: 10000,
     maxAttempts: 5,
     maxRetryDelayMs: 300000,
+    logger: input.logger,
     publisher: input.publisher,
-    retryBaseDelayMs: 1000
+    publisherName: 'webhook',
+    retryBaseDelayMs: 1000,
+    warnDepthThreshold: input.warnDepthThreshold,
+    warnOldestAgeMs: input.warnOldestAgeMs
   });
 
   return { client, connect, dispatcher };
@@ -68,17 +77,26 @@ describe('EventOutboxDispatcher', () => {
       dead: 0,
       delivered: 1,
       failed: 0,
+      oldestPendingAgeMs: 3000,
+      outboxDepth: 1,
       selected: 1,
       skipped: false
     });
 
     expect(publish).toHaveBeenCalledWith({
-      event_id: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
-      event_type: 'vault.usage_period.closed',
-      schema_version: 1,
-      occurred_at: '2026-06-01T00:00:03.000Z',
-      subject: 'vault:vault-1',
-      payload: expect.objectContaining({ period: '2026-05' })
+      category: 'usage',
+      data: expect.objectContaining({ period: '2026-05' }),
+      datacontenttype: 'application/json',
+      dataschema: 'https://schemas.persistio.io/events/io.persistio.usage_period.closed.v1.json',
+      id: '5a3b3e77-cbd8-48f3-98fd-095f8fcb6070',
+      severity: 'info',
+      source: 'io.persistio.platform',
+      specversion: '1.0',
+      subject: 'vault/vault-1',
+      time: '2026-06-01T00:00:03.000Z',
+      type: 'io.persistio.usage_period.closed.v1',
+      vaultid: 'vault-1',
+      workspaceid: 'workspace-1'
     });
     expect(client.query).toHaveBeenCalledWith(
       expect.stringContaining("SET status = 'delivered'"),
@@ -99,6 +117,7 @@ describe('EventOutboxDispatcher', () => {
       dead: 0,
       delivered: 0,
       failed: 1,
+      outboxDepth: 1,
       selected: 1
     });
 
@@ -119,6 +138,7 @@ describe('EventOutboxDispatcher', () => {
       dead: 1,
       delivered: 0,
       failed: 0,
+      outboxDepth: 1,
       selected: 1
     });
 
@@ -141,6 +161,8 @@ describe('EventOutboxDispatcher', () => {
     const first = dispatcher.dispatchDueEvents();
     await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
     await expect(dispatcher.dispatchDueEvents()).resolves.toMatchObject({
+      oldestPendingAgeMs: null,
+      outboxDepth: 0,
       skipped: true,
       selected: 0
     });
@@ -194,6 +216,7 @@ describe('EventOutboxDispatcher', () => {
     await expect(dispatcher.dispatchDueEvents()).rejects.toThrow('pool exhausted');
     await expect(dispatcher.dispatchDueEvents()).resolves.toMatchObject({
       delivered: 1,
+      outboxDepth: 1,
       skipped: false
     });
     expect(publish).toHaveBeenCalledOnce();
@@ -222,6 +245,52 @@ describe('EventOutboxDispatcher', () => {
 
     expect(client.query).not.toHaveBeenCalledWith('SELECT pg_advisory_unlock($1)', [4827166]);
     expect(client.release).toHaveBeenCalledOnce();
+  });
+
+  it('logs event outbox depth and dispatch cycle outcomes', async () => {
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn()
+    };
+    const { dispatcher } = createDispatcher({
+      logger,
+      publisher: { publish: vi.fn().mockResolvedValue(undefined) },
+      rows: [outboxRow()]
+    });
+
+    await dispatcher.dispatchDueEvents();
+
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      delivered: 1,
+      failed: 0,
+      oldest_pending_age_ms: 3000,
+      outbox_depth: 1,
+      publisher: 'webhook',
+      selected: 1
+    }), 'Event outbox dispatch cycle completed');
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.anything(), 'Event outbox backlog above warning threshold');
+  });
+
+  it('warns when event outbox lag exceeds the configured threshold', async () => {
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn()
+    };
+    const { dispatcher } = createDispatcher({
+      logger,
+      publisher: { publish: vi.fn().mockResolvedValue(undefined) },
+      rows: [outboxRow()],
+      warnOldestAgeMs: 1000
+    });
+
+    await dispatcher.dispatchDueEvents();
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      oldest_pending_age_ms: 3000,
+      outbox_depth: 1,
+      warn_oldest_age_ms: 1000
+    }), 'Event outbox backlog above warning threshold');
+    expect(logger.info).not.toHaveBeenCalledWith(expect.anything(), 'Event outbox dispatch cycle completed');
   });
 
   it('caps exponential retry delay', () => {

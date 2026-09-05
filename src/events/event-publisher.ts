@@ -20,8 +20,8 @@ export class NoopEventPublisher implements EventPublisher {
 
   async publish(event: PlatformEvent<string>): Promise<void> {
     this.logger?.info?.({
-      event_id: event.event_id,
-      event_type: event.event_type,
+      event_id: event.id,
+      event_type: event.type,
       subject: event.subject
     }, 'No-op platform event publisher accepted event');
   }
@@ -65,8 +65,8 @@ export class WebhookEventPublisher implements EventPublisher {
         body,
         headers: {
           'Content-Type': 'application/json',
-          'X-Persistio-Event-Id': event.event_id,
-          'X-Persistio-Event-Type': event.event_type,
+          'X-Persistio-Event-Id': event.id,
+          'X-Persistio-Event-Type': event.type,
           'X-Persistio-Signature': signature
         },
         method: 'POST',
