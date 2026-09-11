@@ -67,6 +67,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
       usage: undefined,
       choices: [
         {
+          finish_reason: 'stop',
           message: {
             content: '["supersede_old","discard_new","merge"]'
           }
@@ -93,7 +94,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
   it('passes vaultId through multi-pair batch arbitration for quota attribution', async () => {
     createMock.mockResolvedValue({
       usage: undefined,
-      choices: [{ message: { content: '["merge","discard_new"]' } }]
+      choices: [{ finish_reason: 'stop', message: { content: '["merge","discard_new"]' } }]
     });
     const service = new ExtractorService();
 
@@ -105,11 +106,12 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
     expect(createMock).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to needs_review when the model returns malformed json', async () => {
+  it('fails without decisions when the model returns malformed json', async () => {
     createMock.mockResolvedValue({
       usage: undefined,
       choices: [
         {
+          finish_reason: 'stop',
           message: {
             content: 'not valid json'
           }
@@ -118,15 +120,50 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
     });
     const service = new ExtractorService();
 
-    const result = await service.arbitrateConflictsBatch([
+    await expect(service.arbitrateConflictsBatch([
       { id: 'pair-1', existingFact: 'A', newFact: 'B' },
       { id: 'pair-2', existingFact: 'C', newFact: 'D' }
-    ]);
+    ])).rejects.toThrow('Invalid batch conflict arbitration JSON');
+  });
 
-    expect(result).toEqual(new Map([
-      ['pair-1', 'needs_review'],
-      ['pair-2', 'needs_review']
-    ]));
+  it.each([
+    ['explanatory text', 'The answer is MERGE because they overlap.'],
+    ['unknown text', 'KEEP_BOTH'],
+    ['empty text', '']
+  ])('rejects %s instead of interpreting a substring or defaulting', async (_label, content) => {
+    createMock.mockResolvedValue({
+      usage: undefined,
+      choices: [{ finish_reason: 'stop', message: { content } }]
+    });
+
+    await expect(new ExtractorService().arbitrateConflict('A', 'B'))
+      .rejects.toThrow('Invalid conflict arbitration decision');
+  });
+
+  it.each([
+    ['omitted', '["merge"]'],
+    ['extra', '["merge","discard_new","needs_review"]'],
+    ['unknown', '["merge","keep_both"]']
+  ])('rejects %s batch decisions without returning a mutable fallback', async (_label, content) => {
+    createMock.mockResolvedValue({
+      usage: undefined,
+      choices: [{ finish_reason: 'stop', message: { content } }]
+    });
+
+    await expect(new ExtractorService().arbitrateConflictsBatch([
+      { id: 'pair-1', existingFact: 'A', newFact: 'B' },
+      { id: 'pair-2', existingFact: 'C', newFact: 'D' }
+    ])).rejects.toThrow('exactly one valid decision per pair');
+  });
+
+  it('rejects truncated arbitration before parsing any decision', async () => {
+    createMock.mockResolvedValue({
+      usage: undefined,
+      choices: [{ finish_reason: 'length', message: { content: 'MERGE' } }]
+    });
+
+    await expect(new ExtractorService().arbitrateConflict('A', 'B'))
+      .rejects.toThrow('did not complete cleanly');
   });
 
   it('creates separate extraction and escalation role clients with legacy fallbacks', async () => {
@@ -152,7 +189,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
         completion_tokens: 1,
         total_tokens: 21
       },
-      choices: [{ message: { content: 'USE_EXISTING' } }]
+      choices: [{ finish_reason: 'stop', message: { content: 'USE_EXISTING' } }]
     });
     const service = new ExtractorService();
 
@@ -174,6 +211,16 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
       completionTokens: 1,
       totalTokens: 21
     }));
+  });
+
+  it('rejects non-enum subject arbitration text', async () => {
+    createMock.mockResolvedValue({
+      usage: undefined,
+      choices: [{ finish_reason: 'stop', message: { content: 'Probably USE_EXISTING' } }]
+    });
+
+    await expect(new ExtractorService().arbitrateSubject('Persistio', 'Persistio API'))
+      .rejects.toThrow('Invalid subject arbitration decision');
   });
 });
 

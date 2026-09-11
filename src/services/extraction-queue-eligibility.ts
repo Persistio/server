@@ -1,4 +1,4 @@
-export const EXTRACTION_QUEUE_READY_PREDICATE = `eq.claimed_at IS NULL
+export const EXTRACTION_QUEUE_READY_PREDICATE = `(eq.claim_token IS NULL OR eq.lease_expires_at <= now())
            AND eq.available_at <= now()
            AND (
              (

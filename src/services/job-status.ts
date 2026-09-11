@@ -6,12 +6,12 @@ interface Queryable {
   query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<{ rowCount: number | null; rows: T[] }>;
 }
 
-export async function markPersistentJobRunning(jobId: string | null): Promise<void> {
+export async function markPersistentJobRunning(jobId: string | null, client: Queryable = { query }): Promise<void> {
   if (!jobId) {
     return;
   }
 
-  await query(
+  await client.query(
     `UPDATE jobs
      SET status = 'running', updated_at = now()
      WHERE id = $1

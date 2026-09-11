@@ -8,6 +8,22 @@ export const recallDurationHistogram = meter.createHistogram('persistio.recall.d
   unit: 'ms'
 });
 
+export const recallDeliveryCounter = meter.createCounter('persistio.recall.delivery_memories.total', {
+  description: 'Memories selected, returned, rendered, or dropped by recall delivery stage'
+});
+
+export const globalRuleDeliveryCounter = meter.createCounter('persistio.recall.global_rule_delivery.total', {
+  description: 'Global behavioral rules selected or rendered into a client context'
+});
+
+export const recallDeliveryMissingAckCounter = meter.createCounter('persistio.recall.delivery_ack_failure.total', {
+  description: 'Client delivery acknowledgements that failed validation or persistence'
+});
+
+export const memoryPolicyEventCounter = meter.createCounter('persistio.memory.policy_events.total', {
+  description: 'Security-relevant memory policy decisions and failures'
+});
+
 export const ingestChunksCounter = meter.createCounter('persistio.ingest.chunks.total', {
   description: 'Chunks ingested'
 });
@@ -73,11 +89,11 @@ meter.createObservableGauge('persistio.ai_budget.waiting_jobs', {
   const { rows } = await query<{ queue: string; depth: number }>(
     `SELECT 'extraction' AS queue, COUNT(*)::int AS depth
      FROM extraction_queue
-     WHERE claimed_at IS NULL AND available_at > now()
+     WHERE (claim_token IS NULL OR lease_expires_at <= now()) AND available_at > now()
      UNION ALL
      SELECT 'curation' AS queue, COUNT(*)::int AS depth
      FROM curation_queue
-     WHERE claimed_at IS NULL AND available_at > now()`
+     WHERE (claim_token IS NULL OR lease_expires_at <= now()) AND available_at > now()`
   );
   for (const row of rows) result.observe(row.depth, { queue: row.queue });
 });

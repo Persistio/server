@@ -1,5 +1,6 @@
 import { query } from '../db/client';
 import { getCurrentUsagePeriod } from './usage';
+import { memoryCapacityPredicateSql } from './memory-capacity';
 
 export interface VaultStats {
   vault_id: string;
@@ -12,6 +13,7 @@ export interface VaultStats {
     contradicted: number;
     superseded: number;
     archived: number;
+    capacity_used: number;
     limit: number | null;
   };
   entity_aliases: number;
@@ -46,6 +48,7 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
     ingest_events: string;
     memory_adds: string;
     searches: string;
+    memories_max: string | null;
     limits: {
       memories_max?: number;
       ingest_events_per_month?: number;
@@ -59,7 +62,8 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
        COALESCE(CASE WHEN vu.period = $2 THEN vu.ingest_events ELSE 0 END, 0)::text AS ingest_events,
        COALESCE(CASE WHEN vu.period = $2 THEN vu.memory_adds ELSE 0 END, 0)::text AS memory_adds,
        COALESCE(CASE WHEN vu.period = $2 THEN vu.searches ELSE 0 END, 0)::text AS searches,
-       p.limits
+       p.limits,
+       COALESCE(v.rate_limit_override->>'memories_max', p.limits->>'memories_max') AS memories_max
      FROM vaults AS v
      JOIN plans AS p
        ON p.id = v.plan_id
@@ -81,6 +85,7 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
     contradicted: string;
     superseded: string;
     archived: string;
+    capacity_used: string;
   }>(
     `SELECT
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'active')::text AS active,
@@ -88,8 +93,9 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'needs_review')::text AS needs_review,
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'contradicted')::text AS contradicted,
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'superseded')::text AS superseded,
-       COUNT(*) FILTER (WHERE archived_at IS NOT NULL)::text AS archived
-     FROM memories
+       COUNT(*) FILTER (WHERE archived_at IS NOT NULL)::text AS archived,
+       COUNT(*) FILTER (WHERE ${memoryCapacityPredicateSql('m')})::text AS capacity_used
+     FROM memories AS m
      WHERE vault_id = $1`,
     [vaultId]
   );
@@ -125,7 +131,8 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
       contradicted: Number(counts.contradicted),
       superseded: Number(counts.superseded),
       archived: Number(counts.archived),
-      limit: usage.limits.memories_max ?? null
+      capacity_used: Number(counts.capacity_used),
+      limit: usage.memories_max === null ? null : Number(usage.memories_max)
     },
     entity_aliases: Number(aliases.count),
     contradiction_scan: {

@@ -46,7 +46,7 @@ export type VaultUsagePeriodLimitField =
 
 export interface PlatformActor {
   id: string | null;
-  type: 'api_key' | 'system' | 'user' | 'worker';
+  type: 'api_key' | 'service' | 'system' | 'user' | 'worker';
 }
 
 export interface PlatformActivityCounts {

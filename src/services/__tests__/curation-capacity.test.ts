@@ -215,6 +215,31 @@ describe('curation capacity service', () => {
     );
   });
 
+  it('accounts a replayable curator action receipt exactly once', async () => {
+    queryMock
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ queue_id: 'queue-1' }] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    const input = {
+      vaultId: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
+      candidatesProcessed: 3,
+      countRun: false,
+      promptTokens: 100,
+      completionTokens: 25,
+      limits: mergeCuratorLimits('unlimited', null, null),
+      actionReceipt: { queueId: 'b3313205-c43a-48b7-b861-3679e9849928', actionKey: 'apply-actions' }
+    };
+
+    await expect(recordCuratorUsage(input)).resolves.toBe(true);
+    expect(String(queryMock.mock.calls[0][0])).toContain('AND accounted_at IS NULL');
+
+    queryMock.mockReset();
+    queryMock.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    await expect(recordCuratorUsage(input)).resolves.toBe(false);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+  });
+
   it('writes a closed-period event before curator usage rolls into a new period', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-06-01T00:00:03.000Z'));

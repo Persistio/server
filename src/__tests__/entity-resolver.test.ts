@@ -117,7 +117,7 @@ describe('getVaultSubjectList', () => {
         rowCount: 3
       } as never);
 
-    const subjects = await getVaultSubjectList('vault-1', 5, 5);
+    const subjects = await getVaultSubjectList('vault-1', 5, 5, 'project', 'project-1');
 
     expect(mockQuery).toHaveBeenNthCalledWith(
       1,
@@ -127,17 +127,19 @@ describe('getVaultSubjectList', () => {
     expect(mockQuery).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining('m.subject <>'),
-      ['vault-1', 5]
+      ['vault-1', 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'project', 'project-1']
     );
+    expect(String(mockQuery.mock.calls[1][0])).toContain('m.valid_from IS NULL');
+    expect(String(mockQuery.mock.calls[1][0])).toContain('m.valid_until IS NULL');
     expect(mockQuery).toHaveBeenNthCalledWith(
       4,
       expect.stringContaining('alias = ANY'),
-      ['vault-1', ['fantastic system', 'persistio']]
+      ['vault-1', ['fantastic system', 'persistio'], 'project', 'project-1']
     );
     expect(mockQuery).toHaveBeenNthCalledWith(
       5,
       expect.stringContaining('canonical = ANY'),
-      ['vault-1', ['fantastic-system', 'persistio']]
+      ['vault-1', ['fantastic-system', 'persistio'], 'project', 'project-1']
     );
     expect(subjects).toEqual([
       { canonical: 'fantastic-system', aliases: ['fantastic system'], embedding: [1, 0, 0] },
@@ -156,7 +158,7 @@ describe('getVaultSubjectList', () => {
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never)
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
 
-    await expect(getVaultSubjectList('vault-1', 5, 5)).resolves.toEqual([
+    await expect(getVaultSubjectList('vault-1', 5, 5, 'session', 'session-1')).resolves.toEqual([
       { canonical: 'fantastic system', aliases: [], embedding: null }
     ]);
   });
@@ -197,17 +199,19 @@ describe('getVaultSubjectList', () => {
         rowCount: 2
       } as never);
 
-    const subjects = await getVaultSubjectList('vault-1', 5, 5);
+    const subjects = await getVaultSubjectList('vault-1', 5, 5, 'task', 'task-1');
 
     expect(mockQuery).toHaveBeenNthCalledWith(
       3,
       expect.stringContaining('JOIN known_subjects'),
-      ['vault-1', ['hmac:fantastic-system', 'hmac:persistio'], ['fantastic-system', 'persistio'], 5]
+      ['vault-1', ['hmac:fantastic-system', 'hmac:persistio'], ['fantastic-system', 'persistio'], 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'task', 'task-1']
     );
+    expect(String(mockQuery.mock.calls[2][0])).toContain('m.valid_from IS NULL');
+    expect(String(mockQuery.mock.calls[2][0])).toContain('m.valid_until IS NULL');
     expect(mockQuery).toHaveBeenNthCalledWith(
       5,
       expect.stringContaining('alias = ANY'),
-      ['vault-1', ['fantastic-system', 'persistio']]
+      ['vault-1', ['fantastic-system', 'persistio'], 'task', 'task-1']
     );
     expect(subjects).toEqual([
       { canonical: 'fantastic-system', aliases: [], embedding: [1, 0, 0] },
@@ -251,12 +255,12 @@ describe('getVaultSubjectList', () => {
         rowCount: 2
       } as never);
 
-    const subjects = await getVaultSubjectList('vault-1', 5, 5);
+    const subjects = await getVaultSubjectList('vault-1', 5, 5, 'global', null);
 
     expect(mockQuery).toHaveBeenNthCalledWith(
       3,
       expect.stringContaining('JOIN known_subjects'),
-      ['vault-1', ['hmac:fantastic-system', 'hmac:old fantastic name'], ['fantastic-system', 'fantastic-system'], 5]
+      ['vault-1', ['hmac:fantastic-system', 'hmac:old fantastic name'], ['fantastic-system', 'fantastic-system'], 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'global', null]
     );
     expect(subjects).toEqual([
       { canonical: 'fantastic-system', aliases: ['old fantastic name'], embedding: [1, 0, 0] }
@@ -268,22 +272,28 @@ describe('entity alias storage', () => {
   it('normalises canonical embedding rows before storing them', async () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
 
-    await storeCanonicalEmbedding('vault-1', 'Fantastic System', [1, 2, 3]);
+    await storeCanonicalEmbedding('vault-1', 'Fantastic System', [1, 2, 3], 'project', 'project-1');
 
     expect(mockQuery).toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO entity_aliases'),
-      ['vault-1', 'fantastic system', '[1,2,3]']
+      ['vault-1', 'fantastic system', '[1,2,3]', 'project', 'project-1']
     );
   });
 
   it('stores resolved aliases without overwriting the canonical embedding', async () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
 
-    await storeSubjectAlias('vault-1', 'Fantastic System `wrangler.toml`', 'fantastic-system');
+    await storeSubjectAlias(
+      'vault-1',
+      'Fantastic System `wrangler.toml`',
+      'fantastic-system',
+      'task',
+      'task-1'
+    );
 
     expect(mockQuery).toHaveBeenCalledWith(
       expect.stringContaining('DO UPDATE SET canonical = EXCLUDED.canonical'),
-      ['vault-1', 'fantastic system `wrangler.toml`', 'fantastic-system']
+      ['vault-1', 'fantastic system `wrangler.toml`', 'fantastic-system', 'task', 'task-1']
     );
   });
 });

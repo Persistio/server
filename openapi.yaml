@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Persistio API
-  version: 0.1.20
+  version: 0.1.21
   description: Self-hosted memory service for AI agents.
 servers:
   - url: http://localhost:4827
@@ -58,7 +58,7 @@ paths:
                     description: Process uptime in whole seconds.
               example:
                 status: ok
-                version: 0.1.20
+                version: 0.1.21
                 db: ok
                 db_latency_ms: 12
                 extraction_queue_depth: 2
@@ -89,7 +89,7 @@ paths:
                     type: integer
               example:
                 status: degraded
-                version: 0.1.20
+                version: 0.1.21
                 db: degraded
                 db_latency_ms: 2001
                 extraction_queue_depth: null
@@ -116,43 +116,22 @@ paths:
               properties:
                 session_id:
                   type: string
+                  minLength: 1
+                  maxLength: 512
+                  description: Context identity. Control characters are rejected before trimming; must remain non-empty after trimming. Invalid identities return 400 before ingest side effects.
+                context:
+                  $ref: '#/components/schemas/IngestContext'
                 chunks:
                   type: array
                   items:
-                    type: object
-                    required: [role, content, timestamp]
-                    properties:
-                      role:
-                        type: string
-                        enum: [user, assistant, tool]
-                      content:
-                        type: string
-                        maxLength: 8000
-                      timestamp:
-                        type: string
-                        format: date-time
-                        description: Original conversation turn time, not ingest request time.
+                    $ref: '#/components/schemas/IngestChunk'
       responses:
         '202':
           description: Chunks accepted
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  accepted:
-                    type: integer
-                  chunks:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                          format: uuid
-                        created_at:
-                          type: string
-                          format: date-time
+                $ref: '#/components/schemas/IngestReceipt'
   /v1/ingest/bulk:
     post:
       summary: Bulk append raw conversation chunks
@@ -173,47 +152,30 @@ paths:
               properties:
                 session_id:
                   type: string
+                  minLength: 1
+                  maxLength: 512
+                  description: Same identity contract as normal ingest; controls rejected before trimming.
+                context:
+                  $ref: '#/components/schemas/IngestContext'
                 chunks:
                   type: array
                   maxItems: 2048
                   items:
-                    type: object
-                    required: [role, content, timestamp]
-                    properties:
-                      role:
-                        type: string
-                        enum: [user, assistant, tool]
-                      content:
-                        type: string
-                        maxLength: 8000
-                      timestamp:
-                        type: string
-                        format: date-time
-                        description: Original conversation turn time, not ingest request time.
+                    $ref: '#/components/schemas/IngestChunk'
       responses:
         '202':
           description: Chunks accepted and extraction job queued
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  accepted:
-                    type: integer
-                  job_id:
-                    type: string
-                    format: uuid
-                  chunks:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                          format: uuid
-                        created_at:
-                          type: string
-                          format: date-time
+                allOf:
+                  - $ref: '#/components/schemas/IngestReceipt'
+                  - type: object
+                    properties:
+                      job_id:
+                        type: string
+                        format: uuid
+                        description: Present when an extraction job was queued.
         '403':
           description: Bulk ingest requires a premium plan
         '413':
@@ -229,56 +191,115 @@ paths:
           application/json:
             schema:
               type: object
-              required: [query]
+              required:
+                - query
               properties:
                 query:
                   type: string
+                  minLength: 1
                 top_k:
                   type: integer
+                  minimum: 1
+                  maximum: 100
                 min_similarity:
                   type: number
                   minimum: 0
                   maximum: 1
                 include_raw:
                   type: boolean
+                  description: Requires context.session_id and the default JSON response format. Otherwise returns 400 before
+                    quota or embedding; not supported with bundle or bundle_v2.
+                  default: false
                 include_evidence:
                   type: boolean
+                  default: false
+                include_pending:
+                  type: boolean
+                  default: false
+                include_related:
+                  type: boolean
+                  default: true
+                include_global_rules:
+                  type: boolean
+                  default: false
+                  description: Explicit opt-in for approved global user rules. Effective only for identified agents in agent
+                    mode with a direct, delegated, event, or API trigger.
+                context:
+                  $ref: "#/components/schemas/MemoryContext"
                 mode:
                   type: string
-                  enum: [agent, factual]
+                  enum:
+                    - agent
+                    - factual
+                  default: agent
+                client:
+                  $ref: "#/components/schemas/RecallClient"
       responses:
-        '200':
+        "200":
           description: Recall results
           content:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    required: [memories, evidence_chunks, raw_chunks]
-                    additionalProperties: false
-                    properties:
-                      memories:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/RecallMemory'
-                      evidence_chunks:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/RecallChunk'
-                      raw_chunks:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/RecallRawChunk'
-                  - type: object
-                    required: [bundle]
-                    additionalProperties: false
-                    properties:
-                      bundle:
-                        type: object
-                        additionalProperties:
-                          type: array
-                          items:
-                            type: string
+                  - $ref: "#/components/schemas/RecallJsonResponse"
+                  - $ref: "#/components/schemas/RecallLegacyResponse"
+                  - $ref: "#/components/schemas/RecallStructuredResponse"
+        "400":
+          description: Invalid format, context or request
+        "401":
+          description: Authentication required
+        "403":
+          description: Vault read access denied
+        "500":
+          description: Recall or evidence persistence failed
+      parameters:
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum:
+              - bundle
+              - bundle_v2
+          description: Omit for JSON. All formats include delivery receipts.
+  /v1/recall/{deliveryId}/rendered:
+    post:
+      summary: Acknowledge compiled recall output before handoff
+      description: "Vault-scoped historical evidence, not proof of host consumption or authority approval. IDs must
+        exactly partition selection, be unique ignoring UUID case, and total at most 100. rendered_tokens must
+        not exceed token_budget. An exact retry returns recorded: 0; conflicting immutable outcomes return 400.
+        Empty selections also have a durable ACK."
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: deliveryId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenderedDeliveryRequest"
+      responses:
+        "200":
+          description: Durably accepted (including exact retry)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RenderedDeliveryResponse"
+        "400":
+          description: Invalid partition, accounting or conflicting outcome
+        "401":
+          description: Authentication required
+        "403":
+          description: Vault read access denied
+        "404":
+          description: Delivery not found in authenticated vault
+        "500":
+          description: Persistence failure or ambiguous commit; retry only the same outcome
   /stats:
     get:
       summary: Fetch vault plan, quota, and usage stats
@@ -309,18 +330,53 @@ paths:
           name: archived
           schema:
             type: boolean
+            default: false
         - in: query
           name: category
           schema:
             type: string
         - in: query
+          name: filter
+          schema:
+            type: string
+            enum: [all, high-confidence, low-confidence, positive, negative]
+            default: all
+        - in: query
+          name: include_children
+          schema:
+            type: boolean
+            default: false
+        - in: query
           name: limit
           schema:
             type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
         - in: query
           name: offset
           schema:
             type: integer
+            minimum: 0
+            default: 0
+        - in: query
+          name: q
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [recent, oldest, confidence, salience]
+            default: recent
+        - in: query
+          name: subject
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 500
       responses:
         '200':
           description: Paginated memories
@@ -337,6 +393,8 @@ paths:
                     type: integer
                   offset:
                     type: integer
+                  total:
+                    type: integer
     post:
       summary: Create a memory
       security:
@@ -347,16 +405,40 @@ paths:
           application/json:
             schema:
               type: object
-              required: [data, subject]
+              required: [data, subject, scope]
               properties:
                 data:
                   type: string
+                  minLength: 1
                 subject:
                   type: string
+                  minLength: 1
                 categories:
                   type: array
                   items:
                     type: string
+                    minLength: 1
+                parent_id:
+                  type: [string, 'null']
+                  format: uuid
+                type:
+                  type: string
+                  enum: [user_preference, user_rule, task_pattern, workflow, project, constraint, decision, system_fact, domain_knowledge]
+                  default: system_fact
+                scope:
+                  type: string
+                  enum: [global, project, task, session]
+                scope_key:
+                  type: [string, 'null']
+                  minLength: 1
+                  maxLength: 512
+                  description: Must be null for global scope and is required for project, task, and session scopes.
+                evidence:
+                  type: string
+                volatility:
+                  type: string
+                  enum: [very_low, low, medium, high]
+                  default: low
       responses:
         '201':
           description: Memory created
@@ -364,6 +446,77 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Memory'
+        '400':
+          description: Invalid payload, including a missing or unsupported scope
+  /v1/memories/subjects:
+    get:
+      summary: List memory subjects
+      description: Returns subject summaries for visible non-candidate memories.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: archived
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 200
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - in: query
+          name: q
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [count, recent, name]
+            default: count
+      responses:
+        '200':
+          description: Paginated memory subject summaries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, limit, offset, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [subject, count, latest_at]
+                      properties:
+                        subject:
+                          type: string
+                        count:
+                          type: integer
+                        latest_at:
+                          type:
+                            - string
+                            - 'null'
+                          format: date-time
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  total:
+                    type: integer
+        '401':
+          description: Unauthorized
   /v1/memories/graph:
     get:
       summary: Fetch a bounded live memory graph
@@ -384,7 +537,7 @@ paths:
           schema:
             type: integer
             minimum: 0
-            maximum: 3
+            maximum: 4
             default: 1
           description: Neighborhood expansion depth from the seed memory.
         - in: query
@@ -466,6 +619,58 @@ paths:
           schema:
             type: string
             format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              anyOf:
+                - required: [data]
+                - required: [subject]
+                - required: [categories]
+                - required: [confidence]
+                - required: [type]
+                - required: [scope]
+                - required: [scope_key]
+                - required: [evidence]
+                - required: [archived]
+              properties:
+                data:
+                  type: string
+                  minLength: 1
+                subject:
+                  type: string
+                  minLength: 1
+                categories:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                confidence:
+                  type: number
+                  exclusiveMinimum: 0
+                  maximum: 1
+                type:
+                  type: string
+                  enum: [user_preference, user_rule, task_pattern, workflow, project, constraint, decision, system_fact, domain_knowledge]
+                scope:
+                  type: string
+                  enum: [global, project, task, session]
+                scope_key:
+                  type: [string, 'null']
+                  minLength: 1
+                  maxLength: 512
+                scope_change_reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 500
+                  description: Required when changing to a broader scope.
+                evidence:
+                  type: [string, 'null']
+                archived:
+                  type: boolean
       responses:
         '200':
           description: Memory updated
@@ -473,6 +678,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Memory'
+        '400':
+          description: Invalid payload or scope widening without a reason
+        '409':
+          description: Stored memory has an invalid legacy scope or changed concurrently
         '404':
           description: Memory not found
     delete:
@@ -655,8 +864,397 @@ paths:
                 $ref: '#/components/schemas/CurationStatus'
         '404':
           description: Vault not found
+  /admin/vaults/{id}/memories:
+    get:
+      summary: List memories for trusted review
+      description: Lists vault memories for an authorized platform reviewer. Set include_pending to discover candidate memories before curation so they can enter the authority workflow.
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: archived
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: category
+          schema:
+            type: string
+        - in: query
+          name: filter
+          schema:
+            type: string
+            enum: [all, high-confidence, low-confidence, positive, negative]
+            default: all
+        - in: query
+          name: include_children
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: include_pending
+          description: Include candidate memories so trusted reviewers can approve or revoke them before curation.
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - in: query
+          name: q
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [recent, oldest, confidence, salience]
+            default: recent
+        - in: query
+          name: subject
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 500
+      responses:
+        '200':
+          description: Paginated memories, including candidates only when requested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Memory'
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  total:
+                    type: integer
+        '401':
+          description: Unauthorized
+        '404':
+          description: Vault not found
+  /admin/vaults/{vaultId}/memories/{id}/authority/approve:
+    post:
+      summary: Approve an authority-controlled memory for recall
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: vaultId
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryAuthorityTransition'
+      responses:
+        '200':
+          description: Authority-controlled memory or pending candidate approved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
+        '400':
+          description: Invalid transition or memory outside the authority lifecycle
+        '401':
+          description: Unauthorized
+        '404':
+          description: Vault or memory not found
+        '409':
+          description: Stale, duplicate, or concurrent authority transition
+  /admin/vaults/{vaultId}/memories/{id}/authority/revoke:
+    post:
+      summary: Revoke an authority-controlled memory's recall authority
+      security:
+        - adminKey: []
+      parameters:
+        - in: path
+          name: vaultId
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryAuthorityTransition'
+      responses:
+        '200':
+          description: Authority-controlled memory, including an archived memory or pending candidate, revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
+        '400':
+          description: Invalid transition or memory outside the authority lifecycle
+        '401':
+          description: Unauthorized
+        '404':
+          description: Vault or memory not found
+        '409':
+          description: Stale, duplicate, or concurrent authority transition
 components:
   schemas:
+    IngestReceipt:
+      type: object
+      required: [accepted, inserted, replayed, chunks]
+      properties:
+        accepted:
+          type: integer
+          minimum: 0
+          description: Equals inserted plus replayed.
+        inserted:
+          type: integer
+          minimum: 0
+        replayed:
+          type: integer
+          minimum: 0
+        chunks:
+          type: array
+          description: One outcome per input chunk, in request order.
+          items:
+            type: object
+            required: [id, created_at, outcome]
+            properties:
+              id:
+                type: string
+                format: uuid
+              created_at:
+                type: string
+                format: date-time
+              outcome:
+                type: string
+                enum: [inserted, replayed]
+    ProvenanceIdentity:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^(?=.*\S)[^\x00-\x1f\x7f-\x9f\uD800-\uDFFF]+$'
+      description: Unicode code-point length and controls are checked before trimming; must remain non-empty after trimming.
+    IngestTimestamp:
+      type: string
+      maxLength: 64
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$'
+      description: Original event time. RFC 3339 subset requiring uppercase T/Z, seconds and colon-separated offsets; leap seconds are not supported. Future chunk timestamps beyond configured tolerance are rejected.
+    ProvenanceActor:
+      type: string
+      enum: [human, assistant, agent, tool, system, import, unknown]
+    ProvenanceAuthorship:
+      type: string
+      enum: [original, generated, transcribed, imported, mixed, unknown]
+    SourceEvent:
+      type: object
+      additionalProperties: false
+      required: [namespace, id]
+      description: Vault-scoped replay identity. Namespace, ID and ordinal must be unique within a request; reusing a persisted key with different role or content returns 409. Message ID is metadata, not the replay key.
+      properties:
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^(?=.*\S)[^\x00-\x1f\x7f-\x9f\uD800-\uDFFF]+$'
+          description: Unicode code-point length and controls are checked before trimming; must remain non-empty after trimming.
+        id:
+          $ref: '#/components/schemas/ProvenanceIdentity'
+        message_id:
+          $ref: '#/components/schemas/ProvenanceIdentity'
+        ordinal:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+    CaptureProvenance:
+      type: object
+      additionalProperties: false
+      required: [actor_type, trigger_type, artifact_type, authorship, cadence]
+      properties:
+        source_class:
+          type: string
+          enum: [agent_cron, agent_hook, agent_slack, agent_subagent, agent_other, thread_conversation, direct_or_import, unknown]
+        actor_type:
+          $ref: '#/components/schemas/ProvenanceActor'
+        trigger_type:
+          type: string
+          enum: [direct, delegated, scheduled, event, backfill, api, unknown]
+        artifact_type:
+          type: string
+          enum: [message, conversation, tool_result, status, observation, log, summary, document, unknown]
+        authorship:
+          $ref: '#/components/schemas/ProvenanceAuthorship'
+        cadence:
+          type: string
+          enum: [one_off, recurring, batch, unknown]
+        provenance_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        provenance_basis:
+          type: array
+          maxItems: 8
+          items:
+            type: string
+            enum: [session_id_prefix, agent_trigger, integration_marker, thread_session_shape, session_id_shape, role_counts, plugin_capture, api_provenance, api_provenance_aggregate, transport_envelope, fallback]
+        payload_author:
+          type: object
+          additionalProperties: false
+          required: [actor_type, authorship, is_user]
+          properties:
+            actor_type:
+              $ref: '#/components/schemas/ProvenanceActor'
+            authorship:
+              $ref: '#/components/schemas/ProvenanceAuthorship'
+            is_user:
+              type: [boolean, 'null']
+        transport:
+          type: object
+          additionalProperties: false
+          required: [initiator_actor_type, receiver_actor_type]
+          properties:
+            initiator_actor_type:
+              $ref: '#/components/schemas/ProvenanceActor'
+            receiver_actor_type:
+              $ref: '#/components/schemas/ProvenanceActor'
+            initiator_id:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            receiver_id:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            source_session_id:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            source_channel:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            source_tool:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+        import:
+          type: object
+          additionalProperties: false
+          required: [importer, importer_version, dataset_sha256, import_job_id, original_timestamp]
+          properties:
+            importer:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            importer_version:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            dataset_sha256:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            import_job_id:
+              $ref: '#/components/schemas/ProvenanceIdentity'
+            original_timestamp:
+              $ref: '#/components/schemas/IngestTimestamp'
+    IngestChunk:
+      type: object
+      required: [role, content, timestamp]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, tool]
+        content:
+          type: string
+          minLength: 1
+          description: Runtime-configured character and embedding-token limits apply (413 when exceeded).
+        timestamp:
+          $ref: '#/components/schemas/IngestTimestamp'
+        source_event:
+          $ref: '#/components/schemas/SourceEvent'
+        provenance:
+          $ref: '#/components/schemas/CaptureProvenance'
+    IngestContext:
+      type: object
+      description: Identities are at most 512 characters before trimming, reject control characters, and must remain non-empty after trimming.
+      additionalProperties: false
+      properties:
+        project_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        task_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        agent_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        trigger_type:
+          type: string
+          enum: [direct, delegated, scheduled, event, backfill, api, unknown]
+    MemoryContext:
+      type: object
+      description: Uses the same identity validation and normalization as ingest session IDs and memory scope keys.
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        project_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        task_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        agent_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        trigger_type:
+          type: string
+          enum: [direct, delegated, scheduled, event, backfill, api, unknown]
+    MemoryAuthorityTransition:
+      type: object
+      additionalProperties: false
+      required: [expected_version, reason]
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
     Memory:
       type: object
       properties:
@@ -686,6 +1284,8 @@ components:
             - 'null'
         scope:
           type: string
+        scope_key:
+          type: [string, 'null']
         evidence:
           oneOf:
             - type: object
@@ -695,6 +1295,36 @@ components:
           type: string
         status:
           type: string
+        authority_state:
+          type: string
+          enum: [untrusted, proposed, approved, revoked]
+        authority_required:
+          type: boolean
+          description: Sticky marker indicating that explicit authority approval is required for recall. All current untrusted creation paths set this for new rows regardless of self-declared type.
+        authority_version:
+          type: integer
+        approved_by:
+          type:
+            - string
+            - 'null'
+        approved_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        approval_source:
+          type:
+            - string
+            - 'null'
+        revoked_by:
+          type:
+            - string
+            - 'null'
+        revoked_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
         valid_from:
           type:
             - string
@@ -729,13 +1359,494 @@ components:
           type: string
         edge_count:
           type: integer
+
+    RecallClient:
+      type: object
+      required:
+        - name
+        - version
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          allOf:
+            - pattern: \S
+            - pattern: ^[^\u0000-\u001f\u007f-\u009f\ud800-\udfff]*$
+        version:
+          type: string
+          minLength: 1
+          maxLength: 100
+          allOf:
+            - pattern: \S
+            - pattern: ^[^\u0000-\u001f\u007f-\u009f\ud800-\udfff]*$
+    RecallDeliveryReceipt:
+      type: object
+      required:
+        - id
+        - selected_count
+        - global_selected_count
+        - selected_ids
+      additionalProperties: false
+      properties:
+        id: &a1
+          type: string
+          format: uuid
+        selected_count:
+          type: integer
+          minimum: 0
+          maximum: 100
+        global_selected_count:
+          type: integer
+          minimum: 0
+          maximum: 100
+        selected_ids:
+          type: array
+          items: *a1
+          maxItems: 100
+          uniqueItems: true
+    RecallLegacyBundle:
+      type: object
+      required:
+        - global_user_rules
+        - user_rules
+        - user_preferences
+        - task_patterns
+        - workflows
+        - project
+        - constraints
+        - decisions
+        - system_facts
+        - domain_knowledge
+      additionalProperties: false
+      properties:
+        global_user_rules:
+          type: array
+          items: &a2
+            type: string
+        user_rules:
+          type: array
+          items: *a2
+        user_preferences:
+          type: array
+          items: *a2
+        task_patterns:
+          type: array
+          items: *a2
+        workflows:
+          type: array
+          items: *a2
+        project:
+          type: array
+          items: *a2
+        constraints:
+          type: array
+          items: *a2
+        decisions:
+          type: array
+          items: *a2
+        system_facts:
+          type: array
+          items: *a2
+        domain_knowledge:
+          type: array
+          items: *a2
+    RecallLegacyBundleIds:
+      type: object
+      required:
+        - global_user_rules
+        - user_rules
+        - user_preferences
+        - task_patterns
+        - workflows
+        - project
+        - constraints
+        - decisions
+        - system_facts
+        - domain_knowledge
+      additionalProperties: false
+      properties:
+        global_user_rules:
+          type: array
+          items: *a1
+          maxItems: 100
+        user_rules:
+          type: array
+          items: *a1
+          maxItems: 100
+        user_preferences:
+          type: array
+          items: *a1
+          maxItems: 100
+        task_patterns:
+          type: array
+          items: *a1
+          maxItems: 100
+        workflows:
+          type: array
+          items: *a1
+          maxItems: 100
+        project:
+          type: array
+          items: *a1
+          maxItems: 100
+        constraints:
+          type: array
+          items: *a1
+          maxItems: 100
+        decisions:
+          type: array
+          items: *a1
+          maxItems: 100
+        system_facts:
+          type: array
+          items: *a1
+          maxItems: 100
+        domain_knowledge:
+          type: array
+          items: *a1
+          maxItems: 100
+    RecallJsonResponse:
+      type: object
+      required:
+        - delivery
+        - memories
+        - related_memories
+        - evidence_chunks
+        - raw_chunks
+      additionalProperties: false
+      properties:
+        delivery:
+          $ref: "#/components/schemas/RecallDeliveryReceipt"
+        memories:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecallMemory"
+        related_memories:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecallMemory"
+        evidence_chunks:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecallChunk"
+        raw_chunks:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecallRawChunk"
+    RecallLegacyResponse:
+      type: object
+      required:
+        - delivery
+        - bundle
+        - bundle_ids
+      additionalProperties: false
+      properties:
+        delivery:
+          $ref: "#/components/schemas/RecallDeliveryReceipt"
+        bundle:
+          $ref: "#/components/schemas/RecallLegacyBundle"
+        bundle_ids:
+          $ref: "#/components/schemas/RecallLegacyBundleIds"
+        related_bundle:
+          $ref: "#/components/schemas/RecallLegacyBundle"
+        related_bundle_ids:
+          $ref: "#/components/schemas/RecallLegacyBundleIds"
+    RecallStructuredMemory:
+      type: object
+      required:
+        - id
+        - data
+        - subject
+        - type
+        - status
+        - confidence
+        - sensitivity
+        - scope
+        - authority
+        - provenance
+        - validity
+        - retrieval
+      additionalProperties: false
+      properties:
+        id: *a1
+        data: *a2
+        subject: *a2
+        type:
+          type:
+            - string
+            - "null"
+          enum:
+            - user_preference
+            - user_rule
+            - task_pattern
+            - workflow
+            - project
+            - constraint
+            - decision
+            - system_fact
+            - domain_knowledge
+            - null
+        status:
+          type: string
+          enum:
+            - active
+            - candidate
+        confidence:
+          type: number
+        sensitivity: *a2
+        scope:
+          type: object
+          required:
+            - kind
+            - binding
+          additionalProperties: false
+          properties:
+            kind:
+              type: string
+              enum:
+                - global
+                - project
+                - session
+                - task
+            binding:
+              type:
+                - string
+                - "null"
+        authority:
+          type: object
+          required:
+            - state
+            - required
+            - version
+            - approved_by
+            - approved_at
+            - approval_source
+          additionalProperties: false
+          properties:
+            state:
+              type: string
+              enum:
+                - untrusted
+                - proposed
+                - approved
+                - revoked
+            required: &a4
+              type: boolean
+            version:
+              type: integer
+              minimum: 1
+            approved_by:
+              type:
+                - string
+                - "null"
+            approved_at:
+              type:
+                - string
+                - "null"
+              format: date-time
+            approval_source:
+              type:
+                - string
+                - "null"
+        provenance:
+          type: object
+          required:
+            - source_timestamp
+            - source_segment_id
+            - source_chunk_ids
+            - source_classes
+            - authorships
+          additionalProperties: false
+          properties:
+            source_timestamp:
+              type:
+                - string
+                - "null"
+              format: date-time
+            source_segment_id:
+              type:
+                - string
+                - "null"
+              format: uuid
+            source_chunk_ids:
+              type: array
+              items: *a1
+            source_classes:
+              type: array
+              items: *a2
+            authorships:
+              type: array
+              items: *a2
+        validity:
+          type: object
+          required:
+            - valid_from
+            - valid_until
+          additionalProperties: false
+          properties:
+            valid_from:
+              type:
+                - string
+                - "null"
+              format: date
+            valid_until:
+              type:
+                - string
+                - "null"
+              format: date
+        retrieval:
+          type: object
+          required:
+            - reason
+            - similarity
+            - edge_type
+          additionalProperties: false
+          properties:
+            reason:
+              type: string
+              enum:
+                - semantic
+                - global_behavioral
+                - graph
+            similarity:
+              type:
+                - number
+                - "null"
+              minimum: 0
+              maximum: 1
+            edge_type:
+              type:
+                - string
+                - "null"
+    RecallStructuredResponse:
+      type: object
+      required:
+        - schema_version
+        - generated_at
+        - authority_boundary
+        - delivery
+        - sections
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: string
+          const: persistio.recall_bundle.v2
+        generated_at:
+          type: string
+          format: date-time
+        authority_boundary:
+          type: object
+          required:
+            - classification
+            - may_override_current_instructions
+            - commands_authorized
+          additionalProperties: false
+          properties:
+            classification:
+              type: string
+              const: lower_authority_historical_data
+            may_override_current_instructions:
+              type: boolean
+              const: false
+            commands_authorized:
+              type: boolean
+              const: false
+        delivery:
+          $ref: "#/components/schemas/RecallDeliveryReceipt"
+        sections:
+          type: object
+          required:
+            - approved_preferences_and_rules
+            - historical_facts
+            - candidates
+            - graph_context
+          additionalProperties: false
+          properties:
+            approved_preferences_and_rules:
+              type: array
+              items:
+                $ref: "#/components/schemas/RecallStructuredMemory"
+            historical_facts:
+              type: array
+              items:
+                $ref: "#/components/schemas/RecallStructuredMemory"
+            candidates:
+              type: array
+              items:
+                $ref: "#/components/schemas/RecallStructuredMemory"
+            graph_context:
+              type: array
+              items:
+                $ref: "#/components/schemas/RecallStructuredMemory"
+    RenderedDeliveryRequest:
+      type: object
+      required:
+        - rendered_ids
+        - dropped
+        - token_budget
+        - rendered_tokens
+        - truncated
+        - render_target
+      additionalProperties: false
+      properties:
+        rendered_ids:
+          type: array
+          items: *a1
+          maxItems: 100
+          uniqueItems: true
+        dropped:
+          type: array
+          items:
+            type: object
+            required:
+              - id
+              - reason
+            additionalProperties: false
+            properties:
+              id: *a1
+              reason:
+                type: string
+                enum:
+                  - token_budget
+                  - duplicate
+                  - invalid
+                  - client_policy
+                  - empty_block
+          maxItems: 100
+        token_budget: &a3
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        rendered_tokens: *a3
+        truncated: *a4
+        render_target:
+          type: string
+          enum:
+            - prompt_context
+            - tool_response
+    RenderedDeliveryResponse:
+      type: object
+      required:
+        - accepted
+        - recorded
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        recorded:
+          type: integer
+          minimum: 0
+          maximum: 100
     RecallMemory:
       allOf:
         - $ref: '#/components/schemas/Memory'
         - type: object
           properties:
             similarity:
-              type: number
+              type: [number, 'null']
             source:
               type: string
               enum: [global_behavioral, semantic, graph]

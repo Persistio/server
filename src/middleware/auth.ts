@@ -22,7 +22,7 @@ export type PlatformActorType = 'service' | 'user' | 'system';
 
 export interface PlatformAuthActor {
   type: PlatformActorType;
-  id: string | null;
+  id: string;
 }
 
 export interface PlatformAuthContext {
@@ -271,6 +271,8 @@ function denialReason(error: unknown): string {
       return 'invalid_vault_api_key';
     case 'Invalid actor type':
       return 'invalid_actor_type';
+    case 'Incomplete actor identity':
+      return 'incomplete_actor_identity';
     default:
       if (error.message.endsWith('must be a UUID')) return 'invalid_uuid';
       return 'auth_denied';
@@ -308,6 +310,9 @@ function getActor(request: FastifyRequest): PlatformAuthActor | null {
   const actorType = getHeaderString(request, 'x-persistio-actor-type');
   const actorId = getHeaderString(request, 'x-persistio-actor-id');
   if (!actorType && !actorId) return null;
+  if (!actorType || !actorId) {
+    throw new Error('Incomplete actor identity');
+  }
   if (actorType !== 'service' && actorType !== 'user' && actorType !== 'system') {
     throw new Error('Invalid actor type');
   }

@@ -9,6 +9,7 @@ import type {
 } from '../events/platform-event';
 import { usagePeriodClosedEventType } from '../events/platform-event';
 import { recordCustomerMetric, type CustomerMetricSource } from './customer-metrics';
+import { memoryCapacityPredicateSql } from './memory-capacity';
 
 export type UsageField = 'ingest_events' | 'memory_adds' | 'searches';
 export type ModelUsageRole = 'embedding' | 'extraction' | 'escalation' | 'curation';
@@ -316,22 +317,31 @@ export async function reserveApiQuota(
   field: UsageField,
   source: CustomerMetricSource = 'api'
 ): Promise<ApiQuotaReservation> {
-  const result = await withTransaction((client) => consumeApiQuotaWithPeriodInTransaction(client, vaultId, field));
+  const reservation = await withTransaction((client) => reserveApiQuotaInTransaction(client, vaultId, field, source));
+  recordCommittedApiQuotaReservation(reservation);
+  return reservation;
+}
+
+/** Caller must commit the resource write and this charge together. No metric is
+ * emitted until the caller has received a definite successful commit result. */
+export async function reserveApiQuotaInTransaction(
+  client: PoolClient,
+  vaultId: string,
+  field: UsageField,
+  source: CustomerMetricSource = 'api'
+): Promise<ApiQuotaReservation> {
+  const result = await consumeApiQuotaWithPeriodInTransaction(client, vaultId, field);
+  return { accountId: result.accountId, field, period: result.period, snapshot: result.snapshot, source, vaultId };
+}
+
+export function recordCommittedApiQuotaReservation(reservation: ApiQuotaReservation): void {
   recordUsageQuotaDelta({
-    accountId: result.accountId,
+    accountId: reservation.accountId,
     delta: 1,
-    field,
-    source,
-    vaultId
+    field: reservation.field,
+    source: reservation.source,
+    vaultId: reservation.vaultId
   });
-  return {
-    accountId: result.accountId,
-    field,
-    period: result.period,
-    snapshot: result.snapshot,
-    source,
-    vaultId
-  };
 }
 
 export async function consumeApiQuotaInTransaction(client: PoolClient, vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
@@ -592,7 +602,7 @@ export async function refundApiQuotaReservation(reservation: ApiQuotaReservation
   }
 }
 
-export async function checkQuota(vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
+export async function checkQuota(vaultId: string, field: UsageField, rejectExhausted = true): Promise<RateLimitSnapshot> {
   const period = getCurrentUsagePeriod();
   const limitKey = usageLimitKeys[field];
   const result = await query<VaultUsageRow>(
@@ -617,7 +627,7 @@ export async function checkQuota(vaultId: string, field: UsageField): Promise<Ra
   const limit = result.rows[0].quota_limit ? Number(result.rows[0].quota_limit) : undefined;
   const resetAtEpochSeconds = getNextUsageResetEpochSeconds();
 
-  if (limit !== undefined && consumed >= limit) {
+  if (rejectExhausted && limit !== undefined && consumed >= limit) {
     throw new QuotaExceededError(`${field} quota exceeded`, {
       limit,
       remaining: 0,
@@ -634,8 +644,23 @@ export async function checkQuota(vaultId: string, field: UsageField): Promise<Ra
   };
 }
 
-export async function enforceMemoryCreationLimit(vaultId: string, source: CustomerMetricSource = 'api'): Promise<void> {
-  const capacity = await getMemoryCapacity(vaultId);
+export async function enforceMemoryCreationLimit(
+  vaultId: string,
+  source: CustomerMetricSource = 'api'
+): Promise<void> {
+  await assertMemoryCapacity(vaultId);
+  await consumeApiQuota(vaultId, 'memory_adds', source);
+}
+
+export async function reserveMemoryCreationInTransaction(
+  client: PoolClient, vaultId: string, source: CustomerMetricSource = 'extraction_worker'
+): Promise<ApiQuotaReservation> {
+  await assertMemoryCapacity(vaultId, client);
+  return reserveApiQuotaInTransaction(client, vaultId, 'memory_adds', source);
+}
+
+async function assertMemoryCapacity(vaultId: string, client?: PoolClient): Promise<void> {
+  const capacity = await getMemoryCapacity(vaultId, client);
 
   if (capacity.limit !== undefined && capacity.activeMemories >= capacity.limit) {
     const resetAtEpochSeconds = getNextUsageResetEpochSeconds();
@@ -646,8 +671,6 @@ export async function enforceMemoryCreationLimit(vaultId: string, source: Custom
       retryAfterSeconds: Math.max(1, resetAtEpochSeconds - Math.floor(Date.now() / 1000))
     });
   }
-
-  await consumeApiQuota(vaultId, 'memory_adds', source);
 }
 
 export function recordMemoryCountDelta(
@@ -844,10 +867,11 @@ function recordQuotaDelta(input: {
   }
 }
 
-async function getMemoryCapacity(vaultId: string): Promise<{ activeMemories: number; limit: number | undefined }> {
-  const result = await query<MemoryCapacityRow>(
+async function getMemoryCapacity(vaultId: string, client?: PoolClient): Promise<{ activeMemories: number; limit: number | undefined }> {
+  const execute = client?.query.bind(client) ?? query;
+  const result = await execute<MemoryCapacityRow>(
     `SELECT
-       COUNT(m.id) FILTER (WHERE m.archived_at IS NULL)::text AS active_memories,
+       COUNT(m.id) FILTER (WHERE ${memoryCapacityPredicateSql('m')})::text AS active_memories,
        COALESCE((v.rate_limit_override->>'memories_max'), (p.limits->>'memories_max')) AS memories_max
      FROM vaults AS v
      JOIN plans AS p

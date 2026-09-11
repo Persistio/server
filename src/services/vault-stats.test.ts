@@ -18,6 +18,7 @@ function mockStatsRows() {
       ingest_events: '12',
       memory_adds: '3',
       searches: '7',
+      memories_max: '25',
       limits: {
         memories_max: 1000,
         ingest_events_per_month: 100,
@@ -33,7 +34,8 @@ function mockStatsRows() {
       needs_review: '1',
       contradicted: '0',
       superseded: '4',
-      archived: '5'
+      archived: '5',
+      capacity_used: '14'
     }]
   });
   queryMock.mockResolvedValueOnce({ rows: [{ count: '6' }] });
@@ -54,7 +56,7 @@ describe('getVaultStats', () => {
     )).resolves.toMatchObject({
       vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
       plan: 'unlimited',
-      memories: { active: 10 }
+      memories: { active: 10, candidate: 2, superseded: 4, archived: 5, capacity_used: 14, limit: 25 }
     });
 
     expect(queryMock).toHaveBeenNthCalledWith(

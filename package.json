@@ -1,6 +1,6 @@
 {
   "name": "@persistio/server",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "private": true,
   "license": "BUSL-1.1",
   "main": "dist/index.js",
@@ -28,6 +28,7 @@
     "@opentelemetry/auto-instrumentations-node": "^0.80.0",
     "@opentelemetry/exporter-metrics-otlp-http": "^0.222.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/resources": "2.11.0",
     "@opentelemetry/sdk-metrics": "^2.11.0",
     "@opentelemetry/sdk-node": "^0.222.0",
     "fastify": "^5.0.0",
@@ -43,6 +44,7 @@
     "@types/node": "^22.0.0",
     "@types/pg": "^8.0.0",
     "typescript": "^5.0.0",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "yaml": "^2.9.0"
   }
 }

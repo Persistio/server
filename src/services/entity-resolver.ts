@@ -1,5 +1,12 @@
 import { query } from '../db/client';
+import type { QueryResult, QueryResultRow } from 'pg';
 import { computeSubjectHmac, isVaultEncryptionActive, unwrapDek, type VaultEncryptionContext } from './crypto';
+import type { MemoryScope } from './memory-scope';
+import { memoryValidityPredicateSql, toDateOnly } from './memory-validity';
+
+interface Queryable {
+  query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
+}
 
 export function normaliseSubject(subject: string): string {
   return subject
@@ -15,15 +22,23 @@ export interface VaultSubject {
   embedding: number[] | null;
 }
 
-export async function resolveCanonical(vaultId: string, subject: string): Promise<string | null> {
+export async function resolveCanonical(
+  vaultId: string,
+  subject: string,
+  scope: MemoryScope,
+  scopeKey: string | null,
+  db: Queryable = { query }
+): Promise<string | null> {
   const normalisedSubject = normaliseSubject(subject);
-  const result = await query<{ canonical: string }>(
+  const result = await db.query<{ canonical: string }>(
     `SELECT canonical
      FROM entity_aliases
      WHERE vault_id = $1
        AND alias = $2
+       AND scope = $3
+       AND scope_key IS NOT DISTINCT FROM $4::text
      LIMIT 1`,
-    [vaultId, normalisedSubject]
+    [vaultId, normalisedSubject, scope, scopeKey]
   );
 
   return result.rows[0]?.canonical ?? null;
@@ -32,8 +47,14 @@ export async function resolveCanonical(vaultId: string, subject: string): Promis
 export async function getVaultSubjectList(
   vaultId: string,
   topN: number,
-  recentN: number
+  recentN: number,
+  scope: MemoryScope,
+  scopeKey: string | null
 ): Promise<VaultSubject[]> {
+  const subjectListDate = toDateOnly(new Date());
+  if (!subjectListDate) {
+    throw new Error('Unable to derive a valid subject-list date');
+  }
   const vaultResult = await query<VaultEncryptionContext>(
     `SELECT id, encrypted_dek, vault_encryption_enabled
      FROM vaults
@@ -47,7 +68,7 @@ export async function getVaultSubjectList(
   }
 
   if (isVaultEncryptionActive(vault)) {
-    return getEncryptedVaultSubjectList(vault, topN, recentN);
+    return getEncryptedVaultSubjectList(vault, topN, recentN, scope, scopeKey, subjectListDate);
   }
 
   // Top N by memory count
@@ -55,12 +76,19 @@ export async function getVaultSubjectList(
     `SELECT m.subject, COUNT(m.id) AS cnt
      FROM memories m
      WHERE m.vault_id = $1
+       AND m.scope = $4
+       AND m.scope_key IS NOT DISTINCT FROM $5::text
        AND m.archived_at IS NULL
+       AND m.status = 'active'
+       AND m.sensitivity <> 'restricted'
+       AND m.confidence > 0 AND m.confidence <= 1
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
+       AND ${memoryValidityPredicateSql('m', '$3')}
        AND m.subject <> ''
      GROUP BY m.subject
      ORDER BY cnt DESC
      LIMIT $2`,
-    [vaultId, topN]
+    [vaultId, topN, subjectListDate, scope, scopeKey]
   );
 
   // Recent N by latest memory activity
@@ -68,12 +96,19 @@ export async function getVaultSubjectList(
     `SELECT m.subject
      FROM memories m
      WHERE m.vault_id = $1
+       AND m.scope = $4
+       AND m.scope_key IS NOT DISTINCT FROM $5::text
        AND m.archived_at IS NULL
+       AND m.status = 'active'
+       AND m.sensitivity <> 'restricted'
+       AND m.confidence > 0 AND m.confidence <= 1
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
+       AND ${memoryValidityPredicateSql('m', '$3')}
        AND m.subject <> ''
      GROUP BY m.subject
      ORDER BY MAX(COALESCE(m.updated_at, m.created_at)) DESC NULLS LAST
      LIMIT $2`,
-    [vaultId, recentN]
+    [vaultId, recentN, subjectListDate, scope, scopeKey]
   );
 
   // Deduplicate
@@ -87,13 +122,16 @@ export async function getVaultSubjectList(
     }
   }
 
-  return hydrateVaultSubjects(vaultId, canonicals);
+  return hydrateVaultSubjects(vaultId, canonicals, scope, scopeKey);
 }
 
 async function getEncryptedVaultSubjectList(
   vault: VaultEncryptionContext,
   topN: number,
-  recentN: number
+  recentN: number,
+  scope: MemoryScope,
+  scopeKey: string | null,
+  subjectListDate: string
 ): Promise<VaultSubject[]> {
   if (!vault.encrypted_dek) {
     return [];
@@ -102,8 +140,10 @@ async function getEncryptedVaultSubjectList(
   const aliasResult = await query<{ canonical: string; alias: string }>(
     `SELECT canonical, alias
      FROM entity_aliases
-     WHERE vault_id = $1`,
-    [vault.id]
+     WHERE vault_id = $1
+       AND scope = $2
+       AND scope_key IS NOT DISTINCT FROM $3::text`,
+    [vault.id, scope, scopeKey]
   );
   if (aliasResult.rows.length === 0) {
     return [];
@@ -126,11 +166,18 @@ async function getEncryptedVaultSubjectList(
      FROM memories m
      JOIN known_subjects ks ON ks.subject_hmac = m.subject_hmac
      WHERE m.vault_id = $1
+       AND m.scope = $6
+       AND m.scope_key IS NOT DISTINCT FROM $7::text
        AND m.archived_at IS NULL
+       AND m.status = 'active'
+       AND m.sensitivity <> 'restricted'
+       AND m.confidence > 0 AND m.confidence <= 1
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
+       AND ${memoryValidityPredicateSql('m', '$5')}
      GROUP BY ks.canonical
      ORDER BY cnt DESC
      LIMIT $4`,
-    [vault.id, hmacs, hmacCanonicals, topN]
+    [vault.id, hmacs, hmacCanonicals, topN, subjectListDate, scope, scopeKey]
   );
 
   const recentResult = await query<{ canonical: string }>(
@@ -142,20 +189,32 @@ async function getEncryptedVaultSubjectList(
      FROM memories m
      JOIN known_subjects ks ON ks.subject_hmac = m.subject_hmac
      WHERE m.vault_id = $1
+       AND m.scope = $6
+       AND m.scope_key IS NOT DISTINCT FROM $7::text
        AND m.archived_at IS NULL
+       AND m.status = 'active'
+       AND m.sensitivity <> 'restricted'
+       AND m.confidence > 0 AND m.confidence <= 1
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
+       AND ${memoryValidityPredicateSql('m', '$5')}
      GROUP BY ks.canonical
      ORDER BY MAX(COALESCE(m.updated_at, m.created_at)) DESC NULLS LAST
      LIMIT $4`,
-    [vault.id, hmacs, hmacCanonicals, recentN]
+    [vault.id, hmacs, hmacCanonicals, recentN, subjectListDate, scope, scopeKey]
   );
 
   return hydrateVaultSubjects(vault.id, [
     ...topResult.rows.map((row) => row.canonical),
     ...recentResult.rows.map((row) => row.canonical)
-  ]);
+  ], scope, scopeKey);
 }
 
-async function hydrateVaultSubjects(vaultId: string, canonicals: string[]): Promise<VaultSubject[]> {
+async function hydrateVaultSubjects(
+  vaultId: string,
+  canonicals: string[],
+  scope: MemoryScope,
+  scopeKey: string | null
+): Promise<VaultSubject[]> {
   const uniqueCanonicals = Array.from(new Set(canonicals));
   if (uniqueCanonicals.length === 0) {
     return [];
@@ -165,11 +224,13 @@ async function hydrateVaultSubjects(vaultId: string, canonicals: string[]): Prom
     `SELECT canonical, alias
      FROM entity_aliases
      WHERE vault_id = $1
+       AND scope = $3
+       AND scope_key IS NOT DISTINCT FROM $4::text
        AND (
          canonical = ANY($2::text[])
          OR alias = ANY($2::text[])
        )`,
-    [vaultId, uniqueCanonicals]
+    [vaultId, uniqueCanonicals, scope, scopeKey]
   );
 
   const canonicalByAlias = new Map(aliasLookupResult.rows.map((row) => [row.alias, row.canonical]));
@@ -180,8 +241,10 @@ async function hydrateVaultSubjects(vaultId: string, canonicals: string[]): Prom
     `SELECT canonical, alias, embedding::text AS embedding
      FROM entity_aliases
      WHERE vault_id = $1
+       AND scope = $3
+       AND scope_key IS NOT DISTINCT FROM $4::text
        AND canonical = ANY($2::text[])`,
-    [vaultId, uniqueResolvedCanonicals]
+    [vaultId, uniqueResolvedCanonicals, scope, scopeKey]
   );
 
   const aliasRowsByCanonical = new Map<string, { alias: string; embedding: string | null }[]>();
@@ -294,22 +357,28 @@ export function resolveSubjectTier2(
 export async function storeCanonicalEmbedding(
   vaultId: string,
   canonical: string,
-  embedding: number[]
+  embedding: number[],
+  scope: MemoryScope,
+  scopeKey: string | null,
+  db: Queryable = { query }
 ): Promise<void> {
   const normalisedCanonical = normaliseSubject(canonical);
-  await query(
-    `INSERT INTO entity_aliases (vault_id, alias, canonical, embedding)
-     VALUES ($1, $2, $2, $3::vector)
-     ON CONFLICT (vault_id, alias)
+  await db.query(
+    `INSERT INTO entity_aliases (vault_id, alias, canonical, embedding, scope, scope_key)
+     VALUES ($1, $2, $2, $3::vector, $4, $5)
+     ON CONFLICT (vault_id, scope, scope_key, alias)
      DO UPDATE SET embedding = EXCLUDED.embedding`,
-    [vaultId, normalisedCanonical, JSON.stringify(embedding)]
+    [vaultId, normalisedCanonical, JSON.stringify(embedding), scope, scopeKey]
   );
 }
 
 export async function storeSubjectAlias(
   vaultId: string,
   alias: string,
-  canonical: string
+  canonical: string,
+  scope: MemoryScope,
+  scopeKey: string | null,
+  db: Queryable = { query }
 ): Promise<void> {
   const normalisedAlias = normaliseSubject(alias);
   const normalisedCanonical = normaliseSubject(canonical);
@@ -317,12 +386,12 @@ export async function storeSubjectAlias(
     return;
   }
 
-  await query(
-    `INSERT INTO entity_aliases (vault_id, alias, canonical)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (vault_id, alias)
+  await db.query(
+    `INSERT INTO entity_aliases (vault_id, alias, canonical, scope, scope_key)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (vault_id, scope, scope_key, alias)
      DO UPDATE SET canonical = EXCLUDED.canonical`,
-    [vaultId, normalisedAlias, normalisedCanonical]
+    [vaultId, normalisedAlias, normalisedCanonical, scope, scopeKey]
   );
 }
 

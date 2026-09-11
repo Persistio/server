@@ -1,14 +1,18 @@
 import crypto from 'node:crypto';
 import { parentPort } from 'node:worker_threads';
+import { shutdownTelemetry } from '../azure-monitor';
+import { createShutdownDeadline, drainRuntimeOwner, parseShutdownDeadline } from '../runtime-shutdown';
 import pLimit from 'p-limit';
 
 import { getConfig } from '../config';
-import { closePool, query, withTransaction } from '../db/client';
+import { closePool, query } from '../db/client';
 import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram, extractionCandidatesCounter, extractionJobsCounter, extractionLagHistogram } from '../metrics';
+import { memoryPolicyEventCounter } from '../services/observability-effects';
 import { CircuitBreakerOpenError, isRateLimitError } from '../services/ai-resilience';
-import { scanForContradictions } from '../services/contradiction-scanner';
-import { decryptForVault, encryptForVault, initCryptoClient } from '../services/crypto';
-import { deduplicateMemory, getDedupEscalationRequest, type DedupInput } from '../services/dedup';
+import { drainDueContradictionActivations } from '../services/contradiction-activation';
+import { prepareVaultCrypto, initCryptoClient, type PreparedVaultCrypto } from '../services/crypto';
+import { deduplicateMemoryInTransaction, getDedupEscalationRequest, type DedupInput } from '../services/dedup';
+import { publishCommittedWorkerEffects, type WorkerEffect } from '../services/worker-effects';
 import { filterMemoryCandidates } from '../services/deterministic-filter';
 import { getEmbedder } from '../services/embedder';
 import { formatConversationForExtraction } from '../services/extraction-formatting';
@@ -16,7 +20,9 @@ import { buildPromptHeader } from '../services/extraction-prompt-header';
 import {
   formatProvenanceForPrompt,
   getProvenancePreGate,
-  inferExtractionProvenance
+  inferExtractionProvenance,
+  requiresBehavioralReview,
+  UNTRUSTED_PROVENANCE_POLICY_CODE
 } from '../services/extraction-provenance';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 import { ExtractorService } from '../services/extractor';
@@ -26,6 +32,7 @@ import { completePersistentJobIfReady, failPersistentJob, markPersistentJobRunni
 import { archiveStaleMemories } from '../services/staleness';
 import { AiBudgetDeferredError } from '../services/usage';
 import { isCuratorEnabled } from '../services/curation-capacity';
+import { deriveExtractionMemoryStatus } from '../services/memory-ingestion-policy';
 import { initCustomerMetrics, shutdownCustomerMetrics } from '../services/customer-metrics';
 import { enqueueCurationIfSegmentReady } from '../services/segment-curation-readiness';
 import {
@@ -40,6 +47,21 @@ import {
 import { getSpanAttributes, withSpan } from '../telemetry';
 import { matchSecretPattern } from '../utils/secret-filter';
 import type { VaultPromptContext } from '../services/vault-prompts';
+import {
+  FUTURE_SOURCE_TIMESTAMP_POLICY_CODE,
+  isFutureSourceTimestamp,
+  MISSING_SCOPE_BINDING_POLICY_CODE,
+  scopeKeyForContext,
+  type RecallContext
+} from '../services/memory-applicability';
+import {
+  withWorkerLeaseTransaction,
+  recordWorkerAction,
+  releaseWorkerLease,
+  startWorkerLeaseHeartbeat,
+  StaleWorkerLeaseError,
+  type WorkerLease
+} from '../services/worker-lease';
 
 interface QueuedWorkRow {
   queue_id: string;
@@ -48,6 +70,7 @@ interface QueuedWorkRow {
   vault_id: string;
   retry_count: number;
   job_id: string | null;
+  claim_token: string;
 }
 
 interface VaultContextRow {
@@ -78,6 +101,10 @@ interface SegmentRow {
   session_id: string;
   chunk_ids: string[];
   created_at: string;
+  project_id: string | null;
+  task_id: string | null;
+  agent_id: string | null;
+  trigger_type: RecallContext['trigger_type'] | null;
 }
 
 interface LoadedJob {
@@ -89,6 +116,7 @@ interface LoadedJob {
   chunkIds: string[];
   chunks: RawChunkRow[];
   createdAt: string;
+  context: RecallContext;
 }
 
 interface WorkerRunOnceRequest {
@@ -99,6 +127,7 @@ interface WorkerRunOnceRequest {
 
 interface WorkerShutdownRequest {
   type: 'shutdown';
+  deadline?: unknown;
 }
 
 type WorkerRequest = WorkerRunOnceRequest | WorkerShutdownRequest;
@@ -112,10 +141,13 @@ const subjectArbitrationLimit = pLimit(5);
 const MAX_EXTRACTION_RATE_LIMIT_RETRIES = 5;
 const EXTRACTION_RATE_LIMIT_BASE_DELAY_MS = 1_000;
 const EXTRACTION_RATE_LIMIT_MAX_DELAY_MS = 32_000;
+const WORKER_LEASE_MS = 10 * 60_000;
 const activeWorkerTasks = new Set<Promise<unknown>>();
 let isShuttingDown = false;
 let resolveWorkerSleep: (() => void) | null = null;
 let shutdownPromise: Promise<void> | null = null;
+let workerLoop: Promise<void> | undefined;
+let workerLoopFailed = false;
 
 function trackWorkerTask<T>(task: Promise<T>): Promise<T> {
   const tracked = task.finally(() => {
@@ -141,17 +173,29 @@ function sleepUntilNextBatch(ms: number): Promise<void> {
   });
 }
 
-async function shutdownWorker() {
+async function shutdownWorker(deadlineValue?: unknown) {
   if (!shutdownPromise) {
     shutdownPromise = (async () => {
       isShuttingDown = true;
       resolveWorkerSleep?.();
-      await Promise.allSettled(Array.from(activeWorkerTasks));
-      await shutdownCustomerMetrics();
-      await closePool();
-      if (parentPort) {
-        parentPort.postMessage({ type: 'shutdown-complete' });
-        parentPort.close();
+      let complete = false;
+      try {
+        const deadline = parseShutdownDeadline(deadlineValue) ?? createShutdownDeadline(Boolean(process.env.K_SERVICE));
+        await drainRuntimeOwner({
+          // Task rejection is not drain failure: the loop/handler owns business
+          // errors. All known tasks must settle before resource cleanup.
+          drain: [async () => { await Promise.allSettled([workerLoop, ...Array.from(activeWorkerTasks)]); }],
+          publishers: [shutdownCustomerMetrics],
+          telemetry: shutdownTelemetry,
+          pool: closePool,
+          deadline
+        });
+        complete = !workerLoopFailed;
+      } catch {
+        console.warn('[persistio] Worker shutdown incomplete');
+      } finally {
+        try { parentPort?.postMessage({ type: complete ? 'shutdown-complete' : 'shutdown-failed' }); }
+        finally { parentPort?.close(); }
       }
     })();
   }
@@ -159,17 +203,11 @@ async function shutdownWorker() {
   await shutdownPromise;
 }
 
-async function processBatch(vaultId?: string) {
+export async function processBatch(vaultId?: string) {
   return withSpan('extraction.process_batch', {
     'vault.id': vaultId,
     'extraction.batch_limit': config.EXTRACTION_BATCH_SIZE
   }, async (span) => {
-    await query(
-      `UPDATE extraction_queue
-       SET claimed_at = NULL, claimed_by = NULL
-       WHERE claimed_at < now() - interval '10 minutes'`
-    );
-
     const values: unknown[] = [];
     const vaultClause = vaultId ? 'AND eq.vault_id = $1' : '';
 
@@ -191,10 +229,14 @@ async function processBatch(vaultId?: string) {
          FOR UPDATE SKIP LOCKED
        )
        UPDATE extraction_queue eq
-       SET claimed_at = now(), claimed_by = $${vaultId ? 3 : 2}
+       SET claimed_at = now(),
+           claimed_by = $${vaultId ? 3 : 2},
+           claim_token = gen_random_uuid(),
+           lease_expires_at = now() + interval '10 minutes'
        FROM claimed
        WHERE eq.id = claimed.queue_id
-       RETURNING claimed.queue_id, claimed.chunk_id, claimed.segment_id, claimed.vault_id, claimed.retry_count, claimed.job_id`,
+       RETURNING claimed.queue_id, claimed.chunk_id, claimed.segment_id, claimed.vault_id,
+                 claimed.retry_count, claimed.job_id, eq.claim_token`,
       values
     );
 
@@ -204,42 +246,44 @@ async function processBatch(vaultId?: string) {
       return 0;
     }
 
-    const sessionContextCache = new Map<string, Promise<{ context: string | null; isNew: boolean }>>();
+    const sessionContextCache = new Map<string, string>();
+    const subjectListCache = new Map<string, Promise<VaultSubject[]>>();
     let memoriesCreated = 0;
-    const affectedMemoryIds = new Map<string, Set<string>>();
+    const leases = new Map(claimedResult.rows.map((row) => [row.queue_id, {
+      queueKind: 'extraction' as const,
+      queueId: row.queue_id,
+      claimToken: row.claim_token,
+      workerId
+    }]));
+    const heartbeats = new Map(Array.from(leases, ([queueId, lease]) => [
+      queueId,
+      startWorkerLeaseHeartbeat(lease, WORKER_LEASE_MS)
+    ]));
 
-    // Build per-vault subject list cache — once per batch, never per fact
-    const vaultSubjectCache = new Map<string, VaultSubject[]>();
-    for (const queuedJob of claimedResult.rows) {
-      if (!vaultSubjectCache.has(queuedJob.vault_id)) {
-        try {
-          const subjects = await getVaultSubjectList(
-            queuedJob.vault_id,
-            config.SUBJECT_INJECTION_TOP_N,
-            config.SUBJECT_INJECTION_RECENT_N
-          );
-          vaultSubjectCache.set(queuedJob.vault_id, subjects);
-        } catch (err) {
-          console.warn(JSON.stringify({ level: 40, msg: 'failed to load vault subject list', vault_id: queuedJob.vault_id, err: String(err) }));
-          vaultSubjectCache.set(queuedJob.vault_id, []);
-        }
-      }
-    }
-
-    const processOneJob = async (queuedJob: QueuedWorkRow, sessionContextCache: Map<string, Promise<{ context: string | null; isNew: boolean }>>): Promise<void> => {
+    const processOneJob = async (queuedJob: QueuedWorkRow): Promise<void> => {
+      const lease = leases.get(queuedJob.queue_id)!;
+      const heartbeat = heartbeats.get(queuedJob.queue_id)!;
+      const assertNotLost = () => { if (heartbeat.lost) throw new StaleWorkerLeaseError(lease); };
       try {
         try {
           await withRateLimitRetries(queuedJob, async () => {
           const job = await loadQueuedJob(queuedJob);
-          await markPersistentJobRunning(job.jobId);
+          assertNotLost();
+          await withWorkerLeaseTransaction(lease, client => markPersistentJobRunning(job.jobId, client));
+          const preparedCrypto = await prepareVaultCrypto(job.vault);
           const decryptedChunks = await Promise.all(job.chunks.map(async (chunk) => ({
             ...chunk,
-            decryptedContent: await decryptForVault(job.vault, await readRawChunkContent(chunk))
+            decryptedContent: preparedCrypto.decrypt(job.vault, await readRawChunkContent(chunk))
           })));
 
           const provenance = inferExtractionProvenance({
             sessionId: job.sessionId,
-            chunks: decryptedChunks
+            triggerType: job.context.trigger_type,
+            chunks: decryptedChunks.map((chunk) => ({
+              role: chunk.role,
+              provenance: chunk.provenance,
+              content: chunk.decryptedContent
+            }))
           });
           const provenanceGate = getProvenancePreGate(provenance);
           if (provenanceGate) {
@@ -267,33 +311,30 @@ async function processBatch(vaultId?: string) {
               cadence: provenance.cadence,
               reason: provenanceGate.reason
             }));
-            await completeExtractionJob(job);
+            await completeExtractionJob(job, lease);
             return;
           }
 
           const conversation = formatConversationForExtraction(decryptedChunks);
           const sessionContextCacheKey = `${job.vault.id}:${job.sessionId}`;
-          if (!sessionContextCache.has(sessionContextCacheKey)) {
-            sessionContextCache.set(
-              sessionContextCacheKey,
-              getOrCreateSessionContext(job.vault, job.sessionId, conversation)
-            );
-          }
-          const { context: sessionContext, isNew: sessionIsNew } = await sessionContextCache.get(sessionContextCacheKey)!;
-          if (sessionIsNew) {
-            const sessionAliases = await extractor.extractSessionAliases(conversation, job.vault.id);
-            await upsertEntityAliases(job.vault.id, sessionAliases);
-          }
-          const vaultSubjects = vaultSubjectCache.get(job.vault.id) ?? [];
+          assertNotLost();
+          const sessionContext = sessionContextCache.get(sessionContextCacheKey)
+            ?? await getOrCreateSessionContext(job.vault, job.sessionId, conversation, lease,
+              preparedCrypto, scopeKeyForContext('session', job.context), assertNotLost);
+          if (sessionContext !== null) sessionContextCache.set(sessionContextCacheKey, sessionContext);
           const promptHeader = [
-            buildPromptHeader(job.vault.purpose, sessionContext, vaultSubjects),
+            // Subject aliases are intentionally not injected before facts have a
+            // model-assigned scope. Canonicalisation below loads only the exact
+            // binding for each resulting fact.
+            buildPromptHeader(job.vault.purpose, sessionContext, []),
             formatProvenanceForPrompt(provenance)
           ].filter(Boolean).join('\n\n');
+          assertNotLost();
           const facts = await extractor.extractFacts(
             conversation,
             promptHeader,
             job.vault.id,
-            await decryptVaultPromptContext(job.vault)
+            decryptVaultPromptContext(job.vault, preparedCrypto)
           );
           const filteredByScore = facts.filter((fact) => fact.score >= config.EXTRACTION_SCORE_THRESHOLD);
           const afterSecretFilter = filteredByScore.filter((fact) => {
@@ -366,11 +407,42 @@ async function processBatch(vaultId?: string) {
           // Subject canonicalisation: resolve each fact's subject through tiers
           const resolvedFacts = new Array<NonRestrictedFact>(factsToEmbed.length);
           const subjectResolutionInputs: Array<{ fact: NonRestrictedFact; index: number }> = [];
+          const subjectProposals: Array<{ fact: NonRestrictedFact; canonical?: string; embedding?: number[] }> = [];
+          const subjectLists = await Promise.all(factsToEmbed.map(async (fact) => {
+            const scopeKey = scopeKeyForContext(fact.scope, job.context);
+            if (fact.scope !== 'global' && scopeKey === null) {
+              return [];
+            }
+            const cacheKey = JSON.stringify([job.vault.id, fact.scope, scopeKey]);
+            let cached = subjectListCache.get(cacheKey);
+            if (!cached) {
+              cached = getVaultSubjectList(
+                job.vault.id,
+                config.SUBJECT_INJECTION_TOP_N,
+                config.SUBJECT_INJECTION_RECENT_N,
+                fact.scope,
+                scopeKey
+              ).catch((err) => {
+                console.warn(JSON.stringify({
+                  level: 40,
+                  msg: 'failed to load bound subject list',
+                  vault_id: job.vault.id,
+                  scope: fact.scope,
+                  scope_key: scopeKey,
+                  err: String(err)
+                }));
+                return [];
+              });
+              subjectListCache.set(cacheKey, cached);
+            }
+            return cached;
+          }));
 
           for (let index = 0; index < factsToEmbed.length; index++) {
             const fact = factsToEmbed[index];
+            const boundSubjects = subjectLists[index];
             // Tier 1: text normalisation + Levenshtein (free)
-            const tier1 = resolveSubjectTier1(fact.subject, vaultSubjects, config.SUBJECT_TEXT_MATCH_DISTANCE);
+            const tier1 = resolveSubjectTier1(fact.subject, boundSubjects, config.SUBJECT_TEXT_MATCH_DISTANCE);
             if (tier1) {
               resolvedFacts[index] = { ...fact, subject: tier1 };
               continue;
@@ -378,6 +450,7 @@ async function processBatch(vaultId?: string) {
             subjectResolutionInputs.push({ fact, index });
           }
 
+          assertNotLost();
           const subjectEmbeddings = await embedder.embedBatch(
             subjectResolutionInputs.map(({ fact }) => fact.subject),
             { vaultId: job.vault.id, modelRole: 'embedding', source: 'extraction_worker', inputType: 'document' }
@@ -388,72 +461,57 @@ async function processBatch(vaultId?: string) {
             // Tier 2: embedding similarity (embed cost only, no LLM)
             const tier2 = resolveSubjectTier2(
               subjectEmbedding,
-              vaultSubjects,
+              subjectLists[index],
               config.SUBJECT_EMBED_HIGH_THRESHOLD,
               config.SUBJECT_EMBED_LOW_THRESHOLD
             );
+            const scopeKey = scopeKeyForContext(fact.scope, job.context);
 
             if (tier2) {
               if (tier2.confidence === 'high') {
-                try {
-                  await storeSubjectAlias(job.vault.id, fact.subject, tier2.canonical);
-                } catch (error) {
-                  console.warn(JSON.stringify({
-                    level: 40,
-                    msg: 'failed to store subject alias',
-                    vault_id: job.vault.id,
-                    alias: fact.subject,
-                    canonical: tier2.canonical,
-                    err: String(error)
-                  }));
-                }
+                subjectProposals.push({ fact, canonical: tier2.canonical });
                 resolvedFacts[index] = { ...fact, subject: tier2.canonical };
                 return;
               }
               // Tier 3: LLM arbitration — only for genuinely ambiguous cases
               const decision = await subjectArbitrationLimit(() =>
-                extractor.arbitrateSubject(tier2.canonical, fact.subject, job.vault.id)
+                { assertNotLost(); return extractor.arbitrateSubject(tier2.canonical, fact.subject, job.vault.id); }
               );
               if (decision === 'use_existing') {
-                try {
-                  await storeSubjectAlias(job.vault.id, fact.subject, tier2.canonical);
-                } catch (error) {
-                  console.warn(JSON.stringify({
-                    level: 40,
-                    msg: 'failed to store subject alias',
-                    vault_id: job.vault.id,
-                    alias: fact.subject,
-                    canonical: tier2.canonical,
-                    err: String(error)
-                  }));
-                }
+                subjectProposals.push({ fact, canonical: tier2.canonical });
                 resolvedFacts[index] = { ...fact, subject: tier2.canonical };
                 return;
               }
             }
 
-            // New subject — store canonical embedding for future matching
-            try {
-              await storeCanonicalEmbedding(job.vault.id, fact.subject, subjectEmbedding);
-            } catch (error) {
-              console.warn(JSON.stringify({
-                level: 40,
-                msg: 'failed to store canonical embedding',
-                vault_id: job.vault.id,
-                canonical: fact.subject,
-                err: String(error)
-              }));
-            }
+            subjectProposals.push({ fact, embedding: subjectEmbedding });
             resolvedFacts[index] = fact;
           }));
+          await withWorkerLeaseTransaction(lease, async client => {
+            await preparedCrypto.assertCurrent(client);
+            // Stable order avoids opposite alias-upsert lock ordering between jobs.
+            for (const proposal of subjectProposals.sort((a, b) =>
+              JSON.stringify([a.fact.scope, scopeKeyForContext(a.fact.scope, job.context), normaliseSubject(a.fact.subject)])
+                .localeCompare(JSON.stringify([b.fact.scope, scopeKeyForContext(b.fact.scope, job.context), normaliseSubject(b.fact.subject)])))) {
+              const key = scopeKeyForContext(proposal.fact.scope, job.context);
+              if (proposal.fact.scope !== 'global' && key === null) continue;
+              if (proposal.canonical !== undefined) {
+                await storeSubjectAlias(job.vault.id, proposal.fact.subject, proposal.canonical, proposal.fact.scope, key, client);
+              } else if (proposal.embedding) {
+                await storeCanonicalEmbedding(job.vault.id, proposal.fact.subject, proposal.embedding, proposal.fact.scope, key, client);
+              }
+            }
+          });
+          assertNotLost();
           const factEmbeddings = await embedder.embedBatch(
             factsToEmbed.map((fact) => fact.fact),
             { vaultId: job.vault.id, modelRole: 'embedding', source: 'extraction_worker', inputType: 'document' }
           );
 
-          const curatorEnabled = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id);
           const memoryInputs: DedupInput[] = [];
           const sourceTimestamp = getLatestChunkTimestamp(job.chunks);
+          const sourceTimestampIsFuture = sourceTimestamp !== null
+            && isFutureSourceTimestamp(sourceTimestamp);
 
           for (let i = 0; i < factsToEmbed.length; i++) {
             const fact = resolvedFacts[i];
@@ -461,7 +519,40 @@ async function processBatch(vaultId?: string) {
               throw new Error(`Subject resolution did not complete for fact index ${i}`);
             }
             const embedding = factEmbeddings[i];
-            const status = curatorEnabled ? 'candidate' : fact.status;
+            const scopeKey = scopeKeyForContext(fact.scope, job.context);
+            const policyRejections = [...(fact.policy_rejections ?? [])];
+            if (fact.scope !== 'global' && scopeKey === null) {
+              policyRejections.push({
+                code: MISSING_SCOPE_BINDING_POLICY_CODE,
+                field: 'scope_key',
+                reason: 'missing'
+              });
+            }
+            if (sourceTimestampIsFuture) {
+              policyRejections.push({
+                code: FUTURE_SOURCE_TIMESTAMP_POLICY_CODE,
+                field: 'source_timestamp',
+                reason: 'future'
+              });
+            }
+            if (requiresBehavioralReview(provenance, fact.type)) {
+              policyRejections.push({
+                code: UNTRUSTED_PROVENANCE_POLICY_CODE,
+                field: 'provenance',
+                reason: provenance.trigger_type === 'backfill' || provenance.authorship === 'imported'
+                  ? 'imported'
+                  : 'ambiguous'
+              });
+            }
+            const status = deriveExtractionMemoryStatus(policyRejections);
+            if (fact.type === 'user_rule') {
+              memoryPolicyEventCounter.add(1, {
+                event: 'generated_rule_proposal',
+                source: 'extraction_worker',
+                scope: fact.scope,
+                outcome: status
+              });
+            }
             memoryInputs.push({
               vaultId: job.vault.id,
               fact: fact.fact,
@@ -473,6 +564,7 @@ async function processBatch(vaultId?: string) {
               sensitivity: fact.sensitivity,
               type: fact.type,
               scope: fact.scope,
+              scopeKey,
               polarity: fact.polarity,
               status,
               volatility: fact.volatility,
@@ -480,7 +572,8 @@ async function processBatch(vaultId?: string) {
               validFrom: fact.valid_from,
               validUntil: fact.valid_until,
               sourceSegmentId: job.segmentId,
-              sourceTimestamp
+              sourceTimestamp,
+              policyRejections
             });
           }
 
@@ -488,8 +581,9 @@ async function processBatch(vaultId?: string) {
           // writes. The extra DB reads let us batch expensive escalation calls while
           // dedup remains the final write authority and rechecks the best match.
           const escalationRequests = (await Promise.all(
-            memoryInputs.map((input, index) => getDedupEscalationRequest(input, String(index)))
+            memoryInputs.map((input, index) => getDedupEscalationRequest(input, String(index), { query }, preparedCrypto))
           )).filter((request): request is NonNullable<typeof request> => Boolean(request));
+          assertNotLost();
           const precomputedDecisions = escalationRequests.length > 0
             ? await extractor.arbitrateConflictsBatch(escalationRequests, job.vault.id)
             : new Map<string, ConflictResolution>();
@@ -518,41 +612,45 @@ async function processBatch(vaultId?: string) {
           // atomic with the write, so parallelizing here can race aliases, exact
           // duplicates, or plan capacity. EXTRACTION_WORKER_CONCURRENCY still
           // provides coarse-grained throughput across claimed queue rows.
-          for (let i = 0; i < memoryInputs.length; i++) {
-            const result = await deduplicateMemory(
-              memoryInputs[i],
-              undefined,
-              extractor,
-              {
-                precomputedConflictDecision: validPrecomputedDecisionIds.has(String(i))
-                  ? precomputedDecisions.get(String(i))
-                  : undefined,
-                precomputedConflictMemoryId: validPrecomputedDecisionIds.has(String(i))
-                  ? escalationRequestById.get(String(i))?.existingMemoryId
-                  : undefined
-              }
-            );
+          const effects: WorkerEffect[] = [];
+          const committedResults = await withWorkerLeaseTransaction(lease, async (client) => {
+            if (!await recordWorkerAction(client, lease, 'extract-and-complete')) return [];
+            const results = [];
+            for (let i = 0; i < memoryInputs.length; i++) {
+              results.push(await deduplicateMemoryInTransaction(
+                memoryInputs[i],
+                client,
+                preparedCrypto,
+                effects,
+                {
+                  precomputedConflictInput: escalationRequestById.get(String(i))?.inputFingerprint,
+                  precomputedConflictDecision: validPrecomputedDecisionIds.has(String(i))
+                    ? precomputedDecisions.get(String(i))
+                    : undefined,
+                  precomputedConflictMemoryId: validPrecomputedDecisionIds.has(String(i))
+                    ? escalationRequestById.get(String(i))?.existingMemoryId
+                    : undefined,
+                  precomputedConflictMemoryRevision: validPrecomputedDecisionIds.has(String(i))
+                    ? escalationRequestById.get(String(i))?.existingMemoryRevision
+                    : undefined
+                }
+              ));
+            }
+            await finalizeExtractionJob(client, job, lease);
+            return results;
+          });
+          publishCommittedWorkerEffects(effects);
 
+          for (const result of committedResults) {
             if (result.action === 'inserted' || result.action === 'updated') {
               memoriesCreated += 1;
-              if (result.memoryId) {
-                let memoryIds = affectedMemoryIds.get(job.vault.id);
-                if (!memoryIds) {
-                  memoryIds = new Set<string>();
-                  affectedMemoryIds.set(job.vault.id, memoryIds);
-                }
-                memoryIds.add(result.memoryId);
-              }
             }
-
-            extractionLagHistogram.record(Date.now() - new Date(job.createdAt).getTime(), {
+            try { extractionLagHistogram.record(Date.now() - new Date(job.createdAt).getTime(), {
               vault_id: job.vault.id,
               session_id: job.sessionId,
               dedup_action: result.action
-            });
+            }); } catch { /* Operational telemetry cannot retry committed work. */ }
           }
-
-          await completeExtractionJob(job);
           });
         } catch (error) {
           if (error instanceof AiBudgetDeferredError) {
@@ -566,7 +664,7 @@ async function processBatch(vaultId?: string) {
               available_at: error.availableAt.toISOString(),
               wait_ms: error.waitMs
             }));
-            await deferQueuedJob(queuedJob.queue_id, error);
+            await deferQueuedJob(lease, error);
             return;
           }
           if (error instanceof CircuitBreakerOpenError) {
@@ -576,17 +674,19 @@ async function processBatch(vaultId?: string) {
               queue_id: queuedJob.queue_id,
               retry_after_ms: error.retryAfterMs
             }));
-            await releaseQueuedJob(queuedJob.queue_id, error.message);
+            await releaseQueuedJob(lease, error.message);
             return;
           }
           const lastError = error instanceof Error ? error.message : 'Unknown extraction error';
           console.error(getSpanAttributes({ error, queueId: queuedJob.queue_id }), 'Extraction job failed');
-          await failQueuedJob(queuedJob, lastError);
+          if (!(error instanceof StaleWorkerLeaseError)) await failQueuedJob(queuedJob, lease, lastError);
         }
       } catch (error) {
         const lastError = error instanceof Error ? error.message : 'Unknown extraction error';
         console.error(getSpanAttributes({ error, queueId: queuedJob.queue_id }), 'Extraction job failed');
-        await failQueuedJob(queuedJob, lastError);
+        if (!(error instanceof StaleWorkerLeaseError)) await failQueuedJob(queuedJob, lease, lastError);
+      } finally {
+        await heartbeat.stop();
       }
     };
 
@@ -594,7 +694,7 @@ async function processBatch(vaultId?: string) {
       const limit = pLimit(config.EXTRACTION_WORKER_CONCURRENCY);
       const results = await Promise.allSettled(
         claimedResult.rows.map(queuedJob =>
-          limit(() => processOneJob(queuedJob, sessionContextCache))
+          limit(() => processOneJob(queuedJob))
         )
       );
 
@@ -608,13 +708,7 @@ async function processBatch(vaultId?: string) {
         }
       }
     } finally {
-      for (const [batchVaultId, memoryIds] of affectedMemoryIds.entries()) {
-        try {
-          await scanForContradictions(batchVaultId, Array.from(memoryIds), extractor);
-        } catch (error) {
-          console.error(getSpanAttributes({ error, vaultId: batchVaultId }), 'Contradiction scan failed');
-        }
-      }
+      await Promise.all(Array.from(heartbeats.values(), heartbeat => heartbeat.stop()));
       span.setAttribute('extraction.memories_created', memoriesCreated);
       await archiveStaleMemories();
     }
@@ -623,37 +717,52 @@ async function processBatch(vaultId?: string) {
   });
 }
 
-async function completeExtractionJob(job: LoadedJob): Promise<void> {
-  await withTransaction(async (client) => {
-    await client.query(`DELETE FROM extraction_queue WHERE id = $1`, [job.queueId]);
-    await client.query(
-      `UPDATE raw_chunks
-       SET processed = true
-       WHERE id = ANY($1::uuid[])`,
-      [job.chunkIds]
-    );
-
-    if (job.segmentId) {
-      const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id, client);
-      await enqueueCurationIfSegmentReady(client, {
-        vaultId: job.vault.id,
-        segmentId: job.segmentId,
-        enqueue
-      });
-    }
-
-    await completePersistentJobIfReady(client, job.jobId);
+async function completeExtractionJob(job: LoadedJob, lease: WorkerLease): Promise<void> {
+  await withWorkerLeaseTransaction(lease, async (client) => {
+    if (!await recordWorkerAction(client, lease, 'extract-and-complete')) return;
+    await finalizeExtractionJob(client, job, lease);
   });
 }
 
-async function deadLetterQueuedJob(queuedJob: QueuedWorkRow, retryCount: number, lastError: string) {
-  await withTransaction(async (client) => {
+async function finalizeExtractionJob(client: import('pg').PoolClient, job: LoadedJob, lease: WorkerLease): Promise<void> {
+  const deleted = await client.query(
+    `DELETE FROM extraction_queue
+     WHERE id = $1 AND claim_token = $2 AND claimed_by = $3`,
+    [job.queueId, lease.claimToken, lease.workerId]
+  );
+  if (deleted.rowCount !== 1) throw new StaleWorkerLeaseError(lease);
+  await client.query(
+    `UPDATE raw_chunks
+     SET processed = true
+     WHERE vault_id = $2 AND id = ANY($1::uuid[])`,
+    [job.chunkIds, job.vault.id]
+  );
+
+  if (job.segmentId) {
+    const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id, client);
+    await enqueueCurationIfSegmentReady(client, {
+      vaultId: job.vault.id,
+      segmentId: job.segmentId,
+      enqueue
+    });
+  }
+
+  await completePersistentJobIfReady(client, job.jobId);
+}
+
+async function deadLetterQueuedJob(queuedJob: QueuedWorkRow, lease: WorkerLease, retryCount: number, lastError: string) {
+  await withWorkerLeaseTransaction(lease, async (client) => {
+    if (!await recordWorkerAction(client, lease, 'dead-letter')) return;
     await client.query(
       `INSERT INTO extraction_dead_letter (vault_id, chunk_id, segment_id, retry_count, last_error, job_id)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [queuedJob.vault_id, queuedJob.chunk_id, queuedJob.segment_id, retryCount, lastError, queuedJob.job_id]
     );
-    await client.query(`DELETE FROM extraction_queue WHERE id = $1`, [queuedJob.queue_id]);
+    const deleted = await client.query(
+      `DELETE FROM extraction_queue WHERE id = $1 AND claim_token = $2 AND claimed_by = $3`,
+      [queuedJob.queue_id, lease.claimToken, lease.workerId]
+    );
+    if (deleted.rowCount !== 1) throw new StaleWorkerLeaseError(lease);
     if (queuedJob.segment_id) {
       const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(queuedJob.vault_id, client);
       await enqueueCurationIfSegmentReady(client, {
@@ -666,7 +775,7 @@ async function deadLetterQueuedJob(queuedJob: QueuedWorkRow, retryCount: number,
   });
 }
 
-async function failQueuedJob(queuedJob: QueuedWorkRow, lastError: string) {
+async function failQueuedJob(queuedJob: QueuedWorkRow, lease: WorkerLease, lastError: string) {
   // This limit is based on the persisted queue retry_count, unlike rate-limit
   // retries which happen in memory during a single job attempt.
   const nextRetryCount = queuedJob.retry_count + 1;
@@ -680,55 +789,34 @@ async function failQueuedJob(queuedJob: QueuedWorkRow, lastError: string) {
       max_retries: config.MAX_EXTRACTION_RETRIES,
       error: lastError
     }));
-    await deadLetterQueuedJob(queuedJob, nextRetryCount, lastError);
+    await deadLetterQueuedJob(queuedJob, lease, nextRetryCount, lastError);
     return;
   }
 
-  await query(
-    `UPDATE extraction_queue
-     SET retry_count = retry_count + 1,
-         last_error = $2,
-         claimed_at = NULL,
-         claimed_by = NULL
-     WHERE id = $1`,
-    [queuedJob.queue_id, lastError]
-  );
+  await releaseWorkerLease(lease, { incrementRetry: true, lastError });
 }
 
-async function releaseQueuedJob(queueId: string, lastError: string) {
-  await query(
-    `UPDATE extraction_queue
-     SET last_error = $2,
-         claimed_at = NULL,
-         claimed_by = NULL
-     WHERE id = $1`,
-    [queueId, lastError]
-  );
+async function releaseQueuedJob(lease: WorkerLease, lastError: string) {
+  await releaseWorkerLease(lease, { lastError });
 }
 
-async function deferQueuedJob(queueId: string, error: AiBudgetDeferredError) {
-  await query(
-    `UPDATE extraction_queue
-     SET available_at = $2,
-         last_error = $3,
-         claimed_at = NULL,
-         claimed_by = NULL
-     WHERE id = $1`,
-    [queueId, error.availableAt.toISOString(), error.message]
-  );
+async function deferQueuedJob(lease: WorkerLease, error: AiBudgetDeferredError) {
+  await releaseWorkerLease(lease, { availableAt: error.availableAt, lastError: error.message });
 }
 
 async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   if (queuedJob.segment_id) {
     const segmentResult = await query<SegmentRow & VaultContextRow>(
       `SELECT s.id, s.vault_id, s.session_id, s.chunk_ids, s.created_at,
+              s.project_id, s.task_id, s.agent_id, s.trigger_type,
               v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id,
               v.type, v.custom_extraction_prompt, v.custom_curation_prompt
        FROM segments s
        JOIN vaults v ON v.id = s.vault_id
        WHERE s.id = $1
+         AND s.vault_id = $2
        LIMIT 1`,
-      [queuedJob.segment_id]
+      [queuedJob.segment_id, queuedJob.vault_id]
     );
 
     if (!segmentResult.rowCount) {
@@ -740,8 +828,9 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
       `SELECT id, vault_id, session_id, role, blob_store, blob_key, created_at, provenance
        FROM raw_chunks
        WHERE id = ANY($1::uuid[])
+         AND vault_id = $2
          AND blob_key IS NOT NULL`,
-      [segment.chunk_ids]
+      [segment.chunk_ids, segment.vault_id]
     );
     const chunkById = new Map(chunksResult.rows.map((row) => [row.id, row]));
     const orderedChunks = segment.chunk_ids
@@ -768,7 +857,14 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
       sessionId: segment.session_id,
       chunkIds: segment.chunk_ids,
       chunks: orderedChunks,
-      createdAt: segment.created_at
+      createdAt: segment.created_at,
+      context: {
+        session_id: segment.session_id,
+        project_id: segment.project_id ?? undefined,
+        task_id: segment.task_id ?? undefined,
+        agent_id: segment.agent_id ?? undefined,
+        trigger_type: segment.trigger_type ?? undefined
+      }
     };
   }
 
@@ -783,9 +879,10 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
      FROM raw_chunks rc
      JOIN vaults v ON v.id = rc.vault_id
      WHERE rc.id = $1
+       AND rc.vault_id = $2
        AND rc.blob_key IS NOT NULL
      LIMIT 1`,
-    [queuedJob.chunk_id]
+    [queuedJob.chunk_id, queuedJob.vault_id]
   );
 
   if (!chunkResult.rowCount) {
@@ -810,11 +907,23 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
     sessionId: chunk.session_id,
     chunkIds: [chunk.id],
     chunks: [chunk],
-    createdAt: chunk.created_at
+    createdAt: chunk.created_at,
+    context: {
+      session_id: chunk.session_id,
+      trigger_type: getChunkTriggerType(chunk)
+    }
   };
 }
 
-async function decryptVaultPromptContext(vault: VaultContextRow): Promise<VaultPromptContext> {
+function getChunkTriggerType(chunk: RawChunkRow): RecallContext['trigger_type'] | undefined {
+  if (!chunk.provenance || typeof chunk.provenance !== 'object') return undefined;
+  const value = (chunk.provenance as { trigger_type?: unknown }).trigger_type;
+  return typeof value === 'string' && ['direct', 'delegated', 'scheduled', 'event', 'backfill', 'api', 'unknown'].includes(value)
+    ? value as RecallContext['trigger_type']
+    : undefined;
+}
+
+function decryptVaultPromptContext(vault: VaultContextRow, preparedCrypto: PreparedVaultCrypto): VaultPromptContext {
   if (vault.type !== 'custom') {
     return { type: vault.type };
   }
@@ -822,10 +931,10 @@ async function decryptVaultPromptContext(vault: VaultContextRow): Promise<VaultP
   return {
     type: vault.type,
     custom_extraction_prompt: vault.custom_extraction_prompt
-      ? await decryptForVault(vault, vault.custom_extraction_prompt)
+      ? preparedCrypto.decrypt(vault, vault.custom_extraction_prompt)
       : null,
     custom_curation_prompt: vault.custom_curation_prompt
-      ? await decryptForVault(vault, vault.custom_curation_prompt)
+      ? preparedCrypto.decrypt(vault, vault.custom_curation_prompt)
       : null
   };
 }
@@ -856,8 +965,12 @@ function getLatestChunkTimestamp(chunks: RawChunkRow[]): string | null {
 async function getOrCreateSessionContext(
   vault: VaultContextRow,
   sessionId: string,
-  conversation: string
-): Promise<{ context: string | null; isNew: boolean }> {
+  conversation: string,
+  lease: WorkerLease,
+  preparedCrypto: PreparedVaultCrypto,
+  aliasScopeKey: string | null,
+  assertNotLost: () => void
+): Promise<string | null> {
   const existing = await query<{ context: string }>(
     `SELECT context
      FROM session_contexts
@@ -867,36 +980,42 @@ async function getOrCreateSessionContext(
   );
 
   if (existing.rowCount) {
-    return { context: await decryptForVault(vault, existing.rows[0].context), isNew: false };
+    return preparedCrypto.decrypt(vault, existing.rows[0].context);
   }
 
   const summary = await extractor.extractSessionContext(conversation, buildPromptHeader(vault.purpose, null), vault.id);
   if (!summary) {
-    return { context: null, isNew: false };
+    return null;
   }
 
-  const storedContext = await encryptForVault(vault, summary);
-  const inserted = await query<{ context: string }>(
-    `INSERT INTO session_contexts (vault_id, session_id, context)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (vault_id, session_id) DO NOTHING
-     RETURNING context`,
-    [vault.id, sessionId, storedContext]
-  );
+  assertNotLost();
+  const aliases = aliasScopeKey === null ? [] : await extractor.extractSessionAliases(conversation, vault.id);
+  return withWorkerLeaseTransaction(lease, async client => {
+    await preparedCrypto.assertCurrent(client);
+    const storedContext = preparedCrypto.encrypt(vault, summary);
+    const inserted = await client.query<{ context: string }>(
+      `INSERT INTO session_contexts (vault_id, session_id, context)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (vault_id, session_id) DO NOTHING
+       RETURNING context`,
+      [vault.id, sessionId, storedContext]
+    );
 
-  if (inserted.rowCount) {
-    return { context: summary, isNew: true };
-  }
+    if (inserted.rowCount) {
+      await upsertEntityAliases(client, vault.id, aliases, 'session', aliasScopeKey);
+      return summary;
+    }
 
-  const conflictRead = await query<{ context: string }>(
-    `SELECT context
-     FROM session_contexts
-     WHERE vault_id = $1 AND session_id = $2
-     LIMIT 1`,
-    [vault.id, sessionId]
-  );
-  const conflictContext = conflictRead.rowCount ? await decryptForVault(vault, conflictRead.rows[0].context) : summary;
-  return { context: conflictContext, isNew: false };
+    const conflictRead = await client.query<{ context: string }>(
+      `SELECT context
+       FROM session_contexts
+       WHERE vault_id = $1 AND session_id = $2
+       LIMIT 1`,
+      [vault.id, sessionId]
+    );
+    if (!conflictRead.rows[0]) throw new Error('Committed session context disappeared');
+    return preparedCrypto.decrypt(vault, conflictRead.rows[0].context);
+  });
 }
 
 async function withRateLimitRetries(queuedJob: QueuedWorkRow, fn: () => Promise<void>) {
@@ -920,7 +1039,11 @@ async function withRateLimitRetries(queuedJob: QueuedWorkRow, fn: () => Promise<
           retries: attempt,
           error: lastError
         }));
-        await deadLetterQueuedJob(queuedJob, attempt, lastError);
+        const lease: WorkerLease = {
+          queueKind: 'extraction', queueId: queuedJob.queue_id,
+          claimToken: queuedJob.claim_token, workerId
+        };
+        await deadLetterQueuedJob(queuedJob, lease, attempt, lastError);
         return;
       }
 
@@ -942,8 +1065,11 @@ async function withRateLimitRetries(queuedJob: QueuedWorkRow, fn: () => Promise<
 }
 
 async function upsertEntityAliases(
+  client: import('pg').PoolClient,
   vaultId: string,
-  aliases: Array<{ alias: string; canonical: string }>
+  aliases: Array<{ alias: string; canonical: string }>,
+  scope: 'global' | 'project' | 'task' | 'session',
+  scopeKey: string | null
 ): Promise<void> {
   const normalisedAliases = aliases.map(({ alias, canonical }) => ({
     alias: normaliseSubject(alias),
@@ -954,15 +1080,17 @@ async function upsertEntityAliases(
     return;
   }
 
-  await query(
-    `INSERT INTO entity_aliases (vault_id, alias, canonical)
-     SELECT $1, alias, canonical
+  await client.query(
+    `INSERT INTO entity_aliases (vault_id, alias, canonical, scope, scope_key)
+     SELECT $1, alias, canonical, $4, $5
      FROM UNNEST($2::text[], $3::text[]) AS t(alias, canonical)
-     ON CONFLICT (vault_id, alias) DO NOTHING`,
+     ON CONFLICT (vault_id, scope, scope_key, alias) DO NOTHING`,
     [
       vaultId,
       normalisedAliases.map(({ alias }) => alias),
-      normalisedAliases.map(({ canonical }) => canonical)
+      normalisedAliases.map(({ canonical }) => canonical),
+      scope,
+      scopeKey
     ]
   );
 }
@@ -979,6 +1107,14 @@ async function runLoop() {
     } catch (error) {
       if (!isShuttingDown) {
         console.error('Extraction loop iteration failed', error);
+      }
+    }
+
+    if (!isShuttingDown) {
+      try {
+        await trackWorkerTask(drainDueContradictionActivations(extractor));
+      } catch (error) {
+        console.error('Contradiction activation iteration failed', error);
       }
     }
 
@@ -1030,15 +1166,21 @@ async function handleRunOnce(message: WorkerRunOnceRequest) {
 if (parentPort) {
   parentPort.on('message', (message: WorkerRequest) => {
     if (message.type === 'run-once') {
-      void handleRunOnce(message);
+      // Include status/counter completion after processBatch in the drain barrier.
+      if (!isShuttingDown) void trackWorkerTask(handleRunOnce(message)).catch(() => process.exit(1));
+      else void handleRunOnce(message).catch(() => process.exit(1));
     } else if (message.type === 'shutdown') {
-      void shutdownWorker();
+      void shutdownWorker(message.deadline).catch(() => process.exit(1));
     }
   });
 }
 
-void runLoop().catch(async (error) => {
-  console.error(getSpanAttributes({ error }), 'Extraction worker terminated');
-  await shutdownWorker();
-  process.exit(1);
-});
+if (parentPort) {
+  workerLoop = runLoop();
+  // The failure handler is outside the promise shutdown waits for.
+  void workerLoop.catch(async (error) => {
+    workerLoopFailed = true;
+    try { console.error(getSpanAttributes({ error }), 'Extraction worker terminated'); }
+    finally { try { await shutdownWorker(); } finally { process.exit(1); } }
+  });
+}

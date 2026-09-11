@@ -110,6 +110,51 @@ export async function unwrapDek(encryptedDek: string): Promise<Buffer> {
   return getKeyEncryptionProvider().unwrapDek(encryptedDek);
 }
 
+export interface PreparedVaultCrypto {
+  assertCurrent(client: import('pg').PoolClient): Promise<void>;
+  encrypt(vault: VaultEncryptionContext, plaintext: string): string;
+  decrypt(vault: VaultEncryptionContext, ciphertext: string): string;
+  subject(vault: VaultEncryptionContext, value: string): { encrypted: string; hmac: string } | null;
+  subjectMatch(vault: VaultEncryptionContext, value: string): string;
+}
+
+/** Resolve exactly this wrapped key before taking mutation locks. The resulting
+ * capability has local transforms only: no cache expiry or provider fallback. */
+export async function prepareVaultCrypto(vault: VaultEncryptionContext): Promise<PreparedVaultCrypto> {
+  const identity = { ...vault };
+  const enabled = isVaultEncryptionActive(identity);
+  if (enabled && !identity.encrypted_dek) throw new Error('Missing vault encryption key');
+  const dek = enabled ? await unwrapDek(identity.encrypted_dek!) : null;
+  const assertIdentity = (current: VaultEncryptionContext) => {
+    if (!current || current.id !== identity.id || current.encrypted_dek !== identity.encrypted_dek
+      || current.vault_encryption_enabled !== identity.vault_encryption_enabled || isVaultEncryptionActive(current) !== enabled) {
+      throw new Error('Prepared vault encryption identity changed');
+    }
+  };
+  return Object.freeze({
+    async assertCurrent(client: import('pg').PoolClient) {
+      const row = await client.query<VaultEncryptionContext>(
+        'SELECT id, encrypted_dek, vault_encryption_enabled FROM vaults WHERE id=$1 FOR SHARE', [identity.id]);
+      assertIdentity(row.rows[0]);
+    },
+    encrypt(current: VaultEncryptionContext, value: string) {
+      assertIdentity(current); return dek ? encryptField(value, dek) : value;
+    },
+    decrypt(current: VaultEncryptionContext, value: string) {
+      assertIdentity(current);
+      if (!dek) return value;
+      try { return decryptField(value, dek); }
+      catch (cause) { throw new MemoryCiphertextError('Memory ciphertext could not be authenticated', { cause }); }
+    },
+    subject(current: VaultEncryptionContext, value: string) {
+      assertIdentity(current); return dek ? { encrypted: encryptField(value, dek), hmac: computeSubjectHmac(value, dek) } : null;
+    },
+    subjectMatch(current: VaultEncryptionContext, value: string) {
+      assertIdentity(current); return dek ? computeSubjectHmac(value, dek) : value;
+    }
+  });
+}
+
 export function encryptField(plaintext: string, dek: Buffer): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', dek, iv);
@@ -151,7 +196,17 @@ export async function decryptForVault(vault: VaultEncryptionContext, ciphertext:
   }
 
   const dek = await getVaultDek(vault);
-  return decryptField(ciphertext, dek);
+  try {
+    return decryptField(ciphertext, dek);
+  } catch (cause) {
+    throw new MemoryCiphertextError('Memory ciphertext could not be authenticated', { cause });
+  }
+}
+
+// Key-provider and credential failures occur before this error boundary. Only a
+// stored payload that fails local authenticated decryption is record-specific.
+export class MemoryCiphertextError extends Error {
+  readonly name = 'MemoryCiphertextError';
 }
 
 export async function encryptSubjectForVault(

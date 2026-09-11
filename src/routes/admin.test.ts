@@ -190,6 +190,7 @@ describe('admin vault updates', () => {
         ingest_events: '20',
         memory_adds: '8',
         searches: '40',
+        memories_max: '1000',
         limits: {
           memories_max: 1000,
           ingest_events_per_month: 100,
@@ -202,6 +203,7 @@ describe('admin vault updates', () => {
       rowCount: 1,
       rows: [{
         active: '120',
+        capacity_used: '120',
         candidate: '0',
         needs_review: '0',
         contradicted: '0',

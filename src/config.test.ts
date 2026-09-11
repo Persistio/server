@@ -73,6 +73,24 @@ describe('config environment normalization', () => {
     ).toBe(2500);
   });
 
+  it('bounds stale raw chunk blob reconciliation work by default and accepts overrides', async () => {
+    const defaults = await parseConfig();
+    expect(defaults.RAW_CHUNK_RECONCILE_INTERVAL_MS).toBe(60_000);
+    expect(defaults.RAW_CHUNK_RECONCILE_BATCH_SIZE).toBe(100);
+    const custom = await parseConfig({
+      RAW_CHUNK_RECONCILE_INTERVAL_MS: '15000',
+      RAW_CHUNK_RECONCILE_BATCH_SIZE: '25'
+    });
+    expect(custom.RAW_CHUNK_RECONCILE_INTERVAL_MS).toBe(15_000);
+    expect(custom.RAW_CHUNK_RECONCILE_BATCH_SIZE).toBe(25);
+  });
+
+  it('defaults global behavioral recall to approved-only and validates emergency modes', async () => {
+    expect((await parseConfig()).GLOBAL_RULE_POLICY).toBe('approved_only');
+    expect((await parseConfig({ GLOBAL_RULE_POLICY: 'off' })).GLOBAL_RULE_POLICY).toBe('off');
+    expect((await parseConfig({ GLOBAL_RULE_POLICY: 'legacy' })).GLOBAL_RULE_POLICY).toBe('legacy');
+  });
+
   it('keeps storage embedding dimensions upgrade-safe by default', async () => {
     const { getConfig, getConfiguredEmbeddingDimensions } = await import('./config');
 

@@ -6,6 +6,7 @@ import Fastify from 'fastify';
 import type { FastifyReply } from 'fastify';
 
 import { shutdownAzureMonitor } from './azure-monitor';
+import { closeRuntimeHttp, createRuntimeShutdown, drainRuntimeOwner, stopRuntimeWorker } from './runtime-shutdown';
 import { getConfig } from './config';
 import { httpRequestDurationHistogram } from './http-metrics';
 import type { JobRecord, JobStore } from './routes/jobs';
@@ -110,11 +111,14 @@ async function main() {
     await initCryptoClient();
   }
 
-  if (shouldRegisterFullApi) {
+  if (!isAnalyticsApi) {
     const db = await import('./db/client');
     closeDbPool = db.closePool;
     const { runMigrations } = db;
     await runMigrations();
+    // Main process only, after schema readiness. Analytics has no platform DB.
+    const { registerDeliveryHealthMetrics } = await import('./services/delivery-health');
+    registerDeliveryHealthMetrics();
   }
 
   const app = Fastify({
@@ -161,17 +165,20 @@ async function main() {
   const jobs = new InMemoryJobStore();
   const worker = shouldStartWorker
     ? new Worker(path.resolve(__dirname, 'daemon', 'extraction-worker.js'), {
-      execArgv: ['--require', path.resolve(__dirname, 'preload.js')]
+      execArgv: ['--require', path.resolve(__dirname, 'preload.js')],
+      workerData: { component: 'extraction' }
     })
     : undefined;
   const curationWorker = shouldStartCurationWorker
     ? new Worker(path.resolve(__dirname, 'daemon', 'curation-worker.js'), {
-      execArgv: ['--require', path.resolve(__dirname, 'preload.js')]
+      execArgv: ['--require', path.resolve(__dirname, 'preload.js')],
+      workerData: { component: 'curation' }
     })
     : undefined;
 
   let startedEventOutboxDispatcher: { start(): void; stop(): Promise<void> } | undefined;
   let startedUsagePeriodSweeper: { start(): void; stop(): Promise<void> } | undefined;
+  let startedRawChunkBlobReconciler: { start(): void; stop(): Promise<void> } | undefined;
   if (shouldStartEventOutboxDispatcher && eventPublisher) {
     const db = await import('./db/client');
     closeDbPool ??= db.closePool;
@@ -199,10 +206,17 @@ async function main() {
       intervalMs: config.USAGE_PERIOD_SWEEP_INTERVAL_MS,
       logger: app.log
     });
+    const { RawChunkBlobReconciler } = await import('./services/raw-chunk-blob-reconciler');
+    startedRawChunkBlobReconciler = new RawChunkBlobReconciler({
+      batchSize: config.RAW_CHUNK_RECONCILE_BATCH_SIZE,
+      intervalMs: config.RAW_CHUNK_RECONCILE_INTERVAL_MS,
+      logger: app.log
+    });
   }
 
   startedEventOutboxDispatcher?.start();
   startedUsagePeriodSweeper?.start();
+  startedRawChunkBlobReconciler?.start();
 
   worker?.on('message', (message: { type: string; jobId?: string; status?: JobRecord['status']; error?: string }) => {
     if (message.type === 'job-status' && message.jobId && message.status) {
@@ -243,46 +257,6 @@ async function main() {
     });
   };
 
-  const shutdownWorker = async (target: Worker | undefined, name: string) => {
-    if (!target) return;
-
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      let timeout: NodeJS.Timeout | undefined;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        if (timeout) clearTimeout(timeout);
-        target.off('message', onMessage);
-        target.off('exit', onExit);
-        resolve();
-      };
-      const terminate = () => {
-        app.log.warn({ worker: name }, 'Worker did not acknowledge shutdown; terminating');
-        void target.terminate().finally(finish);
-      };
-      const onMessage = (message: unknown) => {
-        if (typeof message === 'object' && message !== null && (message as { type?: string }).type === 'shutdown-complete') {
-          finish();
-        }
-      };
-      const onExit = () => {
-        finish();
-      };
-
-      timeout = setTimeout(terminate, 10_000);
-      target.on('message', onMessage);
-      target.once('exit', onExit);
-
-      try {
-        target.postMessage({ type: 'shutdown' });
-      } catch (error) {
-        app.log.warn({ err: error, worker: name }, 'Worker shutdown message failed; terminating');
-        terminate();
-      }
-    });
-  };
-
   await registerHealthRoutes(app, config);
   if (isAnalyticsApi) {
     await registerAnalyticsRoutes(app, config);
@@ -315,23 +289,35 @@ async function main() {
     await registerAdminRoutes(app);
   }
 
-  const shutdown = async () => {
-    await startedUsagePeriodSweeper?.stop();
-    await startedEventOutboxDispatcher?.stop();
-    await eventPublisher?.close?.();
-    await app.close();
-    await shutdownWorker(curationWorker, 'curation');
-    await shutdownWorker(worker, 'extraction');
-    await shutdownCustomerMetrics();
-    await closeDbPool?.();
-    await shutdownAzureMonitor();
-  };
+  let httpDrain: Promise<void> | undefined;
+  const stopHttp = () => httpDrain ??= closeRuntimeHttp(() => app.close(), () => app.server.closeIdleConnections());
+  const shutdown = createRuntimeShutdown({
+    cloudRun: Boolean(process.env.K_SERVICE),
+    warn: message => app.log.warn(message),
+    exit: code => process.exit(code),
+    branches: [
+      deadline => drainRuntimeOwner({
+        drain: [stopHttp, () => startedUsagePeriodSweeper?.stop(),
+          () => startedRawChunkBlobReconciler?.stop(), () => startedEventOutboxDispatcher?.stop()],
+        publishers: [() => eventPublisher?.close?.(), shutdownCustomerMetrics],
+        telemetry: shutdownAzureMonitor,
+        pool: () => closeDbPool?.(),
+        deadline
+      }),
+      deadline => stopRuntimeWorker(curationWorker, deadline),
+      async deadline => {
+        // An admitted combined-mode request can still dispatch extraction work.
+        if (config.PERSISTIO_MODE === 'combined') await stopHttp();
+        await stopRuntimeWorker(worker, deadline);
+      }
+    ]
+  });
 
   process.on('SIGINT', () => {
-    void shutdown().finally(() => process.exit(0));
+    void shutdown();
   });
   process.on('SIGTERM', () => {
-    void shutdown().finally(() => process.exit(0));
+    void shutdown();
   });
 
   await app.listen({

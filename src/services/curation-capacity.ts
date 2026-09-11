@@ -66,6 +66,8 @@ export interface ClaimedCurationJobRow {
   queue_id: string;
   vault_id: string;
   segment_id: string;
+  claim_token: string;
+  vault_claim_token: string;
 }
 
 interface VaultLimitsRow extends QueryResultRow {
@@ -260,7 +262,7 @@ export async function claimEligibleCurationJobs(limit: number, workerId: string)
            SELECT 1
            FROM curation_queue cq
            WHERE cq.vault_id = v.id
-             AND cq.claimed_at IS NULL
+             AND (cq.claim_token IS NULL OR cq.lease_expires_at <= now())
              AND cq.available_at <= now()
          )
      ),
@@ -271,7 +273,7 @@ export async function claimEligibleCurationJobs(limit: number, workerId: string)
          SELECT cq.id, cq.vault_id, cq.segment_id, cq.enqueued_at
          FROM curation_queue cq
          WHERE cq.vault_id = ev.vault_id
-           AND cq.claimed_at IS NULL
+           AND (cq.claim_token IS NULL OR cq.lease_expires_at <= now())
            AND cq.available_at <= now()
          ORDER BY cq.enqueued_at ASC
          LIMIT LEAST(
@@ -293,28 +295,37 @@ export async function claimEligibleCurationJobs(limit: number, workerId: string)
        LIMIT $1
      ),
      reserved_vaults AS (
-       INSERT INTO vault_curation_state (vault_id, curator_claimed_until, curator_claimed_by, updated_at)
-       SELECT DISTINCT vault_id, now() + interval '10 minutes', $3, now()
-       FROM selected
+       INSERT INTO vault_curation_state (
+         vault_id, curator_claimed_until, curator_claimed_by, curator_claim_token, updated_at
+       )
+       SELECT selected_vaults.vault_id, now() + interval '10 minutes', $3, gen_random_uuid(), now()
+       FROM (SELECT DISTINCT vault_id FROM selected) selected_vaults
+       ORDER BY selected_vaults.vault_id
        ON CONFLICT (vault_id) DO UPDATE
        SET curator_claimed_until = EXCLUDED.curator_claimed_until,
            curator_claimed_by = EXCLUDED.curator_claimed_by,
+           curator_claim_token = EXCLUDED.curator_claim_token,
            updated_at = now()
        WHERE (vault_curation_state.next_curator_run_at IS NULL OR vault_curation_state.next_curator_run_at <= now())
          AND (vault_curation_state.curator_claimed_until IS NULL OR vault_curation_state.curator_claimed_until <= now())
-       RETURNING vault_id
+       RETURNING vault_id, curator_claim_token
      ),
      claimed AS (
-       SELECT selected.queue_id, selected.vault_id, selected.segment_id
+       SELECT selected.queue_id, selected.vault_id, selected.segment_id,
+              reserved_vaults.curator_claim_token AS vault_claim_token
        FROM selected
        JOIN reserved_vaults
          ON reserved_vaults.vault_id = selected.vault_id
      )
      UPDATE curation_queue cq
-     SET claimed_at = now(), claimed_by = $3
+     SET claimed_at = now(),
+         claimed_by = $3,
+         claim_token = gen_random_uuid(),
+         lease_expires_at = now() + interval '10 minutes'
      FROM claimed
      WHERE cq.id = claimed.queue_id
-     RETURNING claimed.queue_id, claimed.vault_id, claimed.segment_id`,
+     RETURNING claimed.queue_id, claimed.vault_id, claimed.segment_id,
+               cq.claim_token, claimed.vault_claim_token`,
     [limit, period, workerId]
   );
 
@@ -328,12 +339,37 @@ export async function recordCuratorUsage(input: {
   promptTokens: number;
   completionTokens: number;
   limits: CuratorPlanLimits;
-}) {
+  actionReceipt?: { queueId: string; actionKey: string };
+}): Promise<boolean> {
+  return withTransaction((client) => recordCuratorUsageInTransaction(client, input));
+}
+
+export async function recordCuratorUsageInTransaction(client: PoolClient, input: {
+  vaultId: string;
+  candidatesProcessed: number;
+  countRun?: boolean;
+  promptTokens: number;
+  completionTokens: number;
+  limits: CuratorPlanLimits;
+  actionReceipt?: { queueId: string; actionKey: string };
+}): Promise<boolean> {
   const period = getCurrentUsagePeriod();
   const curatorRuns = input.countRun === false ? 0 : 1;
-  await withTransaction(async (client) => {
-    await writeUsagePeriodClosedEventIfNeeded(client, input.vaultId, period);
-    await client.query(
+  if (input.actionReceipt) {
+    const receipt = await client.query(
+      `UPDATE worker_action_receipts
+       SET accounted_at = now()
+       WHERE queue_kind = 'curation'
+         AND queue_id = $1
+         AND action_key = $2
+         AND accounted_at IS NULL
+       RETURNING queue_id`,
+      [input.actionReceipt.queueId, input.actionReceipt.actionKey]
+    );
+    if (receipt.rowCount !== 1) return false;
+  }
+  await writeUsagePeriodClosedEventIfNeeded(client, input.vaultId, period);
+  await client.query(
       `INSERT INTO vault_usage (
          vault_id, period, curator_runs, curator_requests, curator_input_tokens,
          curator_output_tokens, curator_candidates_processed, updated_at
@@ -352,23 +388,20 @@ export async function recordCuratorUsage(input: {
            curator_candidates_deferred = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred ELSE 0 END,
            updated_at = now()`,
       [input.vaultId, period, curatorRuns, input.promptTokens, input.completionTokens, input.candidatesProcessed]
-    );
-  });
-
+  );
   if (curatorRuns > 0) {
-    await query(
+    await client.query(
       `INSERT INTO vault_curation_state (vault_id, last_curator_run_at, next_curator_run_at, last_curator_defer_reason, updated_at)
        VALUES ($1, now(), now() + ($2::text || ' minutes')::interval, NULL, now())
        ON CONFLICT (vault_id) DO UPDATE
        SET last_curator_run_at = EXCLUDED.last_curator_run_at,
            next_curator_run_at = EXCLUDED.next_curator_run_at,
            last_curator_defer_reason = NULL,
-           curator_claimed_until = NULL,
-           curator_claimed_by = NULL,
            updated_at = now()`,
       [input.vaultId, input.limits.curator_schedule_interval_minutes]
     );
   }
+  return true;
 }
 
 export async function recordCuratorRunCompletedActivity(input: {
@@ -431,46 +464,47 @@ export async function recordCuratorRunCompletedActivity(input: {
   }
 }
 
-export async function recordCuratorDeferral(input: {
+interface CuratorDeferral {
   vaultId: string;
   candidatesDeferred?: number;
   reason: string;
   availableAt?: Date;
-}) {
+}
+
+export async function recordCuratorDeferral(input: CuratorDeferral) {
+  return withTransaction(client => recordCuratorDeferralInTransaction(client, input));
+}
+
+export async function recordCuratorDeferralInTransaction(client: PoolClient, input: CuratorDeferral) {
   const period = getCurrentUsagePeriod();
   const candidatesDeferred = input.candidatesDeferred ?? 0;
-  await withTransaction(async (client) => {
-    await writeUsagePeriodClosedEventIfNeeded(client, input.vaultId, period);
-    await client.query(
-      `INSERT INTO vault_usage (vault_id, period, curator_candidates_deferred, updated_at)
-       VALUES ($1, $2, $3, now())
-       ON CONFLICT (vault_id) DO UPDATE
-       SET period = EXCLUDED.period,
-           ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
-           memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
-           searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
-           curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs ELSE 0 END,
-           curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests ELSE 0 END,
-           curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens ELSE 0 END,
-           curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens ELSE 0 END,
-           curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed ELSE 0 END,
-           curator_candidates_deferred = CASE
-             WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred + EXCLUDED.curator_candidates_deferred
-             ELSE EXCLUDED.curator_candidates_deferred
-           END,
-           updated_at = now()`,
-      [input.vaultId, period, candidatesDeferred]
-    );
-  });
-
-  await query(
+  await writeUsagePeriodClosedEventIfNeeded(client, input.vaultId, period);
+  await client.query(
+    `INSERT INTO vault_usage (vault_id, period, curator_candidates_deferred, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (vault_id) DO UPDATE
+     SET period = EXCLUDED.period,
+         ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
+         memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
+         searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
+         curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs ELSE 0 END,
+         curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests ELSE 0 END,
+         curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens ELSE 0 END,
+         curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens ELSE 0 END,
+         curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed ELSE 0 END,
+         curator_candidates_deferred = CASE
+           WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred + EXCLUDED.curator_candidates_deferred
+           ELSE EXCLUDED.curator_candidates_deferred
+         END,
+         updated_at = now()`,
+    [input.vaultId, period, candidatesDeferred]
+  );
+  await client.query(
     `INSERT INTO vault_curation_state (vault_id, next_curator_run_at, last_curator_defer_reason, updated_at)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (vault_id) DO UPDATE
      SET next_curator_run_at = COALESCE($2, vault_curation_state.next_curator_run_at),
          last_curator_defer_reason = EXCLUDED.last_curator_defer_reason,
-         curator_claimed_until = NULL,
-         curator_claimed_by = NULL,
          updated_at = now()`,
     [input.vaultId, input.availableAt?.toISOString() ?? null, input.reason]
   );
@@ -513,7 +547,7 @@ export async function getCurationStatus(vaultId: string): Promise<CuratorCapacit
          MIN(available_at) FILTER (WHERE available_at > now()) AS next_queue_available_at
        FROM curation_queue
        WHERE vault_id = v.id
-         AND claimed_at IS NULL
+         AND (claim_token IS NULL OR lease_expires_at <= now())
      ) queue ON true
      WHERE v.id = $1
      LIMIT 1`,
@@ -586,16 +620,39 @@ export async function getCurationStatus(vaultId: string): Promise<CuratorCapacit
   };
 }
 
-export async function releaseCuratorClaim(vaultId: string, workerId: string): Promise<void> {
-  await query(
-    `UPDATE vault_curation_state
-     SET curator_claimed_until = NULL,
-         curator_claimed_by = NULL,
-         updated_at = now()
-     WHERE vault_id = $1
-       AND curator_claimed_by = $2`,
-    [vaultId, workerId]
-  );
+export async function releaseCuratorClaim(vaultId: string, workerId: string, claimToken: string): Promise<void> {
+  const expired = new Error('Curator claim expired during release');
+  try {
+    await withTransaction(async client => {
+      const locked = await client.query<{ deadline: string }>(
+        `SELECT curator_claimed_until::text AS deadline FROM vault_curation_state
+         WHERE vault_id = $1 AND curator_claimed_by = $2 AND curator_claim_token = $3 FOR UPDATE`,
+        [vaultId, workerId, claimToken]
+      );
+      if (!locked.rows[0]) return;
+      const live = await client.query<{ live: boolean }>(
+        'SELECT $1::timestamptz > clock_timestamp() AS live', [locked.rows[0].deadline]
+      );
+      if (!live.rows[0]?.live) return;
+      await client.query(
+        `UPDATE vault_curation_state
+         SET curator_claimed_until = NULL,
+             curator_claimed_by = NULL,
+             curator_claim_token = NULL,
+             updated_at = now()
+         WHERE vault_id = $1
+           AND curator_claimed_by = $2
+           AND curator_claim_token = $3`,
+        [vaultId, workerId, claimToken]
+      );
+      const final = await client.query<{ live: boolean }>(
+        'SELECT $1::timestamptz > clock_timestamp() AS live', [locked.rows[0].deadline]
+      );
+      if (!final.rows[0]?.live) throw expired;
+    });
+  } catch (error) {
+    if (error !== expired) throw error;
+  }
 }
 
 function getNextRunAt(scheduledRunAt: string | null, queueAvailableAt: string | null, claimedUntil: string | null): string | null {

@@ -3,12 +3,21 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   createPgvectorVerifyHook,
+  databaseApplicationName,
   createPoolErrorHandler,
   getConfiguredPoolConnectionTimeout,
   getConfiguredPoolMax,
   pool,
   validateStorageEmbeddingDimensions
 } from './client';
+
+describe('database connection attribution', () => {
+  it('distinguishes API and named worker connections', () => {
+    expect(databaseApplicationName('api', true, null)).toBe('persistio:api:main');
+    expect(databaseApplicationName('worker', false, { component: 'curation' }))
+      .toBe('persistio:worker:curation');
+  });
+});
 
 describe('pgvector pool verification', () => {
   it('skips registration before migrations enable pgvector type loading', () => {

@@ -71,22 +71,26 @@ class AzureBlobRawChunkStorage implements RawChunkStorage {
   readonly store = 'azure_blob' as const;
 
   private readonly containerClient;
+  private readonly uploadContainerClient;
   private containerReady: Promise<void> | undefined;
 
   constructor() {
     const config = getConfig();
-    const serviceClient = config.AZURE_STORAGE_CONNECTION_STRING
-      ? BlobServiceClient.fromConnectionString(config.AZURE_STORAGE_CONNECTION_STRING)
+    const createClient = (singleAttempt: boolean) => config.AZURE_STORAGE_CONNECTION_STRING
+      ? BlobServiceClient.fromConnectionString(config.AZURE_STORAGE_CONNECTION_STRING,
+        singleAttempt ? { retryOptions: { maxTries: 1 } } : {})
       : new BlobServiceClient(
         `https://${config.AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net`,
-        new DefaultAzureCredential()
+        new DefaultAzureCredential(),
+        singleAttempt ? { retryOptions: { maxTries: 1 } } : {}
       );
-    this.containerClient = serviceClient.getContainerClient(config.RAW_CHUNK_BLOB_CONTAINER);
+    this.containerClient = createClient(false).getContainerClient(config.RAW_CHUNK_BLOB_CONTAINER);
+    this.uploadContainerClient = createClient(true).getContainerClient(config.RAW_CHUNK_BLOB_CONTAINER);
   }
 
   async put(key: string, content: string): Promise<RawChunkReference> {
     await this.ensureContainer();
-    const blockBlobClient = this.containerClient.getBlockBlobClient(key);
+    const blockBlobClient = this.uploadContainerClient.getBlockBlobClient(key);
     await blockBlobClient.upload(content, Buffer.byteLength(content, 'utf8'), {
       blobHTTPHeaders: {
         blobContentType: 'text/plain; charset=utf-8'
@@ -115,15 +119,18 @@ class GcsRawChunkStorage implements RawChunkStorage {
   readonly store = 'gcs' as const;
 
   private readonly bucket: Bucket;
+  private readonly uploadBucket: Bucket;
 
   constructor() {
     const config = getConfig();
-    const storage = new Storage();
-    this.bucket = storage.bucket(config.RAW_CHUNK_GCS_BUCKET);
+    // A successful retry must not conceal an earlier still-indeterminate PUT.
+    // Each application attempt has its own durable intent and unique object key.
+    this.bucket = new Storage().bucket(config.RAW_CHUNK_GCS_BUCKET);
+    this.uploadBucket = new Storage({ retryOptions: { autoRetry: false } }).bucket(config.RAW_CHUNK_GCS_BUCKET);
   }
 
   async put(key: string, content: string): Promise<RawChunkReference> {
-    const file = this.bucket.file(key);
+    const file = this.uploadBucket.file(key);
     await file.save(content, {
       contentType: 'text/plain; charset=utf-8',
       resumable: false

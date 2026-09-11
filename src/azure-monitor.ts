@@ -2,8 +2,10 @@ import { AzureMonitorMetricExporter, AzureMonitorTraceExporter } from '@azure/mo
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import { AggregationTemporality, InstrumentType, PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
 import { NodeSDK } from '@opentelemetry/sdk-node';
+import { envDetector, processDetector, hostDetector } from '@opentelemetry/resources';
+import { memoryProducerDetector } from './memory-telemetry-resource';
 
 export interface OpenTelemetryInstrumentationOptions {
   azureSdk?: { enabled: boolean };
@@ -27,12 +29,22 @@ export interface OtlpOpenTelemetryOptions {
 }
 
 let sdk: NodeSDK | undefined;
+let shutdownPromise: Promise<void> | undefined;
 
 const DEFAULT_OTLP_HTTP_ENDPOINT = 'http://localhost:4318';
 const isEnabled = (value?: { enabled: boolean }) => value?.enabled !== false;
 
+// Do not retain unobserved health states between snapshots. The exported type
+// remains GAUGE; cumulative counters and the Azure exporter are unchanged.
+export class SnapshotOtlpMetricExporter extends OTLPMetricExporter {
+  override selectAggregationTemporality(instrumentType: InstrumentType): AggregationTemporality {
+    return instrumentType === InstrumentType.OBSERVABLE_GAUGE
+      ? AggregationTemporality.DELTA : super.selectAggregationTemporality(instrumentType);
+  }
+}
+
 export function useAzureMonitor(options: AzureMonitorOpenTelemetryOptions = {}) {
-  if (sdk) {
+  if (sdk || shutdownPromise) {
     return;
   }
 
@@ -68,7 +80,7 @@ export function useAzureMonitor(options: AzureMonitorOpenTelemetryOptions = {}) 
 }
 
 export function useOtlpTelemetry(options: OtlpOpenTelemetryOptions = {}) {
-  if (sdk) {
+  if (sdk || shutdownPromise) {
     return;
   }
 
@@ -77,7 +89,7 @@ export function useOtlpTelemetry(options: OtlpOpenTelemetryOptions = {}) {
     url: options.traceEndpoint ?? buildOtlpEndpoint(endpoint, 'v1/traces')
   });
   const metricReader = new PeriodicExportingMetricReader({
-    exporter: new OTLPMetricExporter({
+    exporter: new SnapshotOtlpMetricExporter({
       url: options.metricEndpoint ?? buildOtlpEndpoint(endpoint, 'v1/metrics')
     })
   });
@@ -95,6 +107,7 @@ export function useOtlpTelemetry(options: OtlpOpenTelemetryOptions = {}) {
 
   sdk = new NodeSDK({
     serviceName: options.serviceName ?? 'persistio-server',
+    resourceDetectors: [envDetector, processDetector, hostDetector, memoryProducerDetector],
     traceExporter,
     metricReaders: [metricReader],
     instrumentations: [getNodeAutoInstrumentations(instrumentationConfig)]
@@ -103,14 +116,17 @@ export function useOtlpTelemetry(options: OtlpOpenTelemetryOptions = {}) {
   sdk.start();
 }
 
-export async function shutdownTelemetry() {
-  if (!sdk) {
-    return;
-  }
-
+export function shutdownTelemetry(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  if (!sdk) return Promise.resolve();
   const current = sdk;
   sdk = undefined;
-  await current.shutdown();
+  // No platform timeout here. Callers may bound their wait, not this SDK's
+  // lifetime. A rejected SDK may still have components running: do not reinit.
+  shutdownPromise = Promise.resolve().then(() => current.shutdown()).then(() => {
+    shutdownPromise = undefined;
+  });
+  return shutdownPromise;
 }
 
 export const shutdownAzureMonitor = shutdownTelemetry;

@@ -1,14 +1,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { isMainThread, workerData } from 'node:worker_threads';
 import { Pool, type PoolClient, type PoolConfig, type QueryResultRow } from 'pg';
 import pgvector from 'pgvector/pg';
 
 import { getConfig } from '../config';
 
 const config = getConfig();
+export const MIGRATION_ADVISORY_LOCK_ID = '734920174600360';
 const registeredPgvectorClients = new WeakSet<PoolClient>();
 let pgvectorTypeRegistrationEnabled = false;
 let lastPoolWarningAt = 0;
+
+export function databaseApplicationName(
+  mode: string,
+  mainThread = isMainThread,
+  data: unknown = workerData
+): string {
+  const component = !mainThread && data && typeof data === 'object'
+    && typeof (data as { component?: unknown }).component === 'string'
+    ? (data as { component: string }).component
+    : (mainThread ? 'main' : 'worker');
+  return `persistio:${mode}:${component}`.slice(0, 63);
+}
 
 type PoolConfigWithVerify = PoolConfig & {
   verify?: (client: PoolClient, callback: (error?: Error) => void) => void;
@@ -50,6 +64,7 @@ export function createPgvectorVerifyHook(
 
 export const pool = new Pool({
   connectionString: config.DATABASE_URL,
+  application_name: databaseApplicationName(config.PERSISTIO_MODE),
   connectionTimeoutMillis: config.DB_POOL_CONNECTION_TIMEOUT_MS,
   max: getConfiguredPoolMax(config),
   verify: createPgvectorVerifyHook()
@@ -102,8 +117,13 @@ export async function withTransaction<T>(callback: (client: PoolClient) => Promi
 
 export async function runMigrations() {
   const client = await pool.connect();
+  let migrationLockAcquired = false;
+  let migrationFailed = false;
+  let clientReleased = false;
 
   try {
+    await client.query(`SELECT pg_advisory_lock($1::bigint)`, [MIGRATION_ADVISORY_LOCK_ID]);
+    migrationLockAcquired = true;
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         filename TEXT PRIMARY KEY,
@@ -157,8 +177,20 @@ export async function runMigrations() {
     await validateStorageEmbeddingDimensions(client);
     pgvectorTypeRegistrationEnabled = true;
     await registerPgvectorTypes(client);
+  } catch (error) {
+    migrationFailed = true;
+    throw error;
   } finally {
-    client.release();
+    if (migrationLockAcquired) {
+      try {
+        await client.query(`SELECT pg_advisory_unlock($1::bigint)`, [MIGRATION_ADVISORY_LOCK_ID]);
+      } catch (error) {
+        client.release(toError(error));
+        clientReleased = true;
+        if (!migrationFailed) throw error;
+      }
+    }
+    if (!clientReleased) client.release();
   }
 }
 

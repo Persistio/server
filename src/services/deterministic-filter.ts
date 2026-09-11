@@ -59,7 +59,7 @@ export function filterMemoryCandidates<TFact extends ExtractedFact>(candidates: 
     }
 
     const combined = `${fact.fact}\n${fact.subject}`;
-    if (isSecretLike(combined)) {
+    if (isSecretLikeMemoryContent(combined)) {
       dropped.push({ fact, reason: 'secret_like' });
       continue;
     }
@@ -105,7 +105,7 @@ export function normalizeCandidateText(value: string): string {
     .trim();
 }
 
-function isSecretLike(value: string): boolean {
+export function isSecretLikeMemoryContent(value: string): boolean {
   // The worker already runs matchSecretPattern on fact text before this filter.
   // Reusing it here over fact + subject catches subject-line leaks without adding
   // another broad high-entropy heuristic that would drop benign IDs such as SHAs.

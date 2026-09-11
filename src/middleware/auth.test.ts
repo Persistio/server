@@ -544,6 +544,48 @@ describe('platform auth middleware', () => {
     await app.close();
   });
 
+  it('accepts only complete delegated actor identities', async () => {
+    const token = createJwt({ privateKey, scope: 'platform:analytics:read' });
+    const { app } = await buildAuthApp({
+      PLATFORM_AUTH_MODE: 'dual',
+      PLATFORM_OAUTH_ISSUER: 'https://auth.persistio.test/',
+      PLATFORM_OAUTH_AUDIENCE: 'https://api.persistio.test',
+      PLATFORM_OAUTH_CLIENT_POLICIES: oauthClientPolicies(appWorkerPolicy)
+    }, 'analyticsRead');
+    const commonHeaders = {
+      authorization: `Bearer ${token}`,
+      'x-persistio-account-id': 'd934b9cf-05b2-476d-a7b8-ef6c36b9f3ef'
+    };
+
+    const complete = await app.inject({
+      method: 'GET',
+      url: '/test',
+      headers: {
+        ...commonHeaders,
+        'x-persistio-actor-type': 'user',
+        'x-persistio-actor-id': 'user-1'
+      }
+    });
+    expect(complete.statusCode).toBe(200);
+    expect(complete.json().auth.actor).toEqual({ type: 'user', id: 'user-1' });
+
+    const typeOnly = await app.inject({
+      method: 'GET',
+      url: '/test',
+      headers: { ...commonHeaders, 'x-persistio-actor-type': 'user' }
+    });
+    expect(typeOnly.statusCode).toBe(401);
+
+    const idOnly = await app.inject({
+      method: 'GET',
+      url: '/test',
+      headers: { ...commonHeaders, 'x-persistio-actor-id': 'user-1' }
+    });
+    expect(idOnly.statusCode).toBe(401);
+
+    await app.close();
+  });
+
   it('allows App Worker plan routes without account context', async () => {
     const token = createJwt({ privateKey, scope: 'platform:plans:read' });
     const { app } = await buildAuthApp({
