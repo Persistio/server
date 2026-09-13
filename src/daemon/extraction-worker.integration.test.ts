@@ -20,7 +20,7 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
   let vector: number[];
   const candidate = (fact = 'The project uses PostgreSQL for durable storage.') => ({ fact, subject: 'Project storage', score: 9,
     salience: 0.9, sensitivity: 'low', type: 'system_fact', scope: 'project', polarity: 'neutral', volatility: 'low',
-    evidence: 'User statement', valid_from: null, valid_until: null });
+    evidence: 'User statement', source_refs:['S1'],scope_basis:'Explicit project context',valid_from: null, valid_until: null });
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
     db = await import('../db/client'); await db.runMigrations();
@@ -32,7 +32,10 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
     ({ processBatch } = await import('./extraction-worker'));
   });
   beforeEach(() => {
-    facts = vi.spyOn(extractor.prototype, 'extractFacts').mockResolvedValue([candidate()] as never);
+    facts = vi.spyOn(extractor.prototype, 'extractFacts').mockImplementation(async conversation => {
+      const parsed=JSON.parse(conversation);
+      return [{...candidate(),source_refs:[parsed.sources.find((s:any)=>s.current).ref]}] as never;
+    });
     summary = vi.spyOn(extractor.prototype, 'extractSessionContext').mockResolvedValue('Committed session summary');
     aliases = vi.spyOn(extractor.prototype, 'extractSessionAliases').mockResolvedValue([{ alias: 'DB', canonical: 'Database' }]);
     providers.embed.mockReset().mockImplementation(async (texts: string[]) => texts.map(() => vector));
@@ -42,6 +45,7 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
   afterEach(async () => {
     vi.restoreAllMocks();
     await pool.query('DELETE FROM worker_action_receipts WHERE queue_id=ANY($1::uuid[])', [queues]);
+    await pool.query('DELETE FROM extraction_queue WHERE vault_id=ANY($1::uuid[])',[vaults]);
     await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])', [vaults]);
     vaults.length = 0; queues.length = 0;
   });
@@ -56,7 +60,7 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
       await pool.query("INSERT INTO vaults(id,name,api_key_hash,plan_id,account_id) VALUES ($1,'extraction-regression',$2,'unlimited',$3)", [vault, crypto.randomUUID(), account]);
     }
     queues.push(queue);
-    await pool.query("INSERT INTO raw_chunks(id,vault_id,session_id,role,blob_store,blob_key) VALUES ($1,$2,$3,'user','local',$4)", [chunk, vault, session, `test/${chunk}`]);
+    await pool.query("INSERT INTO raw_chunks(id,vault_id,session_id,role,blob_store,blob_key,storage_bytes,capture_context) VALUES ($1,$2,$3,'user','local',$4,100,jsonb_build_object('session_id',$3::text,'project_id','project'))", [chunk, vault, session, `test/${chunk}`]);
     await pool.query("INSERT INTO segments(id,vault_id,session_id,project_id,chunk_ids) VALUES ($1,$2,$3,'project',$4::uuid[])", [segment, vault, session, [chunk]]);
     await pool.query("INSERT INTO jobs(id,vault_id,kind) VALUES ($1,$2,'bulk_ingest')", [job, vault]);
     await pool.query('INSERT INTO extraction_queue(id,vault_id,segment_id,chunk_id,job_id) VALUES ($1,$2,$3,$4,$5)',
@@ -97,15 +101,19 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
     expect(await status(f)).toMatchObject({ queue: [], job: 'completed', memories: [], usage: 0, processed: true, receipts: 1 });
     expect(deltas()).toEqual([]);
   });
-  it.each([false, true])('fences pre-gated work without starting model preparation (stale=%s)', async stale => {
+  it.each([false, true])('never promotes ambiguous forwarded content into a human rule, and fences stale work (stale=%s)', async stale => {
     const f = await fixture();
+    facts.mockResolvedValue([{ ...candidate(), type: 'user_rule' }] as never);
     providers.read.mockImplementation(async () => {
       if (stale) await pool.query("UPDATE extraction_queue SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [f.queue]);
       return '[Inter-session message] sourceSession=first sourceSession=second isUser=maybe\npayload';
     });
     await processBatch(f.vault);
-    expect(summary).not.toHaveBeenCalled(); expect(facts).not.toHaveBeenCalled();
-    expect(await status(f)).toMatchObject({ job: stale ? 'running' : 'completed', processed: !stale, receipts: stale ? 0 : 1, memories: [], usage: 0 });
+    if (stale) { expect(summary).not.toHaveBeenCalled(); expect(facts).not.toHaveBeenCalled(); }
+    else expect(facts).toHaveBeenCalledOnce();
+    expect(await status(f)).toMatchObject(stale
+      ? {job:'running',processed:false,receipts:0,memories:[],usage:0,queue:[expect.objectContaining({retry_count:0})]}
+      : {job:'completed',processed:true,receipts:1,memories:[],usage:0,queue:[]});
     expect(deltas()).toEqual([]);
   });
   it('rolls back an earlier memory, embedding, receipt and charge when the later candidate fails SQL', async () => {
@@ -116,6 +124,19 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
       queue: [expect.objectContaining({ retry_count: 1, claim_token: null })] });
     expect(deltas()).toEqual([]);
     expect((await pool.query("SELECT 1 FROM entity_aliases WHERE vault_id=$1 AND scope='project'", [f.vault])).rowCount).toBe(1);
+    expect((await pool.query('SELECT id FROM memory_mutation_events WHERE vault_id=$1',[f.vault])).rows).toEqual([]);
+    expect((await pool.query('SELECT id FROM curation_queue WHERE vault_id=$1',[f.vault])).rows).toEqual([]);
+    providers.embed.mockImplementation(async (texts:string[])=>texts.map(()=>vector));
+    await processBatch(f.vault);
+    const recovered=await status(f);
+    expect(recovered).toMatchObject({job:'completed',processed:true,receipts:1,queue:[]});
+    // Equal synthetic vectors can deduplicate the second fact; paid quota and
+    // mutations must describe only this successful transaction, never the rollback.
+    expect(recovered.usage).toBe(recovered.memories.length);
+    expect(recovered.memories.length).toBeGreaterThan(0);
+    const mutations=(await pool.query('SELECT id FROM memory_mutation_events WHERE vault_id=$1',[f.vault])).rows;
+    await processBatch(f.vault);expect(await status(f)).toEqual(recovered);expect(facts).toHaveBeenCalledTimes(2);
+    expect((await pool.query('SELECT id FROM memory_mutation_events WHERE vault_id=$1',[f.vault])).rows).toEqual(mutations);
   });
   it('rolls back a prior insertion when a later candidate exhausts the transaction quota', async () => {
     const f = await fixture(); facts.mockResolvedValue([candidate(), candidate('The project also uses durable queues.')] as never);

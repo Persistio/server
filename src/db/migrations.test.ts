@@ -269,131 +269,12 @@ describe('database migration guardrails', () => {
     }
   });
 
-  it('wires the global-rule policy through the managed GCP deployment contract', () => {
-    const locals = repoFile('infra', 'gcp', 'locals.tf');
-    const variables = repoFile('infra', 'gcp', 'variables.tf');
-    const devVariables = repoFile('infra', 'gcp', 'environments', 'dev.tfvars.example');
-    const prodVariables = repoFile('infra', 'gcp', 'environments', 'prod.tfvars.example');
 
-    expect(locals).toContain('GLOBAL_RULE_POLICY');
-    expect(locals).toContain('var.global_rule_policy');
-    expect(variables).toContain('variable "global_rule_policy"');
-    expect(variables).toContain('contains(["off", "approved_only", "legacy"], var.global_rule_policy)');
-    expect(devVariables).toContain('global_rule_policy = "approved_only"');
-    expect(prodVariables).toContain('global_rule_policy = "approved_only"');
-  });
 
-  it('prevents curator and dedup model rewrites from retaining behavioral approval', () => {
-    const curatorWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-worker.ts');
-    const dedup = repoFile('packages', 'server', 'src', 'services', 'dedup.ts');
 
-    for (const source of [curatorWorker, dedup]) {
-      expect(source).toContain("THEN 'proposed'");
-      expect(source).toContain('THEN NULL');
-      expect(source).toContain('authority_version + 1');
-      expect(source).toContain("'invalidate'");
-      expect(source).toContain('memory_authority_events');
-    }
-  });
 
-  it('preserves scope bindings in every automatic writer under lock', () => {
-    const curatorWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-worker.ts');
-    const dedup = repoFile('packages', 'server', 'src', 'services', 'dedup.ts');
 
-    expect(dedup.match(/const mergedScopeSql = 'target\.previous_scope'/g)).toHaveLength(3);
-    expect(dedup.match(/scope_key IS NOT DISTINCT FROM \$(?:16|19)::text/g)).toHaveLength(3);
-    expect(curatorWorker).toContain('scope = target.previous_scope');
-    expect(curatorWorker).toContain('SELECT id, subject, subject_encrypted, type, scope');
-    expect(curatorWorker).toContain('RETURNING memories.id, memories.subject, memories.subject_encrypted');
-    expect(curatorWorker).toContain('target.previous_data');
-    expect(curatorWorker).toContain('subject = COALESCE($4::text, memories.subject)');
-    expect(curatorWorker).toContain('type = COALESCE($9::text, memories.type)');
-    expect(curatorWorker).toContain('salience = COALESCE($11::numeric, memories.salience)');
-    expect(curatorWorker).toContain('confidence = COALESCE($12::double precision, memories.confidence)');
-    expect(curatorWorker).toContain('volatility = COALESCE($13::memory_volatility, memories.volatility)');
-    expect(curatorWorker).toContain('END || $14::jsonb');
-    expect(curatorWorker).toContain('sensitivity = $17');
-    expect(curatorWorker).toContain('source_chunks = $18::uuid[]');
-    expect(curatorWorker).toContain('valid_from = $19::date');
-    expect(curatorWorker).toContain('valid_until = $20::date');
-    expect(curatorWorker).toContain('evidence #>> \'{summary}\' AS evidence');
-    expect(curatorWorker).not.toContain('sensitivity = $13');
-    expect(curatorWorker).not.toContain('polarity = $14');
-    expect(curatorWorker).not.toContain('parent_id = $17');
-    expect(curatorWorker).toContain('subject: updated.subject');
-    expect(curatorWorker).toContain('oldValue: updated.previousFact');
-    expect(curatorWorker).toContain('INSERT INTO memory_scope_change_log');
-    expect(curatorWorker).toContain('Curator retained the least-privileged scope under row lock.');
-  });
 
-  it('keeps expired memories out of prompt-bearing worker context and prevents validity widening', () => {
-    const curatorWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-worker.ts');
-    const contradictionScanner = repoFile('packages', 'server', 'src', 'services', 'contradiction-scanner.ts');
-    const dedup = repoFile('packages', 'server', 'src', 'services', 'dedup.ts');
-    const entityResolver = repoFile('packages', 'server', 'src', 'services', 'entity-resolver.ts');
-
-    expect(curatorWorker.match(/memoryValidityPredicateSql\('active'/g)).toHaveLength(2);
-    expect(curatorWorker).toContain('const validity = intersectValidityWindows(sourceCandidates.map');
-    expect(curatorWorker).toContain('valid_from, valid_until');
-    expect(curatorWorker).toContain('input.validFrom');
-    expect(curatorWorker).toContain('input.validUntil');
-    expect(contradictionScanner).toContain('memoryValidityPredicateSql(alias, date)');
-    expect(contradictionScanner).toContain("eligibleSql('current', DATABASE_UTC_DATE)");
-    expect(contradictionScanner).toContain('ORDER BY m.id FOR UPDATE OF m');
-    expect(entityResolver.match(/memoryValidityPredicateSql\('m'/g)).toHaveLength(4);
-    expect(dedup.match(/valid_from AS previous_valid_from/g)).toHaveLength(3);
-    expect(dedup.match(/valid_until AS previous_valid_until/g)).toHaveLength(3);
-    expect(dedup.match(/intersectValidityBoundSql\('target\.previous_valid_from'/g)).toHaveLength(3);
-    expect(dedup.match(/intersectValidityBoundSql\('target\.previous_valid_until'/g)).toHaveLength(3);
-    expect(dedup).toContain("memoryValidityPredicateSql('memories', '$3')");
-    expect(dedup).toContain("memoryValidityPredicateSql('m', '$4')");
-    expect(dedup).toContain("validityWindowsOverlapPredicateSql('memories', '$4', '$5')");
-    expect(dedup).toContain("validityWindowsOverlapPredicateSql('m', '$5', '$6')");
-  });
-
-  it('applies the shared validity boundary to every memory-bearing recall stage', () => {
-    const recall = repoFile('packages', 'server', 'src', 'routes', 'recall.ts');
-
-    // Global, semantic, pending, and graph SQL selection use the concrete alias;
-    // the evidence recheck uses its caller-supplied alias.
-    expect(recall.match(/memoryValidityPredicateSql\('m'/g)).toHaveLength(4);
-    expect(recall).toContain('memoryValidityPredicateSql(memoryAlias, referenceDateParameter)');
-    // Direct ranking, graph composition, legacy bundle inputs, and all three
-    // structured-bundle lanes independently fail closed in case a query or caller regresses.
-    expect(recall.match(/isMemoryValidAt\(/g)).toHaveLength(7);
-    expect(recall).toContain('const recallDate = toDateOnly(recallTime)');
-  });
-
-  it('audits source-evidence attachment across curator and extraction writers', () => {
-    const curatorWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-worker.ts');
-    const dedup = repoFile('packages', 'server', 'src', 'services', 'dedup.ts');
-
-    expect(curatorWorker).toContain('buildCuratedEvidence(sourceCandidates');
-    expect(curatorWorker).toContain('sourceCandidates.flatMap((memory) => memory.source_chunks');
-    expect(curatorWorker).not.toContain('Duplicate promotion attached new source evidence; approval requires review.');
-    expect(curatorWorker).toContain('for (const action of actions.promoted_candidates)');
-    expect(curatorWorker).toContain('failed promotion policy revalidation');
-    expect(curatorWorker).toContain('updated.authority_version <> updated.previous_authority_version');
-    expect(dedup).toContain('Exact-match extraction changed prompt-bearing metadata; approval requires review.');
-    expect(dedup).toContain('updated.authority_version <> updated.previous_authority_version');
-  });
-
-  it('removes every implicit curator promotion and makes production dedup atomic', () => {
-    const curatorWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-worker.ts');
-    const dedup = repoFile('packages', 'server', 'src', 'services', 'dedup.ts');
-
-    expect(curatorWorker).toContain('actions.promoted_candidates');
-    expect(curatorWorker).not.toContain('archiveDuplicatePromotionCandidates');
-    expect(curatorWorker).not.toContain('AUTO_PROMOTE_DUPLICATE_SIMILARITY');
-    expect(curatorWorker).not.toContain("NOT (memories.id = ANY($3::uuid[]))");
-    expect(curatorWorker).toContain("validation_status = 'applied'");
-    expect(curatorWorker).toContain('FOR UPDATE');
-    expect(dedup).toContain('const result = await withTransaction((client) => deduplicateMemory');
-    expect(dedup).toContain('publishCommittedWorkerEffects(effects)');
-    expect(dedup).toContain('reserveMemoryCreationInTransaction(db, input.vaultId)');
-    expect(dedup.match(/AND status = 'active'/g)?.length).toBeGreaterThanOrEqual(3);
-    expect(dedup).toContain("array_cat(COALESCE(memories.source_chunks, '{}'::uuid[]), $5::uuid[])");
-  });
 
   it('keeps operator migrations provider-portable for GCP deployments', () => {
     const rawChunkMigration = repoFile('scripts', 'migrate-raw-chunks-to-blob.mjs');
@@ -429,4 +310,28 @@ describe('database migration guardrails', () => {
     expect(leaseService).toContain('await fence.assertUnexpired()');
     expect(leaseService).toContain('curator_claim_token = $2');
   });
+  it('removes live approval and ACK contracts while retaining append-only mutation/recovery evidence',()=>{
+    const sql=migration('057_restore_platform_pipeline.sql');
+    expect(sql).toContain('DROP COLUMN authority_state');
+    expect(sql).toContain('DROP TABLE memory_delivery_pending');
+    expect(sql).toContain('memory_job_recoveries_append_only');
+    expect(sql).toContain('CREATE FUNCTION persistio_memory_observability_state');
+    expect(sql).not.toMatch(/DROP TABLE (?:memory_mutation_events|memory_scope_change_log|worker_action_receipts|platform_event_outbox)/);
+  });
+  it('enforces active baseline data and a single revision-fenced improvement/scheduling model',()=>{
+    const sql=migration('057_restore_platform_pipeline.sql');
+    expect(sql).toContain("status IN ('active', 'superseded', 'contradicted')");
+    expect(sql).toContain('CREATE TABLE curation_queue_items');
+    expect(sql).toContain('work_key');
+    expect(sql).toContain('NEW.revision = OLD.revision');
+    expect(sql).toContain('generation = gen_random_uuid()');
+    expect(sql).toContain('approved empty memory domain');
+  });
+  it('has no managed approval-policy configuration after restoration',()=>{
+    for(const segments of [['infra','gcp','locals.tf'],['infra','gcp','variables.tf'],
+      ['deployments','gcp','deploy-cloud-run.sh'],['.env.example']]){
+      expect(repoFile(...segments)).not.toMatch(/GLOBAL_RULE_POLICY|global_rule_policy/);
+    }
+  });
+
 });

@@ -1,5 +1,4 @@
 import type { CuratorAliasMaps, CuratorMemory, CuratorResult } from './curator';
-import { intersectValidityWindows } from './memory-validity';
 
 export type CuratorNodeRef = { kind: 'existing'; id: string } | { kind: 'created'; index: number };
 export interface CompiledCuratorGraph {
@@ -7,98 +6,87 @@ export interface CompiledCuratorGraph {
   parents: Array<CuratorNodeRef | null>;
   edges: Array<{ from: CuratorNodeRef; to: CuratorNodeRef }>;
 }
-type Binding = Pick<CuratorMemory, 'scope' | 'scope_key'>;
-type Node = Binding & { ref: CuratorNodeRef; subject: string };
-const key = (ref: CuratorNodeRef) => ref.kind === 'existing' ? `existing:${ref.id}` : `created:${ref.index}`;
-const sameBinding = (a: Binding, b: Binding) => a.scope === b.scope && a.scope_key === b.scope_key;
-const window = (memory: CuratorMemory) => ({ valid_from: memory.valid_from ?? null, valid_until: memory.valid_until ?? null });
+type Binding = Pick<CuratorMemory,'scope'|'scope_key'>;
+type Node = Binding & { ref: CuratorNodeRef; alias: string; parentId: string | null };
+const key = (ref: CuratorNodeRef) => ref.kind === 'existing' ? ref.id : `new:${ref.index}`;
+const sameBinding = (a: Binding,b: Binding) => a.scope === b.scope && a.scope_key === b.scope_key;
 
-/** Compile only schema/disposition-validated plans. No database lookups or UUID fallback. */
-export function compileCuratorGraph(
-  plan: CuratorResult, candidates: CuratorMemory[], active: CuratorMemory[], aliases: CuratorAliasMaps
-): CompiledCuratorGraph {
-  const inputs = new Map([...candidates, ...active].map(memory => [memory.id, memory]));
-  const byAlias = (alias: string) => {
-    const memory = inputs.get(aliases.aliasToId.get(alias) ?? '');
-    if (!memory) throw new Error('Unknown reviewed memory alias');
-    return memory;
+/** Compile only fully validated dispositions; database incident graph is checked at apply. */
+export function compileCuratorGraph(plan: CuratorResult, targets: CuratorMemory[], context: CuratorMemory[], aliases: CuratorAliasMaps): CompiledCuratorGraph {
+  const inputs = new Map([...targets,...context].map(m => [aliases.idToAlias.get(m.id)!,m]));
+  const memory = (alias: string) => {
+    const m = inputs.get(alias);
+    if (!m) throw new Error('Unknown reviewed memory');
+    return m;
   };
-  const archived = new Set(plan.nodes_to_archive.map(action => byAlias(action.id).id));
-  const promoted = new Set(plan.promoted_candidates.map(action => byAlias(action.id).id));
-  const updates = new Map(plan.nodes_to_update.map(action => [byAlias(action.id).id, action]));
-  const nodes: Node[] = active.filter(memory => !archived.has(memory.id)).map(memory => ({
-    ...memory, ref: { kind: 'existing', id: memory.id }, subject: updates.get(memory.id)?.subject ?? memory.subject
-  }));
-  nodes.push(...candidates.filter(memory => promoted.has(memory.id)).map(memory => ({
-    ...memory, ref: { kind: 'existing' as const, id: memory.id }
-  })));
-  const created = plan.nodes_to_create.map((action, index): Node => {
-    const sources = action.consumed_candidate_ids.map(byAlias);
-    if (!sources.length || sources.some(source => !sameBinding(source, sources[0])) || action.scope !== sources[0].scope) {
-      throw new Error('Created node has inconsistent applicability');
-    }
-    intersectValidityWindows(sources.map(window));
-    return { ref: { kind: 'created', index }, subject: action.subject, scope: action.scope, scope_key: sources[0].scope_key };
-  });
-  for (const action of plan.nodes_to_update) {
-    intersectValidityWindows([byAlias(action.id), ...action.consumed_candidate_ids.map(byAlias)].map(window));
+  const archived = new Set(plan.archive.map(a => a.id));
+  const replacements = new Map<string,string>();
+  plan.consolidate.forEach(a => a.sources.forEach(id => replacements.set(id,a.id)));
+  const changes = new Map(plan.scope_changes.map(a => [a.id,a]));
+  const nodes = new Map<string,Node>();
+  for (const [alias,m] of inputs) {
+    if (archived.has(alias) || replacements.has(alias)) continue;
+    const binding = changes.get(alias) ?? m;
+    nodes.set(alias,{alias,ref:{kind:'existing',id:m.id},scope:binding.scope,scope_key:binding.scope_key,parentId:m.parent_id});
   }
-  nodes.push(...created);
-  const existing = new Map(nodes.flatMap(node => node.ref.kind === 'existing' ? [[node.ref.id, node] as const] : []));
-  const renamed = active.filter(memory => updates.get(memory.id)?.subject !== undefined
-    && updates.get(memory.id)!.subject !== memory.subject);
-  const resolve = (text: string, binding?: Binding): Node => {
-    if (/^[CM][1-9][0-9]*$/.test(text)) {
-      const node = existing.get(aliases.aliasToId.get(text) ?? '');
-      if (!node) throw new Error('Graph alias does not name a final surviving node');
-      if (nodes.some(other => other.subject === text && key(other.ref) !== key(node.ref)
-        && (!binding || sameBinding(other, binding)))) throw new Error('Ambiguous alias-shaped subject reference');
-      if (binding && !sameBinding(node, binding)) throw new Error('Graph reference crosses applicability binding');
-      return node;
-    }
-    if (renamed.some(memory => memory.subject === text && (!binding || sameBinding(memory, binding)))) {
-      throw new Error('Graph reference uses a renamed old subject; use an alias');
-    }
-    const matches = nodes.filter(node => node.subject === text && (!binding || sameBinding(node, binding)));
-    if (matches.length !== 1) throw new Error('Graph subject must name one unambiguous final surviving node');
-    return matches[0];
-  };
-  const parents = plan.nodes_to_create.map((action, index) => {
-    if (!action.parent_subject) return null;
-    const parent = resolve(action.parent_subject, created[index]);
-    if (key(parent.ref) === key(created[index].ref)) throw new Error('Graph parent cannot reference itself');
-    return parent.ref;
+  plan.consolidate.forEach((a,index) => {
+    const first = memory(a.sources[0]);
+    const binding = changes.get(a.id) ?? first;
+    nodes.set(a.id,{alias:a.id,ref:{kind:'created',index},scope:binding.scope,scope_key:binding.scope_key,parentId:null});
   });
+  const resolve = (alias: string): Node => {
+    const node = nodes.get(alias);
+    if (!node) throw new Error('Graph endpoint is not a final surviving node');
+    return node;
+  };
+  const parentAliases = new Map<string,string>();
+  const inheritedParents = plan.consolidate.map(a => {
+    const parents = new Set(a.sources.map(memory).map(m => m.parent_id).filter((id): id is string => id !== null));
+    // Internal source-to-source parents disappear on consolidation; every
+    // external parent must agree. Never silently choose one of two parents.
+    const external = [...parents].filter(id => !a.sources.some(s => memory(s).id === id));
+    if (external.length > 1) throw new Error('Consolidation has conflicting parents');
+    if (!external.length) return null;
+    const alias = aliases.idToAlias.get(external[0]);
+    if (!alias) throw new Error('Consolidation parent was not reviewed');
+    return replacements.get(alias) ?? alias;
+  });
+  for (const [alias,node] of nodes) {
+    const parentAlias = node.ref.kind === 'created' ? inheritedParents[node.ref.index]
+      : node.parentId ? aliases.idToAlias.get(node.parentId) : null;
+    if (!parentAlias) continue; // Unseen existing parents are validated under DB locks.
+    const finalParent = replacements.get(parentAlias) ?? parentAlias;
+    if (archived.has(finalParent)) throw new Error('Plan archives a surviving node parent');
+    const parent = resolve(finalParent);
+    if (alias === parent.alias || !sameBinding(node,parent)) throw new Error('Invalid parent binding');
+    parentAliases.set(alias,parent.alias);
+  }
+  const edges = plan.edges.map(a => {
+    const from = resolve(a.from), to = resolve(a.to);
+    if (!sameBinding(from,to) || key(from.ref) === key(to.ref)) throw new Error('Invalid graph edge binding');
+    return {from:from.ref,to:to.ref};
+  });
+  const adjacency = new Map<string,string[]>();
+  for (const [child,parent] of parentAliases) adjacency.set(child,[parent]);
+  for (const edge of plan.edges.filter(e => e.type === 'part_of')) adjacency.set(edge.from,[...(adjacency.get(edge.from) ?? []),edge.to]);
+  const done = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (id: string) => {
+    if (visiting.has(id)) throw new Error('Curator hierarchy cycle');
+    if (done.has(id)) return;
+    visiting.add(id);
+    for (const parent of adjacency.get(id) ?? []) visit(parent);
+    visiting.delete(id); done.add(id);
+  };
+  for (const id of nodes.keys()) visit(id);
   const creationOrder: number[] = [];
-  const visited = new Set<number>();
-  const visiting = new Set<number>();
-  // Iterative dependency traversal avoids stack growth with provider-sized arrays.
-  for (let start = 0; start < created.length; start++) {
-    const chain: number[] = [];
-    let index: number | null = start;
-    while (index !== null && !visited.has(index)) {
-      if (visiting.has(index)) throw new Error('Graph parent dependencies contain a cycle');
-      visiting.add(index);
-      chain.push(index);
-      const parent: CuratorNodeRef | null = parents[index];
-      index = parent?.kind === 'created' ? parent.index : null;
-    }
-    for (const child of chain.reverse()) {
-      visiting.delete(child);
-      visited.add(child);
-      creationOrder.push(child);
-    }
-  }
-  const seenEdges = new Set<string>();
-  const edges = plan.edges_to_create.map(action => {
-    const from = resolve(action.from_subject);
-    const to = resolve(action.to_subject, from);
-    if (!sameBinding(from, to)) throw new Error('Graph edge crosses applicability binding');
-    if (key(from.ref) === key(to.ref)) throw new Error('Graph edge cannot reference itself');
-    const edgeKey = JSON.stringify([key(from.ref), key(to.ref), action.type]);
-    if (seenEdges.has(edgeKey)) throw new Error('Duplicate graph edge');
-    seenEdges.add(edgeKey);
-    return { from: from.ref, to: to.ref };
-  });
-  return { creationOrder, parents, edges };
+  const createdDone = new Set<number>();
+  const order = (index: number) => {
+    if (createdDone.has(index)) return;
+    const parent = inheritedParents[index] ? resolve(inheritedParents[index]!) : null;
+    if (parent?.ref.kind === 'created') order(parent.ref.index);
+    createdDone.add(index); creationOrder.push(index);
+  };
+  plan.consolidate.forEach((_,i) => order(i));
+  return {creationOrder,parents:inheritedParents.map(alias => alias ? resolve(alias).ref : null),edges};
 }

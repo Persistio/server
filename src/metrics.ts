@@ -8,22 +8,6 @@ export const recallDurationHistogram = meter.createHistogram('persistio.recall.d
   unit: 'ms'
 });
 
-export const recallDeliveryCounter = meter.createCounter('persistio.recall.delivery_memories.total', {
-  description: 'Memories selected, returned, rendered, or dropped by recall delivery stage'
-});
-
-export const globalRuleDeliveryCounter = meter.createCounter('persistio.recall.global_rule_delivery.total', {
-  description: 'Global behavioral rules selected or rendered into a client context'
-});
-
-export const recallDeliveryMissingAckCounter = meter.createCounter('persistio.recall.delivery_ack_failure.total', {
-  description: 'Client delivery acknowledgements that failed validation or persistence'
-});
-
-export const memoryPolicyEventCounter = meter.createCounter('persistio.memory.policy_events.total', {
-  description: 'Security-relevant memory policy decisions and failures'
-});
-
 export const ingestChunksCounter = meter.createCounter('persistio.ingest.chunks.total', {
   description: 'Chunks ingested'
 });

@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('ingest');
 import crypto from 'node:crypto';
 
 import type { FastifyInstance } from 'fastify';
@@ -9,7 +11,7 @@ import { withTransaction } from '../db/client';
 import { ingestChunksCounter } from '../metrics';
 import { requireVaultWriteAuth } from '../middleware/auth';
 import type { VaultContext } from '../middleware/auth';
-import { encryptForVault } from '../services/crypto';
+import { prepareVaultCrypto } from '../services/crypto';
 import { recordCustomerMetric } from '../services/customer-metrics';
 import { OPENAI_EMBEDDING_MAX_TOKENS_PER_INPUT, estimateEmbeddingTokens, getEmbedder } from '../services/embedder';
 import { createRawChunkBlobKey, getRawChunkStorage, type RawChunkReference, type RawChunkStorage } from '../services/raw-chunk-storage';
@@ -213,6 +215,7 @@ async function ingestChunksForVault(
   priority: QueuePriority,
   jobId?: string
 ): Promise<IngestResult> {
+  const replayContext:RecallContext={...context,session_id:sessionId};
   chunks = chunks.map((chunk, index) => chunk.source_event ? chunk : {
     ...chunk,
     source_event: {
@@ -231,21 +234,20 @@ async function ingestChunksForVault(
     ? crypto.createHash('sha256').update(JSON.stringify(['bulk_ingest', vault.id, sourceEventKeys])).digest('hex')
     : null;
   const effectiveJobId = jobId && stableJobKey ? uuidFromSha256(stableJobKey) : jobId;
-  let replay = await classifyIngestReplay(vault, chunks, sourceEventKeys);
+  let replay = await classifyIngestReplay(vault, chunks, sourceEventKeys,replayContext);
   if (replay.size < chunks.length) {
     try {
       await checkQuota(vault.id, 'ingest_events');
     } catch (error) {
       // A concurrent request may have consumed the final quota unit by accepting
       // this very payload between preflight lookup and the quota snapshot.
-      replay = await classifyIngestReplay(vault, chunks, sourceEventKeys);
+      replay = await classifyIngestReplay(vault, chunks, sourceEventKeys,replayContext);
       if (replay.size < chunks.length) throw error;
     }
   }
   const preparedIndexes = chunks.flatMap((_chunk, index) => replay.has(sourceEventKeys[index]) ? [] : [index]);
   const newChunks = preparedIndexes.map(index => chunks[index]);
-  // A fully attested replay must not even require construction/configuration of
-  // the object-store client. Legacy attestation resolves storage only as needed.
+  // An exact metadata-bound replay does not construct or read object storage.
   const storage = newChunks.length ? getRawChunkStorage() : undefined;
   const blobInputs = preparedIndexes.map(() => ({
     key: createRawChunkBlobKey(vault.id, sessionId, crypto.randomUUID()),
@@ -255,13 +257,16 @@ async function ingestChunksForVault(
   if (storage) await registerRawChunkWrites(vault.id, storage.store, blobInputs.map(blob => blob.key), preparedIndexes.map(index => sourceEventKeys[index]));
 
   try {
+    // Resolve the exact accepted vault key once outside mutation locks. Exact
+    // replays require neither a key-provider call nor any new encrypted data.
+    const preparedCrypto = newChunks.length ? await prepareVaultCrypto(vault) : undefined;
     // Admission above precedes embedding/encryption, and preparation shares a
     // process-wide bound. A late preparation result cannot initiate an upload.
     const [preparedEmbeddings = []] = await rawChunkPreparationPool.map(newChunks.length ? [newChunks] : [], batch =>
       getEmbedder().embedBatch(batch.map(chunk => chunk.content),
         { vaultId: vault.id, modelRole: 'embedding', source: 'api', inputType: 'document' }));
     const embeddings = new Map(preparedIndexes.map((index, localIndex) => [index, preparedEmbeddings[localIndex]]));
-    const storedContents = await rawChunkPreparationPool.map(newChunks, chunk => encryptForVault(vault, chunk.content));
+    const storedContents = newChunks.map(chunk => preparedCrypto!.encrypt(vault, chunk.content));
     blobInputs.forEach((blob, index) => {
       blob.content = storedContents[index];
       blob.storageBytes = Buffer.byteLength(blob.content, 'utf8');
@@ -272,11 +277,12 @@ async function ingestChunksForVault(
       // this transaction; raw lineage and the actual charge commit together.
       const owner = await client.query('SELECT id FROM vaults WHERE id = $1 FOR UPDATE', [vault.id]);
       if (!owner.rowCount) throw new Error('Vault disappeared before ingest commit');
+      await preparedCrypto?.assertCurrent(client);
       if (storage) await lockCompletedRawChunkWrites(client, storage.store, blobInputs.map((blob) => blob.key));
       const existing = await loadLockedIngestRows(client, vault.id, sourceEventKeys);
       chunks.forEach((chunk, index) => {
         const row = existing.get(sourceEventKeys[index]);
-        if (row) assertIngestReplayMatches(row, chunk, index);
+        if (row) assertIngestReplayMatches(row, chunk, index,replayContext);
         else if (replay.has(sourceEventKeys[index])) {
           throw Object.assign(new Error('Previously accepted source evidence is no longer available'), { statusCode: 503 });
         }
@@ -302,7 +308,7 @@ async function ingestChunksForVault(
         blobRefs,
         blobInputs.map((blob) => blob.storageBytes),
         preparedEmbeddings,
-        effectiveJobId ?? null
+        effectiveJobId ?? null,replayContext
       ) : [];
       const inserted = localInserted.map(row => ({ ...row, input_index: preparedIndexes[row.input_index] }));
       const outcomes = await resolveStableIngestOutcomes(
@@ -310,7 +316,7 @@ async function ingestChunksForVault(
         vault.id,
         chunks,
         sourceEventKeys,
-        inserted
+        inserted,replayContext
       );
       const quotaReservation = inserted.length > 0
         ? await reserveApiQuotaInTransaction(client, vault.id, 'ingest_events', 'api')
@@ -334,7 +340,7 @@ async function ingestChunksForVault(
       for (const segment of segments) {
         const segmentId = crypto.randomUUID();
         const storedContext = segment.context
-          ? await encryptForVault(vault, segment.context)
+          ? preparedCrypto!.encrypt(vault, segment.context)
           : null;
         await client.query(
           `INSERT INTO segments (
@@ -397,7 +403,7 @@ async function ingestChunksForVault(
       blobInputs.filter((_blob, index) => !insertedIndexSet.has(preparedIndexes[index])).map(blob => blob.key)
     ) : [];
     if (reconciliationErrors.length > 0) {
-      console.warn(JSON.stringify({
+      operationalLog.warn(JSON.stringify({
         level: 40,
         msg: 'raw chunk blob reconciliation deferred after accepted ingest',
         vault_id: vault.id,
@@ -429,7 +435,7 @@ async function ingestChunksForVault(
       // Cleanup is durable and independent of the request outcome. Preserve the
       // primary error (including quota/collision status) instead of turning it
       // into an unrelated 500 whenever the provider is also unavailable.
-      console.warn(JSON.stringify({ level: 40, msg: 'raw upload cleanup deferred after failed ingest',
+      operationalLog.warn(JSON.stringify({ level: 40, msg: 'raw upload cleanup deferred after failed ingest',
         vault_id: vault.id, deferred: reconciliationErrors.length }));
     }
     throw error;
@@ -442,8 +448,8 @@ function exceedsChunkCount(payload: unknown, limit: number): boolean {
   return Array.isArray(chunks) && chunks.length > limit;
 }
 
-function sourceEventPayloadHash(chunk: IngestChunk): string {
-  return ingestPayloadHash(chunk);
+function sourceEventPayloadHash(chunk: IngestChunk,context:RecallContext): string {
+  return ingestPayloadHash(chunk,context);
 }
 
 function uuidFromSha256(value: string): string {
@@ -479,7 +485,8 @@ async function resolveStableIngestOutcomes(
   vaultId: string,
   chunks: IngestChunk[],
   sourceEventKeys: string[],
-  inserted: Array<{ id: string; created_at: string; input_index: number }>
+  inserted: Array<{ id: string; created_at: string; input_index: number }>,
+  replayContext:RecallContext
 ): Promise<IngestChunkOutcome[]> {
   const insertedByIndex = new Map(inserted.map(row => [row.input_index, row]));
   const rows = await loadLockedIngestRows(client, vaultId, sourceEventKeys);
@@ -488,13 +495,13 @@ async function resolveStableIngestOutcomes(
     if (newlyInserted) return { id: newlyInserted.id, created_at: newlyInserted.created_at, outcome: 'inserted' as const };
     const row = rows.get(sourceEventKeys[index]);
     if (!row) throw new Error(`Ingest did not durably account for input chunk ${index}`);
-    assertIngestReplayMatches(row, chunk, index);
+    assertIngestReplayMatches(row, chunk, index,replayContext);
     return { id: row.id, created_at: row.created_at, outcome: 'replayed' as const };
   });
 }
 
 function bestEffortAcceptanceTelemetry(work: () => void): void {
-  try { work(); } catch { console.warn('Ingest accepted; nonessential acceptance telemetry unavailable'); }
+  try { work(); } catch { operationalLog.warn('Ingest accepted; nonessential acceptance telemetry unavailable'); }
 }
 
 function recordRawChunkStorageDelta(
@@ -568,7 +575,8 @@ async function insertRawChunks(
   blobRefs: RawChunkReference[],
   storageBytes: number[],
   embeddings: number[][],
-  jobId: string | null
+  jobId: string | null,
+  replayContext:RecallContext
 ): Promise<Array<{ id: string; created_at: string; input_index: number }>> {
   const sourceEvents = chunks.map((chunk) => chunk.source_event ?? null);
   const sourceEventKeys = sourceEvents.map((event) => event ? sourceEventKey(vaultId, event) : null);
@@ -588,14 +596,14 @@ async function insertRawChunks(
        INSERT INTO raw_chunks (
          id, vault_id, session_id, role, blob_store, blob_key, storage_bytes, embedding,
          created_at, provenance, source_event_namespace, source_event_id, source_message_id,
-         source_event_key, source_event_ordinal, source_event_payload_sha256, ingest_job_id
+         source_event_key, source_event_ordinal, source_event_payload_sha256, ingest_job_id,capture_context
        )
        SELECT input.id, $1, $2, input.role, input.blob_store, input.blob_key,
               input.storage_bytes, input.embedding::vector, input.created_at, input.provenance,
               input.source_event_namespace, input.source_event_id, input.source_message_id,
-              input.source_event_key, input.source_event_ordinal, input.source_event_payload_sha256, $17::uuid
+              input.source_event_key, input.source_event_ordinal, input.source_event_payload_sha256, $17::uuid,$18::jsonb
        FROM input
-       ORDER BY input.source_event_key
+       ORDER BY input.input_ordinal
        ON CONFLICT (vault_id, source_event_key) WHERE source_event_key IS NOT NULL DO NOTHING
        RETURNING id, created_at
      )
@@ -620,8 +628,8 @@ async function insertRawChunks(
       sourceEvents.map((event) => event?.message_id ?? null),
       sourceEventKeys,
       sourceEvents.map((event) => event?.ordinal ?? null),
-      chunks.map((chunk) => chunk.source_event ? sourceEventPayloadHash(chunk) : null),
-      jobId
+      chunks.map((chunk) => chunk.source_event ? sourceEventPayloadHash(chunk,replayContext) : null),
+      jobId,JSON.stringify(replayContext)
     ]
   );
 

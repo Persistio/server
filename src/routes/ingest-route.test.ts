@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { ingestPayloadHash } from '../services/ingest-replay';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -58,7 +59,7 @@ vi.mock('../middleware/auth', () => ({
 }));
 
 vi.mock('../services/crypto', () => ({
-  encryptForVault: async (_vault: unknown, value: string) => value
+  prepareVaultCrypto: async () => ({encrypt: (_vault: unknown, value: string) => value,assertCurrent:async()=>{}})
 }));
 
 vi.mock('../services/embedder', () => ({
@@ -158,7 +159,7 @@ function configurePersistence(options: {
         rows: insertedIndexes.map((index) => ({ id: ids[index], created_at: timestamps[index], input_index: index }))
       };
     }
-    if (text.includes('SELECT id, created_at, source_event_key')) {
+    if (text.includes('SELECT id,created_at,source_event_key')) {
       return { rowCount: options.existingRows?.length ?? 0, rows: options.existingRows ?? [] };
     }
     if (text.includes('SELECT DISTINCT blob_key')) {
@@ -657,7 +658,7 @@ describe('bulk ingest route body limit', () => {
         });
         return { rowCount: rows.length, rows };
       }
-      if (text.includes('SELECT id, created_at, source_event_key')) {
+      if (text.includes('SELECT id,created_at,source_event_key')) {
         const keys = params[1] as string[];
         const rows = keys.flatMap((key) => durableByKey.get(key) ?? []);
         return { rowCount: rows.length, rows };
@@ -707,8 +708,8 @@ describe('bulk ingest route body limit', () => {
         id: existingId,
         created_at: '2026-05-12T16:00:00.000Z',
         source_event_key: sourceKey,
-        source_event_payload_sha256: crypto.createHash('sha256')
-          .update(JSON.stringify({ role: 'user', content: 'historical payload' })).digest('hex')
+        source_event_payload_sha256: ingestPayloadHash({role:'user',content:'historical payload',timestamp:'2026-05-12T16:00:00.000Z'},
+          {session_id:'bulk-replay-session',trigger_type:'backfill'})
       }]
     });
 

@@ -1,12 +1,12 @@
 {
   "name": "@persistio/server",
-  "version": "0.1.21",
+  "version": "0.2.0",
   "private": true,
   "license": "BUSL-1.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json && rm -rf dist/db/migrations && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/ && cp -R src/db/migrations/down dist/db/migrations/down",
+    "build": "rm -rf dist && tsc -p tsconfig.json && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/ && cp -R src/db/migrations/down dist/db/migrations/down",
     "start": "node --require ./dist/preload.js dist/index.js",
     "test": "vitest run",
     "migrate:raw-chunks": "node ./scripts/migrate-raw-chunks-to-blob.mjs",

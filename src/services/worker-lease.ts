@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('worker-lease');
 import type { PoolClient } from 'pg';
 
 import { withTransaction } from '../db/client';
@@ -124,7 +126,7 @@ export function startWorkerLeaseHeartbeat(
     }).catch((error) => {
       // A transient database failure is not proof of takeover. The final
       // transaction still performs the authoritative, locking fence check.
-      console.warn(JSON.stringify({
+      operationalLog.warn(JSON.stringify({
         level: 40,
         msg: 'worker lease renewal failed',
         queue: lease.queueKind,

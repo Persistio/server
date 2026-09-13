@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('curation-worker');
 import crypto from 'node:crypto';
 import { parentPort } from 'node:worker_threads';
 import { shutdownTelemetry } from '../azure-monitor';
@@ -5,7 +7,7 @@ import { createShutdownDeadline, drainRuntimeOwner, parseShutdownDeadline } from
 import type { PoolClient } from 'pg';
 
 import { getConfig } from '../config';
-import { closePool, query } from '../db/client';
+import { closePool, query, withTransaction } from '../db/client';
 import { CircuitBreakerOpenError } from '../services/ai-resilience';
 import {
   decryptForVault,
@@ -28,11 +30,14 @@ import {
   type EdgeType,
   type MemoryType
 } from '../services/curator';
-import type { CompiledCuratorGraph, CuratorNodeRef } from '../services/curator-graph';
+import { discardObsoleteCurationTargets } from '../services/curation-work';
+import { lockMemoryWriteVault } from '../services/dedup';
+import { getRawChunkStorage } from '../services/raw-chunk-storage';
+import { validateCuratorContract, type CuratorRawSource } from '../services/curator-contract';
+import { compileCuratorGraph, type CompiledCuratorGraph, type CuratorNodeRef } from '../services/curator-graph';
 import { getSpanAttributes } from '../telemetry';
 import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram } from '../metrics';
-import { memoryPolicyEventCounter } from '../services/observability-effects';
-import { AiBudgetDeferredError } from '../services/usage';
+import { AiBudgetDeferredError, getCurrentUsagePeriod } from '../services/usage';
 import { publishCommittedWorkerEffects } from '../services/worker-effects';
 import { prepareCuratorWrites, type PreparedCuratorWrites } from '../services/curator-write-preparation';
 import { initCustomerMetrics, shutdownCustomerMetrics } from '../services/customer-metrics';
@@ -62,7 +67,7 @@ import {
 interface CurationQueueRow {
   queue_id: string;
   vault_id: string;
-  segment_id: string;
+  segment_id: string | null;
   claim_token: string;
   vault_claim_token: string;
 }
@@ -93,6 +98,7 @@ interface MemoryRow {
   evidence: unknown;
   parent_id: string | null;
   source_chunks: string[];
+  source_timestamp: string | null;
   archived_at: string | null;
   status: string;
   valid_from: string | null;
@@ -104,9 +110,10 @@ interface MemoryRow {
 
 interface LoadedCurationJob {
   queueId: string;
-  segmentId: string;
+  segmentId: string | null;
   vault: VaultRow;
   conversation: string | null;
+  rawSources: CuratorRawSource[];
   candidates: CuratorMemory[];
   activeMemories: CuratorMemory[];
   candidateIds: Set<string>;
@@ -184,7 +191,7 @@ async function shutdownWorker(deadlineValue?: unknown) {
         });
         complete = !workerLoopFailed;
       } catch {
-        console.warn('[persistio] Worker shutdown incomplete');
+        operationalLog.warn('[persistio] Worker shutdown incomplete');
       } finally {
         try { parentPort?.postMessage({ type: complete ? 'shutdown-complete' : 'shutdown-failed' }); }
         finally { parentPort?.close(); }
@@ -234,15 +241,16 @@ export async function processBatch() {
         }
 
         if (Number(retryResult.rows[0].retry_count) >= MAX_CURATION_RETRIES) {
-          console.warn(
+          operationalLog.warn(
             `Curation job exceeded retry limit and will be dead-lettered: queueId=${row.queue_id}, retryCount=${retryResult.rows[0].retry_count}, maxRetries=${MAX_CURATION_RETRIES}`
           );
           await withWorkerLeaseTransaction(lease, async (client) => {
             if (!await recordWorkerAction(client, lease, 'dead-letter')) return;
             await client.query(
-              `INSERT INTO curation_dead_letter (vault_id, segment_id, retry_count, last_error)
-               VALUES ($1, $2, $3, $4)`,
-              [row.vault_id, row.segment_id, retryResult.rows[0].retry_count, retryResult.rows[0].last_error]
+              `INSERT INTO curation_dead_letter (vault_id, segment_id, retry_count, last_error,work_key,targets,source_queue_id)
+               SELECT $1,$2,$3,$4,q.work_key,COALESCE((SELECT jsonb_agg(jsonb_build_object('memory_id',i.memory_id,'revision',i.revision::text)) FROM curation_queue_items i WHERE i.queue_id=q.id),'[]'::jsonb),q.id
+               FROM curation_queue q WHERE q.id=$5`,
+              [row.vault_id, row.segment_id, retryResult.rows[0].retry_count, retryResult.rows[0].last_error,row.queue_id]
             );
             const deleted = await client.query(
               `DELETE FROM curation_queue WHERE id = $1 AND claim_token = $2`,
@@ -267,6 +275,7 @@ export async function processBatch() {
         }
 
         const candidateLimit = Math.min(remainingCandidates, limits.curator_candidates_per_call);
+        await withWorkerLeaseTransaction(lease, client => discardObsoleteCurationTargets(client,row.queue_id,row.vault_id));
         const job = await loadJob(row, limits, candidateLimit);
         loadedJob = job;
         if (job.candidates.length === 0) {
@@ -281,9 +290,11 @@ export async function processBatch() {
           {
             maxInputTokens: limits.curator_input_tokens_per_call > 0 ? limits.curator_input_tokens_per_call : undefined,
             maxOutputTokens: limits.curator_output_tokens_per_call > 0 ? limits.curator_output_tokens_per_call : undefined,
-            vaultPromptContext: await decryptVaultPromptContext(job.vault)
+            vaultPromptContext: await decryptVaultPromptContext(job.vault),
+            rawSources: job.rawSources
           }
         );
+        job.rawSources = prepared.rawSources;
         job.candidates = prepared.candidates;
         job.activeMemories = prepared.activeMemories;
         job.candidateIds = new Set(prepared.candidates.map(memory => memory.id));
@@ -291,12 +302,50 @@ export async function processBatch() {
         job.deferredCandidates += prepared.deferredCandidateIds.length;
         remainingCandidatesByVault.set(row.vault_id, Math.max(0, remainingCandidates - job.candidates.length));
         assertNotLost();
-        const { result, graph, aliasMaps, rawResponse, usage, audit } = await curator.curatePrepared(prepared, job.vault.id);
+        const attemptId = crypto.randomUUID();
+        const requestActionKey = 'provider-request:'+attemptId;
+        const tokenActionKey = 'provider-usage:'+attemptId;
+        const countRun = !runRecordedVaults.has(job.vault.id);
+        const { result: proposedResult, aliasMaps, rawResponse, usage, audit } = await curator.curatePrepared(prepared, job.vault.id,{
+          beforeRequest:async () => {
+            await withWorkerLeaseTransaction(lease,async client => {
+              await lockMemoryWriteVault(client,job.vault.id);
+              const currentLimits = await getCuratorLimits(job.vault.id,client);
+              if (getCuratorPlanBlockReason(currentLimits)) throw new CuratorPreparationDeferredError('Curation entitlement changed');
+              const usage = (await client.query<{curator_runs:number;curator_requests:number;tokens:number}>(`SELECT curator_runs,curator_requests,
+                curator_input_tokens+curator_output_tokens AS tokens FROM vault_usage WHERE vault_id=$1 AND period=$2 FOR UPDATE`,
+                [job.vault.id,getCurrentUsagePeriod()])).rows[0];
+              if ((countRun && (usage?.curator_runs ?? 0)>=currentLimits.curator_runs_per_month)
+                || (usage?.curator_requests ?? 0)>=currentLimits.curator_requests_per_month
+                || (usage?.tokens ?? 0)>=currentLimits.curator_tokens_per_month) throw new CuratorPreparationDeferredError('Curation monthly capacity exhausted');
+              if (!await recordWorkerAction(client,lease,requestActionKey)) throw new Error('Provider request already attempted');
+              await recordCuratorUsageInTransaction(client,{vaultId:job.vault.id,candidatesProcessed:0,countRun,
+                promptTokens:0,completionTokens:0,limits:currentLimits,requestCount:1,
+                actionReceipt:{queueId:job.queueId,actionKey:requestActionKey}});
+            });
+            runRecordedVaults.add(job.vault.id);
+          },
+          returnedUsage:async usage => {
+            // The provider already ran. Account its reported usage even if the
+            // application lease expired; this grants no memory-write capability.
+            await withTransaction(async client => {
+              const attempted = await client.query(`SELECT queue_id FROM worker_action_receipts
+                WHERE queue_kind='curation' AND queue_id=$1 AND action_key=$2 AND claim_token=$3 FOR UPDATE`,
+                [job.queueId,requestActionKey,lease.claimToken]);
+              if (attempted.rowCount!==1) throw new Error('Provider usage lacks attempt receipt');
+              if (!await recordWorkerAction(client,lease,tokenActionKey)) return;
+              await recordCuratorUsageInTransaction(client,{vaultId:job.vault.id,candidatesProcessed:0,countRun:false,
+                promptTokens:usage.promptTokens,completionTokens:usage.completionTokens,requestCount:0,limits:job.limits,
+                actionReceipt:{queueId:job.queueId,actionKey:tokenActionKey}});
+            });
+          }
+        });
+        const result=validateCuratorContract(proposedResult,job.candidates,job.activeMemories,aliasMaps,job.rawSources);
+        const graph=compileCuratorGraph(result,job.candidates,job.activeMemories,aliasMaps);
         reviewRunId = await insertCurationReviewRun(job, audit, rawResponse, 'valid', []);
         const writes = await prepareCuratorWrites(result, job.vault.id, assertNotLost);
         assertNotLost();
         const preparedCrypto = await prepareVaultCrypto(job.vault);
-        const countRun = !runRecordedVaults.has(job.vault.id);
         const actionKey = buildCurationActionKey(job);
         const usageRecorded = await applyActions(
           job,
@@ -340,7 +389,7 @@ export async function processBatch() {
               [reviewRunId]
             );
           }
-          console.warn(JSON.stringify({
+          operationalLog.warn(JSON.stringify({
             level: 40,
             msg: 'discarding stale curation worker result',
             queue_id: row.queue_id,
@@ -368,7 +417,7 @@ export async function processBatch() {
         if (error instanceof AiBudgetDeferredError) {
           aiBudgetWaitHistogram.record(error.waitMs, { role: error.role, queue: 'curation', vault_id: row.vault_id });
           aiBudgetThrottledJobsCounter.add(1, { role: error.role, queue: 'curation', vault_id: row.vault_id });
-          console.info(JSON.stringify({
+          operationalLog.info(JSON.stringify({
             level: 30,
             msg: 'deferring curation job for ai budget',
             queue_id: row.queue_id,
@@ -384,7 +433,7 @@ export async function processBatch() {
           continue;
         }
         if (error instanceof CircuitBreakerOpenError) {
-          console.warn(JSON.stringify({
+          operationalLog.warn(JSON.stringify({
             level: 40,
             msg: 'skipping curation job while circuit breaker is open',
             queue_id: row.queue_id,
@@ -397,7 +446,7 @@ export async function processBatch() {
           continue;
         }
         const lastError = error instanceof Error ? error.message : 'Unknown curation error';
-        console.error(getSpanAttributes({ error, queueId: row.queue_id }), 'Curation job failed');
+        operationalLog.error(getSpanAttributes({ error, queueId: row.queue_id }), 'Curation job failed');
         await releaseWorkerLease(lease, { incrementRetry: true, lastError });
       } finally {
         await heartbeat.stop();
@@ -454,12 +503,8 @@ async function deferCapacityBlockedJob(
 ): Promise<void> {
   const countResult = await query<{ total_candidates: string }>(
     `SELECT COUNT(*)::text AS total_candidates
-     FROM memories
-     WHERE vault_id = $1
-       AND source_segment_id = $2
-       AND archived_at IS NULL
-       AND status = 'candidate'`,
-    [row.vault_id, row.segment_id]
+     FROM curation_queue_items WHERE vault_id=$1 AND queue_id=$2`,
+    [row.vault_id, row.queue_id]
   );
   const totalCandidates = Number(countResult.rows[0]?.total_candidates ?? 0);
 
@@ -499,11 +544,12 @@ async function completeEmptyCurationJob(lease: WorkerLease): Promise<void> {
 }
 
 async function finishCurationJobInTransaction(client: PoolClient, job: LoadedCurationJob, lease: WorkerLease): Promise<void> {
-  const remaining = await client.query<{ count: string }>(
-    `SELECT COUNT(*)::text AS count FROM memories
-     WHERE vault_id = $1 AND source_segment_id = $2 AND status = 'candidate' AND archived_at IS NULL`,
-    [job.vault.id, job.segmentId]
-  );
+  await client.query(`DELETE FROM curation_queue_items i USING jsonb_to_recordset($3::jsonb) AS done(id uuid,revision bigint)
+    WHERE i.queue_id=$1 AND i.vault_id=$2 AND i.memory_id=done.id AND i.revision=done.revision`,
+    [job.queueId,job.vault.id,JSON.stringify(job.candidates.map(m => ({id:m.id,revision:m.row_version})))]);
+  await discardObsoleteCurationTargets(client,job.queueId,job.vault.id);
+  const remaining = await client.query<{count:string}>(
+    'SELECT count(*)::text AS count FROM curation_queue_items WHERE queue_id=$1 AND vault_id=$2',[job.queueId,job.vault.id]);
   const candidatesDeferred = Number(remaining.rows[0].count);
   if (candidatesDeferred > 0) {
     const availableAt = getNextCapacityAvailableAt(job.limits);
@@ -536,259 +582,68 @@ async function decryptVaultPromptContext(vault: VaultRow): Promise<VaultPromptCo
 }
 
 async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candidateLimit: number): Promise<LoadedCurationJob> {
-  const vaultResult = await query<VaultRow>(
-    `SELECT id, account_id::text AS account_id, encrypted_dek, vault_encryption_enabled, plan_id,
-            type, custom_extraction_prompt, custom_curation_prompt
-     FROM vaults
-     WHERE id = $1
-     LIMIT 1`,
-    [row.vault_id]
-  );
-
-  if (!vaultResult.rowCount) {
-    throw new Error(`Vault ${row.vault_id} not found`);
+  // Target and related-memory revisions come from one read snapshot. No provider
+  // call occurs under a mutation lock; a later short apply transaction rechecks it.
+  const loaded = await withTransaction(async client => {
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const vault = (await client.query<VaultRow>(`SELECT id,account_id::text,encrypted_dek,vault_encryption_enabled,plan_id,
+      type,custom_extraction_prompt,custom_curation_prompt FROM vaults WHERE id=$1`,[row.vault_id])).rows[0];
+    if (!vault) throw new Error('Curation vault missing');
+    const targets = (await client.query<MemoryRow>(`SELECT m.*,m.revision::text AS row_version
+      FROM curation_queue_items i JOIN memories m ON m.id=i.memory_id AND m.vault_id=i.vault_id AND m.revision=i.revision
+      WHERE i.queue_id=$1 AND i.vault_id=$2 AND m.status='active' AND m.archived_at IS NULL
+      ORDER BY m.confidence DESC,m.salience DESC,m.created_at,m.id LIMIT $3`,[row.queue_id,row.vault_id,candidateLimit+1])).rows;
+    const selected = targets.slice(0,candidateLimit);
+    const ids = selected.map(m => m.id);
+    const related = (await client.query<MemoryRow>(`WITH targets AS (SELECT m.*,e.embedding AS vector FROM memories m
+        LEFT JOIN memory_embeddings e ON e.memory_id=m.id WHERE m.vault_id=$1 AND m.id=ANY($2::uuid[])),
+      matches AS (
+        SELECT m.id,t.id AS target_id,CASE WHEN m.id=t.parent_id OR m.parent_id=t.id THEN 2
+          WHEN (m.subject_hmac IS NOT NULL AND m.subject_hmac=t.subject_hmac)
+            OR (m.subject_hmac IS NULL AND t.subject_hmac IS NULL AND m.subject=t.subject) THEN 1 ELSE 0 END AS rank
+        FROM targets t CROSS JOIN LATERAL (
+          SELECT a.* FROM memories a LEFT JOIN memory_embeddings e ON e.memory_id=a.id
+          WHERE a.vault_id=$1 AND a.status='active' AND a.archived_at IS NULL AND NOT(a.id=ANY($2::uuid[]))
+            AND a.scope=t.scope AND a.scope_key IS NOT DISTINCT FROM t.scope_key
+            AND (a.id=t.parent_id OR a.parent_id=t.id
+              OR (a.subject_hmac IS NOT NULL AND a.subject_hmac=t.subject_hmac)
+              OR (a.subject_hmac IS NULL AND t.subject_hmac IS NULL AND a.subject=t.subject)
+              OR (t.vector IS NOT NULL AND 1-(e.embedding <=> t.vector)>=$4))
+          ORDER BY (a.id=t.parent_id OR a.parent_id=t.id) DESC,
+            (e.embedding <=> t.vector) NULLS LAST,a.id LIMIT $3
+        ) m
+      ), ranked AS (SELECT id,max(rank) AS rank,array_agg(DISTINCT target_id) AS relevant_candidate_ids
+        FROM matches GROUP BY id ORDER BY max(rank) DESC,id LIMIT $3)
+      SELECT m.*,m.revision::text AS row_version,r.relevant_candidate_ids FROM ranked r JOIN memories m ON m.id=r.id
+      ORDER BY r.rank DESC,m.id`,[row.vault_id,ids,Math.max(0,limits.curator_active_memories_per_call),RELEVANT_ACTIVE_MEMORY_MIN_SIMILARITY])).rows;
+    const sourceIds = [...new Set([...selected,...related].flatMap(m => m.source_chunks ?? []))];
+    const sourceStore = sourceIds.length ? getRawChunkStorage().store : null;
+    const sourceRows = (await client.query<{id:string;role:string;created_at:string;provenance:unknown;session_id:string;project_id:string|null;task_id:string|null;blob_key:string;blob_store:string;storage_bytes:string}>(`
+      SELECT r.id,r.role,r.created_at,r.provenance,r.session_id,r.blob_key,r.blob_store,r.storage_bytes,
+        r.capture_context->>'project_id' AS project_id,r.capture_context->>'task_id' AS task_id FROM raw_chunks r
+      WHERE r.vault_id=$1 AND r.id=ANY($2::uuid[]) AND r.role IN ('user','assistant')
+        AND r.storage_bytes BETWEEN 0 AND 32768 AND r.blob_key IS NOT NULL AND r.blob_store=$3
+      ORDER BY r.acceptance_ordinal DESC LIMIT 8`,[row.vault_id,sourceIds,sourceStore])).rows;
+    return {vault,selected,related,sourceRows,hasMore:targets.length>candidateLimit};
+  });
+  const rawSources: CuratorRawSource[] = [];
+  if (loaded.sourceRows.length) {
+    const storage = getRawChunkStorage();
+    let bytes = 0;
+    for (const r of loaded.sourceRows) {
+      if (r.blob_store !== storage.store || bytes + Number(r.storage_bytes)>32768) continue;
+      const content = await decryptForVault(loaded.vault,await storage.get(r.blob_key));
+      const size = Buffer.byteLength(content,'utf8');
+      if (bytes+size>32768) continue;
+      bytes+=size;
+      rawSources.push({id:r.id,role:r.role,created_at:r.created_at,content,provenance:r.provenance,current:true,
+        context:{session_id:r.session_id,...(r.project_id ? {project_id:r.project_id}:{}),...(r.task_id?{task_id:r.task_id}:{})}});
+    }
   }
-
-  const vault = vaultResult.rows[0];
-  const segmentResult = await query<{
-    context: string | null;
-    session_id: string;
-    project_id: string | null;
-    task_id: string | null;
-  }>(
-    `SELECT context, session_id, project_id, task_id
-     FROM segments
-     WHERE id = $1 AND vault_id = $2
-     LIMIT 1`,
-    [row.segment_id, row.vault_id]
-  );
-
-  if (!segmentResult.rowCount) {
-    throw new Error(`Segment ${row.segment_id} not found`);
-  }
-
-  const conversation = segmentResult.rows[0].context
-    ? await decryptForVault(vault, segmentResult.rows[0].context)
-    : null;
-  const candidateDate = toDateOnly(new Date());
-  if (!candidateDate) {
-    throw new Error('Unable to derive a valid candidate curation date');
-  }
-
-  const candidateRows = await query<MemoryRow>(
-    `SELECT id, vault_id, data, subject, subject_encrypted, subject_hmac, confidence, salience, sensitivity, type,
-            scope, scope_key, polarity, volatility, evidence, parent_id, source_chunks, archived_at, status,
-            valid_from, valid_until, xmin::text AS row_version,
-            COUNT(*) OVER()::text AS total_candidates
-     FROM memories
-     WHERE vault_id = $1
-       AND source_segment_id = $2
-       AND archived_at IS NULL
-       AND status = 'candidate'
-       AND sensitivity <> 'restricted'
-       AND confidence > 0 AND confidence <= 1
-       AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-       AND ${memoryValidityPredicateSql('memories', '$7')}
-       AND (
-         (scope = 'global' AND scope_key IS NULL)
-         OR (scope = 'project' AND scope_key = $4::text AND $4::text IS NOT NULL)
-         OR (scope = 'task' AND scope_key = $5::text AND $5::text IS NOT NULL)
-         OR (scope = 'session' AND scope_key = $6::text)
-       )
-     ORDER BY confidence DESC, salience DESC, created_at ASC, id ASC
-     LIMIT $3`,
-    [
-      row.vault_id,
-      row.segment_id,
-      candidateLimit + 1,
-      segmentResult.rows[0].project_id,
-      segmentResult.rows[0].task_id,
-      segmentResult.rows[0].session_id,
-      candidateDate
-    ]
-  );
-
-  const hasMoreCandidates = candidateRows.rows.length > candidateLimit;
-  const candidates = await Promise.all(candidateRows.rows.slice(0, candidateLimit).map((memory) => decryptMemory(vault, memory)));
-  const totalCandidates = candidateRows.rows[0]?.total_candidates ? Number(candidateRows.rows[0].total_candidates) : candidates.length;
-  const candidateIds = new Set(candidates.map((memory) => memory.id));
-  const activeMemories = await loadRelevantActiveMemories(
-    vault,
-    candidates,
-    Math.max(0, limits.curator_active_memories_per_call)
-  );
-
-  return {
-    queueId: row.queue_id,
-    segmentId: row.segment_id,
-    vault,
-    conversation,
-    candidates,
-    activeMemories,
-    candidateIds,
-    limits,
-    hasMoreCandidates,
-    deferredCandidates: Math.max(0, totalCandidates - candidates.length)
-  };
-}
-
-async function loadRelevantActiveMemories(
-  vault: VaultRow,
-  candidates: CuratorMemory[],
-  limit: number
-): Promise<CuratorMemory[]> {
-  if (candidates.length === 0 || limit <= 0) {
-    return [];
-  }
-
-  const subjects = Array.from(new Set(candidates.map((memory) => memory.subject)));
-  const plaintextSubjects = isVaultEncryptionActive(vault) ? [] : subjects;
-  const subjectHmacs = isVaultEncryptionActive(vault)
-    ? (await Promise.all(subjects.map(async (subject) => (await encryptSubjectForVault(vault, subject))?.hmac ?? null)))
-        .filter((value): value is string => Boolean(value))
-    : [];
-  const candidateIds = candidates.map((candidate) => candidate.id);
-  const semanticLimitPerCandidate = Math.max(1, Math.min(5, limit));
-  const curationDate = toDateOnly(new Date());
-  if (!curationDate) {
-    throw new Error('Unable to derive a valid curation date');
-  }
-
-  const result = await query<MemoryRow>(
-    `WITH candidate_context AS (
-       SELECT candidate.id,
-              candidate.subject,
-              candidate.subject_hmac,
-              candidate.scope,
-              candidate.scope_key,
-              candidate_embedding.embedding
-       FROM memories candidate
-       LEFT JOIN memory_embeddings candidate_embedding
-         ON candidate_embedding.memory_id = candidate.id
-       WHERE candidate.vault_id = $1
-         AND candidate.id = ANY($2::uuid[])
-         AND candidate.archived_at IS NULL
-         AND candidate.status = 'candidate'
-     ),
-     exact_matches AS (
-       SELECT active.id, active.vault_id, active.data, active.subject, active.subject_encrypted,
-              active.subject_hmac, active.confidence, active.salience, active.sensitivity, active.type,
-              active.scope, active.scope_key, active.polarity, active.volatility, active.evidence, active.parent_id,
-              active.source_chunks, active.archived_at, active.status, active.valid_from, active.valid_until,
-              active.xmin::text AS row_version, active.updated_at,
-              1 AS exact_subject_rank,
-              NULL::double precision AS similarity,
-              ARRAY(SELECT binding.id FROM candidate_context binding
-                WHERE active.scope = binding.scope
-                  AND active.scope_key IS NOT DISTINCT FROM binding.scope_key
-                  AND ((active.subject_hmac IS NULL AND binding.subject_hmac IS NULL AND active.subject = binding.subject)
-                    OR active.subject_hmac = binding.subject_hmac)) AS relevant_candidate_ids
-       FROM memories active
-       WHERE active.vault_id = $1
-         AND active.archived_at IS NULL
-         AND active.status = 'active'
-         AND active.sensitivity <> 'restricted'
-         AND active.confidence > 0 AND active.confidence <= 1
-         AND CASE WHEN active.evidence ? 'policy_rejections' THEN
-           CASE WHEN jsonb_typeof(active.evidence -> 'policy_rejections') = 'array'
-             THEN jsonb_array_length(active.evidence -> 'policy_rejections') = 0
-             ELSE false END
-           ELSE true END
-         AND (active.source_timestamp IS NULL OR active.source_timestamp <= now() + interval '5 minutes')
-         AND ${memoryValidityPredicateSql('active', '$9')}
-         AND EXISTS (
-           SELECT 1 FROM candidate_context binding
-           WHERE active.scope = binding.scope
-             AND active.scope_key IS NOT DISTINCT FROM binding.scope_key
-             AND ((active.subject_hmac IS NULL AND binding.subject_hmac IS NULL AND active.subject = binding.subject)
-               OR active.subject_hmac = binding.subject_hmac)
-         )
-         AND (
-           active.subject = ANY($3::text[])
-           OR active.subject_hmac = ANY($4::text[])
-         )
-       ORDER BY active.updated_at DESC, active.created_at DESC, active.id
-       LIMIT $6
-     ),
-     semantic_matches AS (
-       SELECT nearest.id, nearest.vault_id, nearest.data, nearest.subject, nearest.subject_encrypted,
-              nearest.subject_hmac, nearest.confidence, nearest.salience, nearest.sensitivity, nearest.type,
-              nearest.scope, nearest.scope_key, nearest.polarity, nearest.volatility, nearest.evidence, nearest.parent_id,
-              nearest.source_chunks, nearest.archived_at, nearest.status, nearest.valid_from, nearest.valid_until,
-              nearest.row_version, nearest.updated_at,
-              0 AS exact_subject_rank,
-              1 - (nearest.embedding <=> candidate_context.embedding) AS similarity,
-              ARRAY[candidate_context.id] AS relevant_candidate_ids
-       FROM candidate_context
-       CROSS JOIN LATERAL (
-         SELECT active.id, active.vault_id, active.data, active.subject, active.subject_encrypted,
-                active.subject_hmac, active.confidence, active.salience, active.sensitivity, active.type,
-                active.scope, active.scope_key, active.polarity, active.volatility, active.evidence, active.parent_id,
-                active.source_chunks, active.archived_at, active.status, active.valid_from, active.valid_until,
-                active.xmin::text AS row_version, active.updated_at,
-                active_embedding.embedding
-         FROM memory_embeddings active_embedding
-         JOIN memories active
-           ON active.id = active_embedding.memory_id
-         WHERE candidate_context.embedding IS NOT NULL
-           AND active.vault_id = $1
-           AND active.archived_at IS NULL
-           AND active.status = 'active'
-           AND active.sensitivity <> 'restricted'
-           AND active.confidence > 0 AND active.confidence <= 1
-           AND CASE WHEN active.evidence ? 'policy_rejections' THEN
-             CASE WHEN jsonb_typeof(active.evidence -> 'policy_rejections') = 'array'
-               THEN jsonb_array_length(active.evidence -> 'policy_rejections') = 0
-               ELSE false END
-             ELSE true END
-           AND ${memoryValidityPredicateSql('active', '$9')}
-           AND active.scope = candidate_context.scope
-           AND active.scope_key IS NOT DISTINCT FROM candidate_context.scope_key
-           AND (active.source_timestamp IS NULL OR active.source_timestamp <= now() + interval '5 minutes')
-         ORDER BY active_embedding.embedding <=> candidate_context.embedding, active.id
-         LIMIT $7
-       ) nearest
-       WHERE candidate_context.embedding IS NOT NULL
-         AND 1 - (nearest.embedding <=> candidate_context.embedding) >= $5
-     ),
-     all_matches AS (
-       SELECT * FROM exact_matches UNION ALL SELECT * FROM semantic_matches
-     ),
-     ranked AS (
-       SELECT DISTINCT ON (matches.id)
-              matches.id, matches.vault_id, matches.data, matches.subject, matches.subject_encrypted,
-              matches.subject_hmac, matches.confidence, matches.salience, matches.sensitivity, matches.type,
-              matches.scope, matches.scope_key, matches.polarity, matches.volatility, matches.evidence, matches.parent_id,
-              matches.source_chunks, matches.archived_at, matches.status, matches.valid_from, matches.valid_until,
-              matches.row_version, matches.updated_at,
-              matches.exact_subject_rank, matches.similarity
-       FROM all_matches matches
-       ORDER BY matches.id,
-                matches.exact_subject_rank DESC,
-                matches.similarity DESC NULLS LAST,
-                matches.updated_at DESC
-     )
-     SELECT id, vault_id, data, subject, subject_encrypted, subject_hmac, confidence, salience,
-            sensitivity, type, scope, scope_key, polarity, volatility, evidence, parent_id, source_chunks,
-            archived_at, status, valid_from, valid_until, row_version,
-            ARRAY(SELECT DISTINCT candidate_id FROM all_matches matches,
-              unnest(matches.relevant_candidate_ids) candidate_id WHERE matches.id = ranked.id) AS relevant_candidate_ids
-     FROM ranked
-     ORDER BY exact_subject_rank DESC, similarity DESC NULLS LAST, updated_at DESC, id
-     LIMIT $8`,
-    [
-      vault.id,
-      candidateIds,
-      plaintextSubjects,
-      subjectHmacs,
-      RELEVANT_ACTIVE_MEMORY_MIN_SIMILARITY,
-      limit,
-      semanticLimitPerCandidate,
-      limit,
-      curationDate
-    ]
-  );
-  return Promise.all(result.rows.map((memory) => decryptMemory(vault, memory)));
+  const candidates = await Promise.all(loaded.selected.map(m => decryptMemory(loaded.vault,m)));
+  const activeMemories = await Promise.all(loaded.related.map(m => decryptMemory(loaded.vault,m)));
+  return {queueId:row.queue_id,segmentId:row.segment_id,vault:loaded.vault,conversation:null,rawSources,candidates,activeMemories,
+    candidateIds:new Set(candidates.map(m=>m.id)),limits,hasMoreCandidates:loaded.hasMore,deferredCandidates:loaded.hasMore?1:0};
 }
 
 async function decryptMemory(vault: VaultRow, memory: MemoryRow): Promise<CuratorMemory> {
@@ -813,6 +668,7 @@ async function decryptMemory(vault: VaultRow, memory: MemoryRow): Promise<Curato
       : null,
     evidence_record: memory.evidence,
     source_chunks: memory.source_chunks,
+    source_timestamp: memory.source_timestamp ? new Date(memory.source_timestamp).toISOString() : null,
     row_version: memory.row_version,
     relevant_candidate_ids: memory.relevant_candidate_ids,
     parent_id: memory.parent_id,
@@ -840,7 +696,7 @@ function buildCuratedEvidence(sources: CuratorMemory[], summary: string | null):
   });
   return {
     summary,
-    curation_source_candidate_ids: sources.map((memory) => memory.id),
+    curation_source_memory_ids: sources.map((memory) => memory.id),
     ...(policyRejections.length > 0 ? { policy_rejections: policyRejections } : {})
   };
 }
@@ -908,666 +764,204 @@ async function insertCurationReviewRun(
 }
 
 async function applyActions(
-  job: LoadedCurationJob,
-  actions: CuratorResult,
-  aliasMaps: CuratorAliasMaps,
-  graph: CompiledCuratorGraph,
-  rawResponse: unknown,
-  reviewRunId: string,
-  preparedCrypto: PreparedVaultCrypto,
-  writes: PreparedCuratorWrites,
-  lease: WorkerLease,
-  actionKey: string,
-  usage: { countRun: boolean; promptTokens: number; completionTokens: number }
+  job: LoadedCurationJob, actions: CuratorResult, aliasMaps: CuratorAliasMaps, graph: CompiledCuratorGraph,
+  rawResponse: unknown, reviewRunId: string, preparedCrypto: PreparedVaultCrypto, writes: PreparedCuratorWrites,
+  lease: WorkerLease, actionKey: string, usage: {countRun:boolean;promptTokens:number;completionTokens:number}
 ): Promise<boolean> {
-  const capCuratorText = (value: string | null | undefined): string | undefined => value ? value.slice(0, 500) : undefined;
-  const knownById = new Map<string, CuratorMemory>();
-  for (const memory of [...job.candidates, ...job.activeMemories]) {
-    knownById.set(memory.id, memory);
-  }
-  const createdIds = new Map<number, string>();
-  const resolveRef = (ref: CuratorNodeRef): string => {
-    const id = ref.kind === 'existing' ? ref.id : createdIds.get(ref.index);
-    if (!id || !knownById.has(id)) throw new Error('Compiled graph target is not available');
+  validateCuratorContract(actions,job.candidates,job.activeMemories,aliasMaps,job.rawSources);
+  const reviewed = new Map([...job.candidates,...job.activeMemories].map(m => [m.id,m]));
+  const byAlias = (alias:string) => {
+    const memory = reviewed.get(aliasMaps.aliasToId.get(alias) ?? '');
+    if (!memory) throw new Error('Unknown reviewed memory alias');
+    return memory;
+  };
+  const createdIds = new Map<number,string>();
+  const resolveRef = (ref:CuratorNodeRef) => {
+    const id = ref.kind==='existing' ? ref.id : createdIds.get(ref.index);
+    if (!id) throw new Error('Replacement is unavailable');
     return id;
   };
-
-  const touchedCandidates = new Set<string>();
-  let memoryCountDelta = 0;
-
-  const applied = await withWorkerLeaseTransaction(lease, async (client) => {
+  let delta = 0;
+  const applied = await withWorkerLeaseTransaction(lease,async client => {
+    await lockMemoryWriteVault(client,job.vault.id);
     await preparedCrypto.assertCurrent(client);
-    if (!await recordWorkerAction(client, lease, actionKey)) {
-      await client.query(
-        `UPDATE curation_review_runs
-         SET validation_status = 'application_failed',
-             validation_errors = '["durable action already applied by an earlier claim"]'::jsonb
-         WHERE id = $1 AND validation_status = 'valid'`,
-        [reviewRunId]
-      );
-      await finishCurationJobInTransaction(client, job, lease);
-      return false;
-    }
-    const reviewedIds = [...job.candidates, ...job.activeMemories].map((memory) => memory.id);
-    const locked = await client.query<{
-      id: string;
-      scope: MemoryScope;
-      scope_key: string | null;
-      status: string;
-      archived_at: string | null;
-      row_version: string;
-      [key: string]: unknown;
-    }>(
-      `SELECT id, data, subject, subject_encrypted, type, scope, scope_key, sensitivity,
-              status, authority_state, authority_required, authority_version, evidence,
-              source_chunks, valid_from, valid_until, archived_at, xmin::text AS row_version
-       FROM memories
-       WHERE vault_id = $1
-         AND id = ANY($2::uuid[])
-       ORDER BY id
-       FOR UPDATE`,
-      [job.vault.id, reviewedIds]
-    );
-    if (locked.rows.length !== reviewedIds.length) {
-      throw new Error('Curation context changed after review: one or more reviewed memories are missing');
-    }
-    for (const row of locked.rows) {
-      const expected = knownById.get(row.id);
-      const expectedStatus = job.candidateIds.has(row.id) ? 'candidate' : 'active';
-      if (!expected || row.archived_at !== null || row.status !== expectedStatus
-        || row.scope !== expected.scope || row.scope_key !== expected.scope_key
-        || row.row_version !== expected.row_version) {
-        throw new Error(`Curation context changed after review for memory ${row.id}`);
+    const limits = await getCuratorLimits(job.vault.id,client);
+    const blocked = getCuratorPlanBlockReason(limits);
+    if (blocked) throw new CuratorPreparationDeferredError('Curation entitlement or capacity changed');
+    if (!await recordWorkerAction(client,lease,actionKey)) return false;
+    const ids = [...reviewed.keys()].sort();
+    // The vault write lock serializes graph writers as well as memory writers.
+    // Discover bounded incident rows before acquiring all memory locks in ID order.
+    const incident = (await client.query<{id:string;from_memory_id:string;to_memory_id:string;type:EdgeType;confidence:number;reason:string|null}>(`
+      SELECT id,from_memory_id,to_memory_id,type,confidence,reason FROM memory_edges
+      WHERE vault_id=$1 AND (from_memory_id=ANY($2::uuid[]) OR to_memory_id=ANY($2::uuid[]))
+      ORDER BY id LIMIT 501 FOR UPDATE`,[job.vault.id,ids])).rows;
+    const children = (await client.query<{id:string;parent_id:string}>(`
+      SELECT id,parent_id FROM memories WHERE vault_id=$1 AND parent_id=ANY($2::uuid[]) ORDER BY id LIMIT 501`,[job.vault.id,ids])).rows;
+    if (incident.length>500 || children.length>500) throw new CuratorPreparationDeferredError('Curation incident graph exceeds bounded application capacity');
+    const lockIds = [...new Set([...ids,...incident.flatMap(e => [e.from_memory_id,e.to_memory_id]),
+      ...children.map(c => c.id),...[...reviewed.values()].flatMap(m => m.parent_id ? [m.parent_id]:[])])].sort();
+    const locked = (await client.query<MemoryRow>(`SELECT m.*,m.revision::text AS row_version FROM memories m
+      WHERE vault_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR UPDATE`,[job.vault.id,lockIds])).rows;
+    const current = new Map(locked.map(m => [m.id,m]));
+    for (const [id,expected] of reviewed) {
+      const actual = current.get(id);
+      if (!actual || actual.status!=='active' || actual.archived_at!==null || actual.row_version!==expected.row_version) {
+        throw new Error('Curation reviewed revision changed');
       }
     }
-    const lockedBeforeState = serializePreparedCurationAuditPayload(job.vault, locked.rows, preparedCrypto);
-    const auditLock = await client.query(
-      `UPDATE curation_review_runs
-       SET before_state = $2::jsonb
-       WHERE id = $1 AND validation_status = 'valid'
-       RETURNING id`,
-      [reviewRunId, lockedBeforeState]
-    );
-    if (auditLock.rowCount !== 1) {
-      throw new Error(`Curation review run ${reviewRunId} was not in a valid state`);
+    const sourceIds = [...new Set([...reviewed.values()].flatMap(m => m.source_chunks ?? []))];
+    if (sourceIds.length) {
+      const sourceRows = await client.query('SELECT id FROM raw_chunks WHERE vault_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR KEY SHARE',[job.vault.id,sourceIds]);
+      if (sourceRows.rows.length!==sourceIds.length) throw new Error('Curation source lineage is unavailable');
+    }
+    const audit = await client.query(`UPDATE curation_review_runs SET before_state=$2::jsonb
+      WHERE id=$1 AND vault_id=$3 AND validation_status='valid' RETURNING id`,
+      [reviewRunId,serializePreparedCurationAuditPayload(job.vault,locked.filter(m=>reviewed.has(m.id)),preparedCrypto),job.vault.id]);
+    if (audit.rowCount!==1) throw new Error('Curation review is not applicable');
+
+    const replacementById = new Map<string,string>();
+    const changes = new Map(actions.scope_changes.map(c => [c.id,c]));
+    // Insert replacements with their complete source union before retiring anything;
+    // all changes roll back together and no intermediate state is externally visible.
+    for (const index of graph.creationOrder) {
+      const action = actions.consolidate[index];
+      const sources = action.sources.map(byAlias);
+      const proposed = action.memory;
+      const binding = changes.get(action.id) ?? sources[0];
+      const sourceChunks = [...new Set(sources.flatMap(m => m.source_chunks ?? []))].sort();
+      const inserted = await insertActiveMemory(client,job.vault,preparedCrypto,
+        writes.vector('create',index,proposed.statement,proposed.subject),{
+          subject:proposed.subject,fact:proposed.statement,type:proposed.type,scope:binding.scope,
+          scopeKey:binding.scope_key,salience:proposed.salience,confidence:proposed.confidence,
+          sensitivity:proposed.sensitivity,polarity:proposed.polarity,volatility:proposed.volatility,
+          evidence:buildCuratedEvidence(sources,proposed.evidence),sourceChunks,
+          parentId:graph.parents[index] ? resolveRef(graph.parents[index]!) : null,
+          sourceSegmentId:job.segmentId,validFrom:proposed.valid_from,validUntil:proposed.valid_until
+          ,sourceTimestamp:sources.map(m=>m.source_timestamp).filter((s):s is string=>Boolean(s)).sort().at(-1) ?? null
+        });
+      createdIds.set(index,inserted.id);
+      sources.forEach(m => replacementById.set(m.id,inserted.id));
+      await insertActionLog(client,preparedCrypto,{reviewRunId,vaultId:job.vault.id,vault:job.vault,segmentId:job.segmentId,
+        actionType:'create',newMemoryId:inserted.id,subject:proposed.subject,newValue:proposed.statement,rawResponse,applied:true});
+      delta+=1;
+    }
+    for (const [index,action] of actions.update.entries()) {
+      const original = byAlias(action.id);
+      const sources = action.source_refs.map(byAlias);
+      const proposed = action.memory;
+      const vector = writes.vector('update',index,proposed.statement,proposed.subject);
+      const encryptedSubject = preparedCrypto.subject(job.vault,proposed.subject);
+      await client.query(`UPDATE memories SET data=$3,subject=$4,subject_encrypted=$5,subject_hmac=$6,hash=$7,
+        embedding=$8::vector,type=$9,confidence=$10,salience=$11,sensitivity=$12,polarity=$13,volatility=$14,
+        evidence=$15::jsonb,source_chunks=$16::uuid[],source_timestamp=$17::timestamptz,updated_at=now()
+        WHERE vault_id=$1 AND id=$2`,[job.vault.id,original.id,preparedCrypto.encrypt(job.vault,proposed.statement),
+        isVaultEncryptionActive(job.vault)?'':proposed.subject,encryptedSubject?.encrypted ?? null,encryptedSubject?.hmac ?? null,
+        crypto.createHash('sha256').update(proposed.statement).digest('hex'),JSON.stringify(vector),proposed.type,proposed.confidence,
+        proposed.salience,proposed.sensitivity,proposed.polarity,proposed.volatility,
+        JSON.stringify(buildCuratedEvidence(sources,proposed.evidence)),[...new Set(sources.flatMap(m=>m.source_chunks ?? []))].sort(),
+        sources.map(m=>m.source_timestamp).filter((s):s is string=>Boolean(s)).sort().at(-1) ?? null]);
+      await upsertMemoryEmbedding(client,original.id,vector);
+      await insertActionLog(client,preparedCrypto,{reviewRunId,vaultId:job.vault.id,vault:job.vault,segmentId:job.segmentId,
+        actionType:'update',memoryId:original.id,subject:proposed.subject,oldValue:original.data,newValue:proposed.statement,rawResponse,applied:true});
+    }
+    // Scope is a separate auditable action, never inferred from a merge/update.
+    for (const change of actions.scope_changes) {
+      const index = actions.consolidate.findIndex(c=>c.id===change.id);
+      const id = index>=0 ? createdIds.get(index)! : byAlias(change.id).id;
+      const previous = index>=0 ? byAlias(actions.consolidate[index].sources[0]) : byAlias(change.id);
+      if (previous.scope===change.scope && previous.scope_key===change.scope_key) continue;
+      await client.query('UPDATE memories SET scope=$3,scope_key=$4,updated_at=now() WHERE vault_id=$1 AND id=$2',
+        [job.vault.id,id,change.scope,change.scope_key]);
+      await client.query(`INSERT INTO memory_scope_change_log
+        (vault_id,memory_id,old_scope,new_scope,old_scope_key,new_scope_key,actor_type,actor_id,source,reason)
+        VALUES($1,$2,$3,$4,$5,$6,'worker',NULL,'curator',$7)`,
+        [job.vault.id,id,previous.scope,change.scope,previous.scope_key,change.scope_key,change.reason]);
     }
 
-    const promotionDate = toDateOnly(new Date());
-    if (!promotionDate) {
-      throw new Error('Unable to derive a valid candidate promotion date');
+    // Rewire all incident relationships, retaining their evidence and restrictive
+    // confidence on duplicate edges. Internal consolidation edges become self edges
+    // and have no remaining semantic relationship to represent.
+    for (const edge of incident) {
+      const from = replacementById.get(edge.from_memory_id) ?? edge.from_memory_id;
+      const to = replacementById.get(edge.to_memory_id) ?? edge.to_memory_id;
+      if (from===edge.from_memory_id && to===edge.to_memory_id) continue;
+      if (from!==to) await client.query(`INSERT INTO memory_edges(vault_id,from_memory_id,to_memory_id,type,confidence,reason)
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(from_memory_id,to_memory_id,type) DO UPDATE
+        SET confidence=LEAST(memory_edges.confidence,EXCLUDED.confidence),
+          reason=CASE WHEN memory_edges.reason IS NOT DISTINCT FROM EXCLUDED.reason THEN memory_edges.reason
+            ELSE concat_ws(E'\\n',memory_edges.reason,EXCLUDED.reason) END,updated_at=now()`,
+        [job.vault.id,from,to,edge.type,edge.confidence,edge.reason]);
+      await client.query('DELETE FROM memory_edges WHERE vault_id=$1 AND id=$2',[job.vault.id,edge.id]);
     }
-    for (const action of actions.promoted_candidates) {
-      const memoryId = resolveAlias(action.id, aliasMaps);
-      const memory = knownById.get(memoryId);
-      if (!memory || !job.candidateIds.has(memoryId) || touchedCandidates.has(memoryId)) {
-        throw new Error(`Curator promotion target is not an untouched reviewed candidate: ${action.id}`);
-      }
-      const promoteResult = await client.query<{ id: string }>(
-        `UPDATE memories
-         SET status = 'active',
-             evidence = CASE
-               WHEN jsonb_typeof(evidence) = 'object' THEN evidence
-               ELSE '{}'::jsonb
-             END || jsonb_build_object('curation_promotion_evidence', $7::text),
-             updated_at = now()
-         WHERE id = $1
-           AND vault_id = $2
-           AND source_segment_id = $3
-           AND archived_at IS NULL
-           AND status = 'candidate'
-           AND scope = $4
-           AND scope_key IS NOT DISTINCT FROM $5::text
-           AND sensitivity <> 'restricted'
-           AND confidence > 0 AND confidence <= 1
-           AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-           AND ${memoryValidityPredicateSql('memories', '$6')}
-           AND CASE WHEN evidence ? 'policy_rejections' THEN
-             CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-               THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-               ELSE false END
-             ELSE true END
-         RETURNING id`,
-        [memoryId, job.vault.id, job.segmentId, memory.scope, memory.scope_key, promotionDate, action.evidence]
-      );
-      if (promoteResult.rowCount !== 1) {
-        throw new Error(`Candidate ${action.id} failed promotion policy revalidation`);
-      }
-      touchedCandidates.add(memoryId);
-      await insertActionLog(client, preparedCrypto, {
-        vaultId: job.vault.id,
-        vault: job.vault,
-        segmentId: job.segmentId,
-        actionType: 'promote',
-        memoryId,
-        subject: memory?.subject,
-        oldValue: memory?.data,
-        newValue: action.evidence,
-        rawResponse,
-        applied: true
-      });
+    for (const child of children) {
+      if (replacementById.has(child.id)) continue;
+      const parent = replacementById.get(child.parent_id);
+      if (parent) await client.query('UPDATE memories SET parent_id=$3,updated_at=now() WHERE vault_id=$1 AND id=$2',[job.vault.id,child.id,parent]);
+      else if (actions.archive.some(a=>byAlias(a.id).id===child.parent_id)
+        && !actions.archive.some(a=>byAlias(a.id).id===child.id)) throw new Error('Archive would orphan a surviving child');
     }
-
-    for (const creationIndex of graph.creationOrder) {
-      const action = actions.nodes_to_create[creationIndex];
-      if (action.type === 'user_rule') {
-        memoryPolicyEventCounter.add(1, {
-          event: 'generated_rule_proposal',
-          source: 'curation_worker',
-          scope: action.scope,
-          outcome: 'proposed'
-        });
-      }
-      const consumedCandidateIds = resolveCandidateAliases(
-        action.consumed_candidate_ids,
-        aliasMaps,
-        job.candidateIds
-      );
-      const sourceCandidates = consumedCandidateIds.length > 0
-        ? consumedCandidateIds.flatMap((id) => {
-          const memory = knownById.get(id);
-          return memory ? [memory] : [];
-        })
-        : [];
-      const sourceBinding = sourceCandidates[0];
-      const hasTrustedBinding = Boolean(sourceBinding)
-        && sourceCandidates.every((memory) => memory.scope === action.scope && memory.scope_key === sourceBinding.scope_key)
-        && (action.scope === 'global' ? sourceBinding.scope_key === null : sourceBinding.scope_key !== null);
-      if (!hasTrustedBinding) {
-        throw new Error(`Curator applicability change denied: requested=${action.scope}, sources=${sourceCandidates.map((memory) => `${memory.scope}:${memory.scope_key ?? '<unbound>'}`).join(',')}`);
-      }
-      const parent = graph.parents[creationIndex];
-      const parentId = parent ? resolveRef(parent) : null;
-      if (parentId) {
-        const checked = await client.query(
-          `SELECT id FROM memories WHERE id = $1 AND vault_id = $2 AND scope = $3
-             AND scope_key IS NOT DISTINCT FROM $4::text AND status = 'active' AND archived_at IS NULL FOR UPDATE`,
-          [parentId, job.vault.id, action.scope, sourceBinding!.scope_key]
-        );
-        if (checked.rowCount !== 1) throw new Error('Compiled parent failed write-time revalidation');
-      }
-      try {
-        const validity = intersectValidityWindows(sourceCandidates.map((memory) => ({
-          valid_from: memory.valid_from ?? null,
-          valid_until: memory.valid_until ?? null
-        })));
-        const inserted = await insertActiveMemory(client, job.vault, preparedCrypto,
-          writes.vector('create', creationIndex, action.statement, action.subject), {
-          subject: action.subject,
-          fact: action.statement,
-          type: action.type,
-          scope: action.scope,
-          scopeKey: sourceBinding!.scope_key,
-          salience: action.salience ?? 0.6,
-          confidence: action.confidence ?? 0.95,
-          sensitivity: mostRestrictiveSensitivity(sourceCandidates, action.sensitivity ?? 'low'),
-          polarity: action.polarity ?? 'neutral',
-          volatility: action.volatility ?? 'low',
-          evidence: buildCuratedEvidence(sourceCandidates, capCuratorText(action.evidence) ?? null),
-          sourceChunks: Array.from(new Set(sourceCandidates.flatMap((memory) => memory.source_chunks ?? []))),
-          parentId,
-          sourceSegmentId: job.segmentId,
-          validFrom: validity.valid_from,
-          validUntil: validity.valid_until
-        });
-        memoryCountDelta += 1;
-        createdIds.set(creationIndex, inserted.id);
-        knownById.set(inserted.id, {
-          id: inserted.id,
-          subject: action.subject,
-          data: action.statement,
-          type: action.type,
-          scope: action.scope,
-          scope_key: sourceBinding!.scope_key,
-          salience: action.salience ?? 0.6,
-          confidence: action.confidence ?? 0.95,
-          sensitivity: mostRestrictiveSensitivity(sourceCandidates, action.sensitivity ?? 'low'),
-          polarity: action.polarity ?? 'neutral',
-          volatility: action.volatility ?? 'low',
-          evidence: capCuratorText(action.evidence) ?? null,
-          evidence_record: buildCuratedEvidence(sourceCandidates, capCuratorText(action.evidence) ?? null),
-          source_chunks: Array.from(new Set(sourceCandidates.flatMap((memory) => memory.source_chunks ?? []))),
-          parent_id: parentId,
-          valid_from: validity.valid_from,
-          valid_until: validity.valid_until
-        });
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'create',
-          subject: action.subject,
-          newMemoryId: inserted.id,
-          newValue: action.statement,
-          rawResponse,
-          applied: true
-        });
-        memoryCountDelta -= await archiveConsumedCandidates(client, preparedCrypto, {
-          job,
-          knownById,
-          aliasMaps,
-          touchedCandidates,
-          consumedAliases: action.consumed_candidate_ids,
-          targetMemoryId: inserted.id,
-          rawResponse,
-          reason: `absorbed into curator-created memory ${inserted.id}`
-        });
-      } catch (error) {
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'create',
-          subject: action.subject,
-          newValue: action.statement,
-          rawResponse,
-          applied: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
+    for (const [index,edge] of graph.edges.entries()) {
+      const action = actions.edges[index];
+      await client.query(`INSERT INTO memory_edges(vault_id,from_memory_id,to_memory_id,type,confidence,reason)
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(from_memory_id,to_memory_id,type) DO UPDATE
+        SET confidence=EXCLUDED.confidence,reason=EXCLUDED.reason,updated_at=now()`,
+        [job.vault.id,resolveRef(edge.from),resolveRef(edge.to),action.type,action.confidence,action.reason]);
     }
-
-    for (const [updateIndex, action] of actions.nodes_to_update.entries()) {
-      const resolvedId = resolveAlias(action.id, aliasMaps);
-      const existing = knownById.get(resolvedId);
-      if (!existing) {
-        throw new Error(`Curator referenced memory outside curation context: ${action.id}`);
-      }
-
-      if ((action.type ?? existing.type) === 'user_rule') {
-        memoryPolicyEventCounter.add(1, {
-          event: 'generated_rule_proposal',
-          source: 'curation_worker',
-          scope: action.scope ?? existing.scope,
-          outcome: 'proposed_update'
-        });
-      }
-
-      if (action.scope && action.scope !== existing.scope) {
-        memoryPolicyEventCounter.add(1, {
-          event: isScopeWidening(existing.scope, action.scope) ? 'scope_widening_attempt' : 'scope_change_attempt',
-          source: 'curation_worker',
-          outcome: 'rejected'
-        });
-        throw new Error(`Curator scope change denied: existing=${existing.scope}, requested=${action.scope}`);
-      }
-
-      try {
-        const consumedCandidateIds = resolveCandidateAliases(
-          action.consumed_candidate_ids,
-          aliasMaps,
-          job.candidateIds
-        );
-        const sourceCandidates = consumedCandidateIds.map((id) => knownById.get(id)!);
-        const validity = intersectValidityWindows([existing, ...sourceCandidates].map((memory) => ({
-          valid_from: memory.valid_from ?? null,
-          valid_until: memory.valid_until ?? null
-        })));
-        const updated = await updateMemoryNode(client, job.vault, preparedCrypto,
-          writes.vector('update', updateIndex, action.statement, action.subject ?? null), {
-          id: resolvedId,
-          fact: action.statement,
-          subject: action.subject ?? null,
-          type: action.type ?? null,
-          scope: action.scope ?? null,
-          salience: action.salience ?? null,
-          confidence: action.confidence ?? null,
-          volatility: action.volatility ?? null,
-          evidence: buildCuratedEvidence(sourceCandidates, capCuratorText(action.reason) ?? null),
-          sensitivity: mostRestrictiveSensitivity(sourceCandidates, existing.sensitivity),
-          sourceChunks: Array.from(new Set([
-            ...(existing.source_chunks ?? []),
-            ...sourceCandidates.flatMap((memory) => memory.source_chunks ?? [])
-          ])),
-          validFrom: validity.valid_from,
-          validUntil: validity.valid_until,
-          expectedScope: existing.scope,
-          expectedScopeKey: existing.scope_key
-        });
-        knownById.set(resolvedId, {
-          ...existing,
-          data: action.statement,
-          subject: updated.subject,
-          type: updated.type,
-          scope: updated.scope,
-          salience: updated.salience,
-          confidence: updated.confidence,
-          sensitivity: updated.sensitivity,
-          polarity: updated.polarity,
-          volatility: updated.volatility,
-          evidence: updated.evidence,
-          evidence_record: updated.evidence_record,
-          source_chunks: updated.source_chunks,
-          parent_id: updated.parent_id
-        });
-        if (job.candidateIds.has(resolvedId)) {
-          touchedCandidates.add(resolvedId);
-        }
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'update',
-          memoryId: resolvedId,
-          newMemoryId: resolvedId,
-          subject: updated.subject,
-          oldValue: updated.previousFact,
-          newValue: action.statement,
-          rawResponse,
-          applied: true
-        });
-        memoryCountDelta -= await archiveConsumedCandidates(client, preparedCrypto, {
-          job,
-          knownById,
-          aliasMaps,
-          touchedCandidates,
-          consumedAliases: action.consumed_candidate_ids,
-          targetMemoryId: resolvedId,
-          rawResponse,
-          reason: `absorbed into curator-updated memory ${resolvedId}`
-        });
-      } catch (error) {
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'update',
-          memoryId: knownById.has(resolvedId) ? resolvedId : undefined,
-          subject: knownById.has(resolvedId) ? knownById.get(resolvedId)?.subject : action.subject,
-          oldValue: knownById.has(resolvedId) ? knownById.get(resolvedId)?.data : undefined,
-          newValue: action.statement,
-          rawResponse,
-          applied: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
+    const retiredIds = [...replacementById.keys(),...actions.archive.map(a=>byAlias(a.id).id)];
+    if (retiredIds.length) {
+      await client.query(`UPDATE memories SET status='superseded',archived_at=now(),updated_at=now()
+        WHERE vault_id=$1 AND id=ANY($2::uuid[])`,[job.vault.id,retiredIds]);
+      delta-=retiredIds.length;
+      for (const id of retiredIds) await insertActionLog(client,preparedCrypto,{
+        reviewRunId,vaultId:job.vault.id,vault:job.vault,segmentId:job.segmentId,actionType:'delete',memoryId:id,
+        newMemoryId:replacementById.get(id),oldValue:reviewed.get(id)!.data,rawResponse,applied:true});
     }
-
-    for (const [edgeIndex, action] of actions.edges_to_create.entries()) {
-      try {
-        const fromId = resolveRef(graph.edges[edgeIndex].from);
-        const toId = resolveRef(graph.edges[edgeIndex].to);
-        const fromMemory = knownById.get(fromId);
-        const toMemory = knownById.get(toId);
-        if (!fromMemory || !toMemory) {
-          throw new Error(`Curator edge endpoint left the reviewed context: ${action.from_subject} -> ${action.to_subject}`);
-        }
-        const cappedReason = capCuratorText(action.reason);
-        await insertEdge(
-          client,
-          job.vault.id,
-          fromId,
-          toId,
-          action.type,
-          action.confidence ?? 0.8,
-          cappedReason ?? null,
-          fromMemory,
-          toMemory
-        );
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'create',
-          memoryId: fromId,
-          newMemoryId: toId,
-          subject: `${action.from_subject} -> ${action.to_subject}`,
-          newValue: `${action.type}: ${cappedReason ?? ''}`.trim(),
-          rawResponse,
-          applied: true,
-          error: undefined
-        });
-      } catch (error) {
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'create',
-          subject: `${action.from_subject} -> ${action.to_subject}`,
-          newValue: action.type,
-          rawResponse,
-          applied: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
-    }
-
-    for (const action of actions.nodes_to_archive) {
-      const resolvedId = resolveAlias(action.id, aliasMaps);
-      const existing = knownById.get(resolvedId);
-      if (!existing) {
-        throw new Error(`Curator referenced memory outside curation context: ${action.id}`);
-      }
-
-      try {
-        const archived = await archiveMemory(client, resolvedId, job.vault.id, existing.scope, existing.scope_key, 'active');
-        if (!archived) throw new Error(`Curator archive target ${action.id} changed after review`);
-        memoryCountDelta -= 1;
-        if (job.candidateIds.has(resolvedId)) {
-          touchedCandidates.add(resolvedId);
-        }
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'delete',
-          memoryId: resolvedId,
-          subject: existing.subject,
-          oldValue: existing.data,
-          newValue: capCuratorText(action.reason),
-          rawResponse,
-          applied: true
-        });
-      } catch (error) {
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'delete',
-          memoryId: knownById.has(resolvedId) ? resolvedId : undefined,
-          subject: knownById.has(resolvedId) ? knownById.get(resolvedId)?.subject : undefined,
-          oldValue: knownById.has(resolvedId) ? knownById.get(resolvedId)?.data : undefined,
-          newValue: capCuratorText(action.reason),
-          rawResponse,
-          applied: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
-    }
-
-    for (const action of actions.discarded_candidates) {
-      const resolvedId = resolveAlias(action.id, aliasMaps);
-      const existing = knownById.get(resolvedId);
-      if (!existing) {
-        throw new Error(`Curator referenced memory outside curation context: ${action.id}`);
-      }
-
-      try {
-        const archived = await archiveMemory(client, resolvedId, job.vault.id, existing.scope, existing.scope_key, 'candidate');
-        if (!archived) throw new Error(`Curator discard target ${action.id} changed after review`);
-        memoryCountDelta -= 1;
-        touchedCandidates.add(resolvedId);
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'delete',
-          memoryId: resolvedId,
-          subject: existing.subject,
-          oldValue: existing.data,
-          newValue: capCuratorText(action.reason),
-          rawResponse,
-          applied: true
-        });
-      } catch (error) {
-        await insertActionLog(client, preparedCrypto, {
-          vaultId: job.vault.id,
-          vault: job.vault,
-          segmentId: job.segmentId,
-          actionType: 'delete',
-          memoryId: knownById.has(resolvedId) ? resolvedId : undefined,
-          subject: knownById.has(resolvedId) ? knownById.get(resolvedId)?.subject : undefined,
-          oldValue: knownById.has(resolvedId) ? knownById.get(resolvedId)?.data : undefined,
-          newValue: capCuratorText(action.reason),
-          rawResponse,
-          applied: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
-    }
-
-    const afterResult = await client.query(
-      `SELECT id, data, subject, subject_encrypted, type, scope, scope_key, sensitivity,
-              status, authority_state, authority_required, authority_version, evidence,
-              source_chunks, valid_from, valid_until, archived_at
-       FROM memories
-       WHERE vault_id = $1
-         AND (source_segment_id = $2 OR id = ANY($3::uuid[]))
-       ORDER BY id`,
-      [job.vault.id, job.segmentId, job.activeMemories.map((memory) => memory.id)]
-    );
-    const afterState = serializePreparedCurationAuditPayload(job.vault, afterResult.rows, preparedCrypto);
-    const auditResult = await client.query(
-      `UPDATE curation_review_runs
-       SET validation_status = 'applied',
-           after_state = $2::jsonb,
-           applied_at = now()
-       WHERE id = $1
-         AND validation_status = 'valid'
-       RETURNING id`,
-      [reviewRunId, afterState]
-    );
-    if (auditResult.rowCount !== 1) {
-      throw new Error(`Curation review run ${reviewRunId} was not in an applicable state`);
-    }
-    const accounted = await recordCuratorUsageInTransaction(client, {
-      vaultId: job.vault.id,
-      candidatesProcessed: job.candidates.length,
-      countRun: usage.countRun,
-      promptTokens: usage.promptTokens,
-      completionTokens: usage.completionTokens,
-      limits: job.limits,
-      actionReceipt: { queueId: job.queueId, actionKey }
-    });
-    if (!accounted) throw new Error(`Curation action receipt ${actionKey} was not available for accounting`);
-    await finishCurationJobInTransaction(client, job, lease);
+    const finalIds = [...new Set([...lockIds,...createdIds.values()])];
+    const invalid = await client.query(`SELECT 1 FROM memory_edges e
+      JOIN memories a ON a.id=e.from_memory_id JOIN memories b ON b.id=e.to_memory_id
+      WHERE e.vault_id=$1 AND (a.id=ANY($2::uuid[]) OR b.id=ANY($2::uuid[]))
+        AND a.status='active' AND b.status='active' AND a.archived_at IS NULL AND b.archived_at IS NULL
+        AND (a.scope<>b.scope OR a.scope_key IS DISTINCT FROM b.scope_key OR a.id=b.id)
+      UNION ALL SELECT 1 FROM memories a JOIN memories b ON b.id=a.parent_id
+      WHERE a.vault_id=$1 AND (a.id=ANY($2::uuid[]) OR b.id=ANY($2::uuid[]))
+        AND a.status='active' AND a.archived_at IS NULL
+        AND (a.scope<>b.scope OR a.scope_key IS DISTINCT FROM b.scope_key)
+      LIMIT 1`,[job.vault.id,finalIds]);
+    if (invalid.rows.length) throw new Error('Curation final graph violates applicability');
+    await validateFinalHierarchy(client,job.vault.id,finalIds);
+    const after = await client.query('SELECT * FROM memories WHERE vault_id=$1 AND id=ANY($2::uuid[]) ORDER BY id',[job.vault.id,[...ids,...createdIds.values()]]);
+    await client.query(`UPDATE curation_review_runs SET validation_status='applied',after_state=$2::jsonb,applied_at=now()
+      WHERE id=$1 AND validation_status='valid'`,[reviewRunId,serializePreparedCurationAuditPayload(job.vault,after.rows,preparedCrypto)]);
+    const accounted = await recordCuratorUsageInTransaction(client,{vaultId:job.vault.id,candidatesProcessed:job.candidates.length,
+      countRun:false,promptTokens:0,completionTokens:0,requestCount:0,
+      limits,actionReceipt:{queueId:job.queueId,actionKey}});
+    if (!accounted) throw new Error('Curation receipt accounting unavailable');
+    await finishCurationJobInTransaction(client,job,lease);
     return true;
   });
-
-  if (applied) publishCommittedWorkerEffects([{
-    kind: 'memory-count', vaultId: job.vault.id, accountId: job.vault.account_id,
-    delta: memoryCountDelta, source: 'curation_worker'
-  }]);
+  if (applied) publishCommittedWorkerEffects([{kind:'memory-count',vaultId:job.vault.id,accountId:job.vault.account_id,delta,source:'curation_worker'}]);
   return applied;
 }
 
-function buildCurationActionKey(job: LoadedCurationJob): string {
-  const reviewedCandidates = job.candidates
-    .map((memory) => memory.id)
-    .sort();
-  return `apply-actions:${crypto.createHash('sha256').update(JSON.stringify({
-    reviewedCandidates
-  })).digest('hex')}`;
+async function validateFinalHierarchy(client:PoolClient,vaultId:string,ids:string[]):Promise<void> {
+  const paths = (await client.query<{cycle:boolean;depth:number}>(`WITH RECURSIVE walk(id,path,cycle,depth) AS (
+    SELECT id,ARRAY[id],false,0 FROM memories WHERE vault_id=$1 AND id=ANY($2::uuid[]) AND status='active' AND archived_at IS NULL
+    UNION ALL
+    SELECT parent.id,w.path||parent.id,parent.id=ANY(w.path),w.depth+1 FROM walk w
+    CROSS JOIN LATERAL (
+      SELECT parent_id AS id FROM memories WHERE vault_id=$1 AND id=w.id AND parent_id IS NOT NULL
+      UNION SELECT to_memory_id FROM memory_edges WHERE vault_id=$1 AND from_memory_id=w.id AND type='part_of'
+    ) link JOIN memories parent ON parent.id=link.id AND parent.vault_id=$1 AND parent.status='active' AND parent.archived_at IS NULL
+    WHERE NOT w.cycle AND w.depth<128
+  ) SELECT cycle,depth FROM walk LIMIT 1001`,[vaultId,ids])).rows;
+  if (paths.length>1000 || paths.some(p=>p.depth>=128)) throw new CuratorPreparationDeferredError('Curation hierarchy exceeds bounded validation capacity');
+  if (paths.some(p=>p.cycle)) throw new Error('Curation creates hierarchy cycle');
 }
 
-async function archiveConsumedCandidates(
-  client: PoolClient,
-  preparedCrypto: PreparedVaultCrypto,
-  input: {
-    job: LoadedCurationJob;
-    knownById: Map<string, CuratorMemory>;
-    aliasMaps: CuratorAliasMaps;
-    touchedCandidates: Set<string>;
-    consumedAliases: string[] | undefined;
-    targetMemoryId: string;
-    rawResponse: unknown;
-    reason: string;
-  }
-): Promise<number> {
-  const consumedCandidateIds = resolveCandidateAliases(input.consumedAliases, input.aliasMaps, input.job.candidateIds);
-  const targetMemory = input.knownById.get(input.targetMemoryId);
-  const hasSameBinding = (candidateId: string) => {
-    const candidate = input.knownById.get(candidateId);
-    return Boolean(targetMemory && candidate
-      && candidate.scope === targetMemory.scope
-      && candidate.scope_key === targetMemory.scope_key);
-  };
-  const candidatesToArchive = consumedCandidateIds.filter((candidateId) =>
-    candidateId !== input.targetMemoryId
-      && !input.touchedCandidates.has(candidateId)
-      && hasSameBinding(candidateId)
-  );
-  let archivedCount = 0;
-
-  for (const candidateId of consumedCandidateIds) {
-    if (candidateId === input.targetMemoryId) {
-      input.touchedCandidates.add(candidateId);
-      continue;
-    }
-    if (input.touchedCandidates.has(candidateId)) {
-      continue;
-    }
-    if (!hasSameBinding(candidateId)) {
-      continue;
-    }
-
-    const memory = input.knownById.get(candidateId);
-    const archived = await archiveMemory(
-      client,
-      candidateId,
-      input.job.vault.id,
-      memory!.scope,
-      memory!.scope_key,
-      'candidate'
-    );
-    if (!archived) throw new Error(`Consumed candidate ${candidateId} changed after review`);
-    archivedCount += 1;
-    input.touchedCandidates.add(candidateId);
-    await insertActionLog(client, preparedCrypto, {
-      vaultId: input.job.vault.id,
-      vault: input.job.vault,
-      segmentId: input.job.segmentId,
-      actionType: 'archive_duplicate',
-      memoryId: candidateId,
-      newMemoryId: input.targetMemoryId,
-      subject: memory?.subject,
-      oldValue: memory?.data,
-      newValue: input.reason,
-      rawResponse: input.rawResponse,
-      applied: true
-    });
-  }
-
-  return archivedCount;
-}
-
-function resolveCandidateAliases(
-  aliases: string[] | undefined,
-  aliasMaps: CuratorAliasMaps,
-  candidateIds: Set<string>
-): string[] {
-  if (!aliases?.length) {
-    return [];
-  }
-
-  const resolved = new Set<string>();
-  for (const alias of aliases) {
-    const id = resolveAlias(alias, aliasMaps);
-    if (candidateIds.has(id)) {
-      resolved.add(id);
-    }
-  }
-  return Array.from(resolved);
-}
-
-function resolveAlias(id: string, aliasMaps: CuratorAliasMaps): string {
-  const resolved = aliasMaps.aliasToId.get(id);
-  if (!resolved) throw new Error('Unknown curator alias');
-  return resolved;
+function buildCurationActionKey(job:LoadedCurationJob):string {
+  const targets = job.candidates.map(m=>[m.id,m.row_version]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])));
+  return 'apply-actions:'+crypto.createHash('sha256').update(JSON.stringify(targets)).digest('hex');
 }
 
 async function insertActiveMemory(
@@ -1589,9 +983,10 @@ async function insertActiveMemory(
     evidence: Record<string, unknown>;
     sourceChunks: string[];
     parentId: string | null;
-    sourceSegmentId: string;
+    sourceSegmentId: string | null;
     validFrom: string | null;
     validUntil: string | null;
+    sourceTimestamp: string | null;
   }
 ): Promise<{ id: string }> {
   const storedFact = preparedCrypto.encrypt(vault, input.fact);
@@ -1600,9 +995,9 @@ async function insertActiveMemory(
      `INSERT INTO memories (
        vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding,
        salience, confidence, sensitivity, type, scope, scope_key, polarity, status, parent_id, volatility, evidence, source_chunks, source_segment_id,
-       valid_from, valid_until
+       valid_from, valid_until,source_timestamp
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14, 'active', $15, $16::memory_volatility, $17::jsonb, $18::uuid[], $19, $20::date, $21::date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14, 'active', $15, $16::memory_volatility, $17::jsonb, $18::uuid[], $19, $20::date, $21::date,$22::timestamptz)
      RETURNING id`,
     [
       vault.id,
@@ -1610,7 +1005,7 @@ async function insertActiveMemory(
       isVaultEncryptionActive(vault) ? '' : input.subject,
       encryptedSubject?.encrypted ?? null,
       encryptedSubject?.hmac ?? null,
-      crypto.createHash('md5').update(input.fact).digest('hex'),
+      crypto.createHash('sha256').update(input.fact).digest('hex'),
       JSON.stringify(embedding),
       input.salience,
       input.confidence,
@@ -1625,214 +1020,11 @@ async function insertActiveMemory(
       input.sourceChunks,
       input.sourceSegmentId,
       input.validFrom,
-      input.validUntil
+      input.validUntil,input.sourceTimestamp
     ]
   );
   await upsertMemoryEmbedding(client, result.rows[0].id, embedding);
   return result.rows[0];
-}
-
-async function updateMemoryNode(
-  client: PoolClient,
-  vault: VaultRow,
-  preparedCrypto: PreparedVaultCrypto,
-  embedding: number[],
-  input: {
-    id: string;
-    fact: string;
-    subject: string | null;
-    type: CuratorMemory['type'];
-    scope: CuratorMemory['scope'] | null;
-    salience: number | null;
-    confidence: number | null;
-    volatility: CuratorMemory['volatility'] | null;
-    evidence: Record<string, unknown>;
-    sensitivity: CuratorMemory['sensitivity'];
-    sourceChunks: string[];
-    validFrom: string | null;
-    validUntil: string | null;
-    expectedScope: CuratorMemory['scope'];
-    expectedScopeKey: string | null;
-  }
-) {
-  const storedFact = preparedCrypto.encrypt(vault, input.fact);
-  const encryptedSubject = input.subject === null
-    ? null
-    : preparedCrypto.subject(vault, input.subject);
-  const result = await client.query<{
-    id: string;
-    confidence: number;
-    evidence: string | null;
-    evidence_record: unknown;
-    parent_id: string | null;
-    polarity: CuratorMemory['polarity'];
-    salience: number;
-    scope: MemoryScope;
-    sensitivity: CuratorMemory['sensitivity'];
-    source_chunks: string[];
-    subject: string;
-    subject_encrypted: string | null;
-    type: CuratorMemory['type'];
-    valid_from: string | null;
-    valid_until: string | null;
-    volatility: CuratorMemory['volatility'];
-    previous_data: string;
-  }>(
-    `WITH target AS (
-       SELECT id,
-              data AS previous_data,
-              scope AS previous_scope,
-              authority_state AS previous_authority_state,
-              authority_version AS previous_authority_version
-       FROM memories
-       WHERE vault_id = $1
-         AND id = $2
-         AND scope = $15
-         AND scope_key IS NOT DISTINCT FROM $16::text
-         AND ($10::text IS NULL OR $10::text = memories.scope)
-         AND status = 'active'
-         AND archived_at IS NULL
-       FOR UPDATE
-     ), updated AS (
-       UPDATE memories
-       SET data = $3,
-         subject = COALESCE($4::text, memories.subject),
-         subject_encrypted = CASE WHEN $4::text IS NULL THEN memories.subject_encrypted ELSE $5 END,
-         subject_hmac = CASE WHEN $4::text IS NULL THEN memories.subject_hmac ELSE $6 END,
-         hash = $7,
-         embedding = $8::vector,
-         type = COALESCE($9::text, memories.type),
-         scope = target.previous_scope,
-         salience = COALESCE($11::numeric, memories.salience),
-         confidence = COALESCE($12::double precision, memories.confidence),
-         authority_state = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN 'proposed'
-           ELSE authority_state
-         END,
-         approved_by = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN NULL
-           ELSE approved_by
-         END,
-         approved_at = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN NULL
-           ELSE approved_at
-         END,
-         approval_source = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN NULL
-           ELSE approval_source
-         END,
-         revoked_by = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN NULL
-           ELSE revoked_by
-         END,
-         revoked_at = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN NULL
-           ELSE revoked_at
-         END,
-         authority_version = CASE
-           WHEN authority_required
-             OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-           THEN authority_version + 1
-           ELSE authority_version
-         END,
-         volatility = COALESCE($13::memory_volatility, memories.volatility),
-         evidence = CASE
-           WHEN jsonb_typeof(memories.evidence) = 'object' THEN memories.evidence
-           ELSE '{}'::jsonb
-         END || $14::jsonb,
-         sensitivity = $17,
-         source_chunks = $18::uuid[],
-         valid_from = $19::date,
-         valid_until = $20::date,
-         updated_at = now()
-       FROM target
-       WHERE memories.id = target.id
-       RETURNING memories.id, memories.subject, memories.subject_encrypted,
-                 memories.type, memories.scope, memories.salience,
-                 memories.confidence, memories.sensitivity, memories.polarity,
-                 memories.volatility, memories.evidence, memories.source_chunks,
-                 memories.valid_from, memories.valid_until, memories.parent_id,
-                 memories.authority_state, memories.authority_version,
-                 target.previous_data,
-                 target.previous_scope,
-                 target.previous_authority_state, target.previous_authority_version
-     ), scope_audit AS (
-       INSERT INTO memory_scope_change_log (
-         vault_id, memory_id, old_scope, new_scope, actor_type, actor_id, source, reason
-       )
-       SELECT $1, updated.id, updated.previous_scope, updated.scope,
-              'worker', NULL, 'curation_worker',
-              'Curator retained the least-privileged scope under row lock.'
-       FROM updated
-       WHERE updated.scope <> updated.previous_scope
-       RETURNING id
-     ), authority_audit AS (
-       INSERT INTO memory_authority_events (
-         vault_id, memory_id, event_type, old_state, new_state, old_version, new_version,
-         actor_type, source, reason
-       )
-       SELECT $1, updated.id, 'invalidate', updated.previous_authority_state, updated.authority_state,
-              updated.previous_authority_version, updated.authority_version,
-              'worker', 'curation_worker', 'Curator rewrote prompt-bearing memory content; approval requires review.'
-       FROM updated
-       WHERE updated.authority_version <> updated.previous_authority_version
-       RETURNING id
-     )
-     SELECT id, subject, subject_encrypted, type, scope,
-            salience::double precision AS salience, confidence, sensitivity,
-            polarity, volatility, evidence #>> '{summary}' AS evidence, evidence AS evidence_record,
-            source_chunks, valid_from::text, valid_until::text, parent_id,
-            previous_data
-     FROM updated`,
-    [
-      vault.id,
-      input.id,
-      storedFact,
-      input.subject === null
-        ? null
-        : isVaultEncryptionActive(vault) ? '' : input.subject,
-      encryptedSubject?.encrypted ?? null,
-      encryptedSubject?.hmac ?? null,
-      crypto.createHash('md5').update(input.fact).digest('hex'),
-      JSON.stringify(embedding),
-      input.type,
-      input.scope,
-      input.salience,
-      input.confidence,
-      input.volatility,
-      JSON.stringify(input.evidence),
-      input.expectedScope,
-      input.expectedScopeKey,
-      input.sensitivity,
-      input.sourceChunks,
-      input.validFrom,
-      input.validUntil
-    ]
-  );
-  const updated = result.rows[0];
-  if (!updated) {
-    throw new Error(`Curator update target ${input.id} no longer has its reviewed scope binding in vault ${vault.id}`);
-  }
-  await upsertMemoryEmbedding(client, input.id, embedding);
-  return {
-    ...updated,
-    subject: updated.subject_encrypted
-      ? preparedCrypto.decrypt(vault, updated.subject_encrypted)
-      : updated.subject,
-    previousFact: preparedCrypto.decrypt(vault, updated.previous_data)
-  };
 }
 
 async function upsertMemoryEmbedding(client: PoolClient, memoryId: string, embedding: number[]) {
@@ -1845,90 +1037,15 @@ async function upsertMemoryEmbedding(client: PoolClient, memoryId: string, embed
   );
 }
 
-async function insertEdge(
-  client: PoolClient,
-  vaultId: string,
-  fromMemoryId: string,
-  toMemoryId: string,
-  type: EdgeType,
-  confidence: number,
-  reason: string | null,
-  fromMemory: Pick<CuratorMemory, 'scope' | 'scope_key'>,
-  toMemory: Pick<CuratorMemory, 'scope' | 'scope_key'>
-) {
-  const result = await client.query<{ id: string }>(
-    `INSERT INTO memory_edges (vault_id, from_memory_id, to_memory_id, type, confidence, reason)
-     SELECT $1, source.id, destination.id, $4, $5, $6
-     FROM memories source
-     JOIN memories destination ON destination.vault_id = source.vault_id
-     WHERE source.vault_id = $1
-       AND source.id = $2
-       AND destination.id = $3
-       AND source.scope = $7
-       AND source.scope_key IS NOT DISTINCT FROM $8::text
-       AND destination.scope = $9
-       AND destination.scope_key IS NOT DISTINCT FROM $10::text
-       AND source.scope = destination.scope
-       AND source.scope_key IS NOT DISTINCT FROM destination.scope_key
-       AND source.archived_at IS NULL
-       AND destination.archived_at IS NULL
-       AND source.status = 'active'
-       AND destination.status = 'active'
-     ON CONFLICT (from_memory_id, to_memory_id, type)
-     DO UPDATE SET confidence = EXCLUDED.confidence, reason = EXCLUDED.reason, updated_at = now()
-     RETURNING id`,
-    [
-      vaultId,
-      fromMemoryId,
-      toMemoryId,
-      type,
-      confidence,
-      reason,
-      fromMemory.scope,
-      fromMemory.scope_key,
-      toMemory.scope,
-      toMemory.scope_key
-    ]
-  );
-
-  if (!result.rowCount) {
-    throw new Error(`Failed to persist edge ${fromMemoryId} -> ${toMemoryId} (${type})`);
-  }
-}
-
-async function archiveMemory(
-  client: PoolClient,
-  memoryId: string,
-  vaultId: string,
-  expectedScope: CuratorMemory['scope'],
-  expectedScopeKey: string | null,
-  expectedStatus: 'active' | 'candidate'
-): Promise<boolean> {
-  const result = await client.query<{ id: string }>(
-    `UPDATE memories
-     SET archived_at = now(),
-         status = 'superseded',
-         updated_at = now()
-     WHERE id = $1
-       AND vault_id = $2
-       AND scope = $3
-       AND scope_key IS NOT DISTINCT FROM $4::text
-       AND status = $5
-       AND archived_at IS NULL
-     RETURNING id`,
-    [memoryId, vaultId, expectedScope, expectedScopeKey, expectedStatus]
-  );
-  return (result.rowCount ?? 0) > 0;
-}
-
 async function insertActionLog(
   client: PoolClient,
   preparedCrypto: PreparedVaultCrypto,
   input: {
+    reviewRunId: string;
     vaultId: string;
     vault: VaultEncryptionContext;
-    segmentId: string;
-    actionType: 'create' | 'update' | 'delete' | 'promote' | 'archive_duplicate';
+    segmentId: string | null;
+    actionType: 'create' | 'update' | 'delete';
     memoryId?: string;
     newMemoryId?: string;
     subject?: string;
@@ -1955,9 +1072,9 @@ async function insertActionLog(
   await client.query(
     `INSERT INTO curation_action_log (
        vault_id, segment_id, action_type, memory_id, new_memory_id, subject, old_value, new_value,
-       raw_curator_response, applied_at, error
+       raw_curator_response, applied_at, error, review_run_id
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)`,
     [
       input.vaultId,
       input.segmentId,
@@ -1969,7 +1086,8 @@ async function insertActionLog(
       newValue,
       storedRawResponse,
       input.applied ? new Date().toISOString() : null,
-      input.error ?? null
+      input.error ?? null,
+      input.reviewRunId
     ]
   );
 }
@@ -1985,7 +1103,7 @@ async function runLoop() {
       await trackWorkerTask(processBatch());
     } catch (error) {
       if (!isShuttingDown) {
-        console.error('Curation loop iteration failed', error);
+        operationalLog.error('Curation loop iteration failed', error);
       }
     }
 
@@ -2006,7 +1124,7 @@ if (parentPort) {
   // The failure handler is outside the promise shutdown waits for.
   void workerLoop.catch(async (error) => {
     workerLoopFailed = true;
-    try { console.error(getSpanAttributes({ error }), 'Curation worker terminated'); }
+    try { operationalLog.error(getSpanAttributes({ error }), 'Curation worker terminated'); }
     finally { try { await shutdownWorker(); } finally { process.exit(1); } }
   });
 }

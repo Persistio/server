@@ -11,7 +11,6 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
   const vaultId = crypto.randomUUID();
   const segmentId = crypto.randomUUID();
   const memoryId = crypto.randomUUID();
-  const deliveryId = crypto.randomUUID();
   let client: PoolClient;
 
   beforeAll(async () => {
@@ -41,7 +40,7 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
     await client.query(
       `INSERT INTO memories (
          id, vault_id, data, subject, hash, scope, status, type, evidence, source_segment_id
-       ) VALUES ($1, $2, 'sensitive value', 'sensitive subject', $3, 'global', 'candidate', 'system_fact', '{}'::jsonb, $4)`,
+       ) VALUES ($1, $2, 'sensitive value', 'sensitive subject', $3, 'global', 'active', 'system_fact', '{}'::jsonb, $4)`,
       [memoryId, vaultId, crypto.randomUUID(), segmentId]
     );
     await client.query(`UPDATE memories SET confidence = 0.8 WHERE id = $1`, [memoryId]);
@@ -59,7 +58,7 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
        FROM memory_mutation_events WHERE vault_id = $1 AND memory_id = $2 ORDER BY occurred_at, id`,
       [vaultId, memoryId]
     );
-    expect(events.rows.map((event) => event.event_type)).toEqual(['create', 'decay']);
+    expect(events.rows.map((event) => event.event_type)).toEqual(['create', 'metadata_change']);
     expect(events.rows.every((event) => event.source === 'database')).toBe(true);
     expect(events.rows.every((event) => event.database_application === 'unknown')).toBe(true);
     expect(events.rows.every((event) => /^[0-9a-f]{64}$/.test(event.statement_hash))).toBe(true);
@@ -71,74 +70,12 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
     expect(events.rows[1].changed_fields).toContain('confidence');
   });
 
-  it('reconstructs an exact selected, returned, and rendered delivery', async () => {
-    await client.query('SAVEPOINT invalid_delivery_count');
-    await expect(client.query(
-      `INSERT INTO memory_delivery_runs (
-         id, vault_id, query_hash, response_format, mode, top_k, min_similarity,
-         global_rule_policy, include_global_rules_requested, include_global_rules_effective,
-         selected_count, global_selected_count
-       ) VALUES ($1, $2, $3, 'bundle_v2', 'agent', 10, 0.5, 'approved_only', false, false, 0, 1)`,
-      [crypto.randomUUID(), vaultId, 'b'.repeat(64)]
-    )).rejects.toThrow();
-    await client.query('ROLLBACK TO SAVEPOINT invalid_delivery_count');
-
-    await client.query(
-      `INSERT INTO memory_delivery_runs (
-         id, vault_id, query_hash, response_format, mode, client_name, client_version,
-         session_id, trigger_type, top_k, min_similarity, global_rule_policy,
-         include_global_rules_requested, include_global_rules_effective,
-         selected_count, global_selected_count
-       ) VALUES ($1, $2, $3, 'bundle_v2', 'agent', 'test-client', '1.0.0',
-                 'session', 'direct', 10, 0.5, 'legacy', true, true, 1, 1)`,
-      [deliveryId, vaultId, 'c'.repeat(64)]
-    );
-    for (const stage of ['selected', 'returned']) {
-      await client.query(
-        `INSERT INTO memory_delivery_events (
-           delivery_id, vault_id, memory_id, authority_version, stage, section,
-           memory_type, retrieval_reason, scope, authority_state, authority_required,
-           authority_approval_valid, similarity
-         ) VALUES ($1, $2, $3, 1, $4, 'historical_facts', 'user_rule',
-                   'global_behavioral', 'global', 'proposed', true, false, 0.75)`,
-        [deliveryId, vaultId, memoryId, stage]
-      );
-    }
-    await client.query('SAVEPOINT missing_render_target');
-    await expect(client.query(
-      `INSERT INTO memory_delivery_events (
-         delivery_id, vault_id, memory_id, authority_version, stage, section,
-         memory_type, retrieval_reason, scope, authority_state, authority_required,
-         authority_approval_valid, similarity, token_budget, rendered_tokens, truncated
-       ) VALUES ($1, $2, $3, 1, 'rendered', 'historical_facts', 'user_rule',
-                 'global_behavioral', 'global', 'proposed', true, false, 0.75, 100, 75, false)`,
-      [deliveryId, vaultId, memoryId]
-    )).rejects.toThrow();
-    await client.query('ROLLBACK TO SAVEPOINT missing_render_target');
-    await client.query(
-      `INSERT INTO memory_delivery_events (
-         delivery_id, vault_id, memory_id, authority_version, stage, section,
-         memory_type, retrieval_reason, scope, authority_state, authority_required,
-         authority_approval_valid, similarity, render_target, token_budget, rendered_tokens, truncated
-       ) VALUES ($1, $2, $3, 1, 'rendered', 'historical_facts', 'user_rule',
-                 'global_behavioral', 'global', 'proposed', true, false, 0.75,
-                 'prompt_context', 100, 75, false)`,
-      [deliveryId, vaultId, memoryId]
-    );
-
-    const timeline = await client.query<{ stage: string; render_target: string | null }>(
-      `SELECT stage, render_target FROM memory_delivery_events
-       WHERE delivery_id = $1 ORDER BY occurred_at, stage`, [deliveryId]
-    );
-    expect(timeline.rows.map((row) => row.stage).sort()).toEqual(['rendered', 'returned', 'selected']);
-    expect(timeline.rows.find((row) => row.stage === 'rendered')?.render_target).toBe('prompt_context');
-  });
-
   it('preserves curation and mutation evidence after source and vault deletion', async () => {
     const destructiveAuditFks = await client.query<{ table_name: string; constraint_name: string }>(
-      `SELECT table_name, constraint_name
-       FROM information_schema.table_constraints
-       WHERE constraint_type='FOREIGN KEY'
+      `SELECT table_name, tc.constraint_name
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.referential_constraints rc ON rc.constraint_name=tc.constraint_name AND rc.constraint_schema=tc.constraint_schema
+       WHERE constraint_type='FOREIGN KEY' AND rc.delete_rule IN ('CASCADE','SET NULL','SET DEFAULT')
          AND table_name=ANY($1::text[])`,
       [[
         'memory_authority_events', 'memory_scope_change_log', 'contradiction_scan_log',
@@ -166,7 +103,7 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
     await expect(client.query(
       `INSERT INTO contradiction_scan_log (
          vault_id, memory_id_a, memory_id_b, decision, similarity
-       ) VALUES ($1, $2, $3, 'needs_review', 0.95)`,
+       ) VALUES ($1, $2, $3, 'keep_both', 0.95)`,
       [vaultId, memoryId, crypto.randomUUID()]
     )).rejects.toThrow(/must belong to vault/);
     await client.query('ROLLBACK TO SAVEPOINT invalid_retained_audit_reference');
@@ -203,7 +140,7 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
     const contradiction = await client.query<{ id: string }>(
       `INSERT INTO contradiction_scan_log (
          vault_id, memory_id_a, memory_id_b, decision, similarity
-       ) VALUES ($1, $2, $2, 'needs_review', 0.95) RETURNING id`,
+       ) VALUES ($1, $2, $2, 'keep_both', 0.95) RETURNING id`,
       [vaultId, memoryId]
     );
     const curationDeadLetter = await client.query<{ id: string }>(
@@ -250,8 +187,6 @@ describeWithPostgres('immutable memory observability (PostgreSQL)', () => {
     expect((await client.query(
       `SELECT 1 FROM memory_mutation_events WHERE vault_id = $1 AND memory_id = $2`, [vaultId, memoryId]
     )).rowCount).toBeGreaterThan(0);
-    expect((await client.query(`SELECT 1 FROM memory_delivery_runs WHERE id = $1`, [deliveryId])).rowCount).toBe(1);
-    expect((await client.query(`SELECT 1 FROM memory_delivery_events WHERE delivery_id = $1`, [deliveryId])).rowCount).toBe(3);
     for (const [table, id] of [
       ['memory_scope_change_log', scopeChange.rows[0].id],
       ['memory_authority_events', authority.rows[0].id],

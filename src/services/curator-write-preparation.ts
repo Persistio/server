@@ -15,16 +15,16 @@ export async function prepareCuratorWrites(
   const key = (kind: string, index: number, fact: string, subject: string | null) =>
     JSON.stringify([kind, index, fact, subject]);
   for (const kind of ['create', 'update'] as const) {
-    const nodes = kind === 'create' ? actions.nodes_to_create : actions.nodes_to_update;
+    const nodes = kind === 'create' ? actions.consolidate : actions.update;
     for (const [index, node] of nodes.entries()) {
       assertNotLost();
-      const vector = await getEmbedder().embed(node.statement, {
+      const vector = await getEmbedder().embed(node.memory.statement, {
         vaultId, modelRole: 'embedding', source: 'curation_worker', inputType: 'document'
       });
       if (vector.length !== dimensions || !vector.every(Number.isFinite)) {
         throw new Error('Invalid prepared curator embedding');
       }
-      vectors.set(key(kind, index, node.statement, node.subject ?? null), [...vector]);
+      vectors.set(key(kind, index, node.memory.statement, node.memory.subject ?? null), [...vector]);
     }
   }
   return Object.freeze({

@@ -1,11 +1,12 @@
 import { z } from 'zod';
 import { provenanceIdentitySchema } from './provenance-identity';
+import { isValidDateOnly } from './memory-validity';
 
 // Explicit RFC 3339 subset shared with OpenAPI: uppercase T/Z, seconds,
 // colon-separated offsets, and no leap seconds (Date/PostgreSQL interoperability).
 export const ingestTimestampSchema = z.string().max(64).pipe(z.string().datetime({ offset: true }).regex(
   /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/
-));
+)).refine(value=>isValidDateOnly(value.slice(0,10)) && Number.isFinite(Date.parse(value)), 'Invalid calendar timestamp');
 const provenanceBasisLimit = z.unknown().superRefine((value, ctx) => {
   if (Array.isArray(value) && value.length > 8) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Too many provenance basis values', fatal: true });
 });

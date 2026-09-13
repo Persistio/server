@@ -1,29 +1,43 @@
 import crypto from 'node:crypto';
-
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 
+const { settings } = vi.hoisted(() => ({ settings: { MEMORY_ARCHIVE_TTL_DAYS: 0 } }));
+vi.mock('../../config', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../config')>();
+  return { ...actual, getConfig: () => ({ ...actual.getConfig(), ...settings }) };
+});
 const databaseUrl = process.env.PERSISTIO_TEST_DATABASE_URL;
 
-describe.skipIf(!databaseUrl)('scheduled memory staleness (PostgreSQL)', () => {
+describe.skipIf(!databaseUrl)('historical knowledge and opt-in retention (PostgreSQL)', () => {
   const testPool = new Pool({ connectionString: databaseUrl });
   const vaultId = crypto.randomUUID();
   let archiveStaleMemories: () => Promise<void>;
   let closeDefaultPool = async () => {};
-  let decayDays: number;
-  let ttlDays: number;
 
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
     ({ closePool: closeDefaultPool } = await import('../../db/client'));
     ({ archiveStaleMemories } = await import('../staleness'));
-    const { getConfig } = await import('../../config');
-    decayDays = getConfig().CONFIDENCE_DECAY_INTERVAL_DAYS;
-    ttlDays = getConfig().MEMORY_ARCHIVE_TTL_DAYS;
-    await testPool.query(
-      'INSERT INTO vaults (id, name, api_key_hash) VALUES ($1, $2, $3)',
-      [vaultId, `scheduled-staleness-${vaultId}`, crypto.randomUUID()]
-    );
+    await testPool.query('INSERT INTO vaults (id, name, api_key_hash) VALUES ($1, $2, $3)',
+      [vaultId, `retention-${vaultId}`, crypto.randomUUID()]);
+    for (const [name, from, until, updated, recalled] of [
+      ['historical', -500, -400, -500, null],
+      ['future', 5, null, -500, null],
+      ['recent-correction', null, null, -1, -500],
+      ['recent-recall', null, null, -500, -1],
+      ['old', null, null, -500, null]
+    ] as const) {
+      await testPool.query(`INSERT INTO memories
+        (vault_id, data, subject, hash, scope, confidence, salience, valid_from, valid_until,
+         created_at, updated_at, last_recalled, status)
+        VALUES ($1, $2, 'retention', $3, 'global', 0.8, 0.5,
+          (now() AT TIME ZONE 'UTC')::date + $4::integer,
+          (now() AT TIME ZONE 'UTC')::date + $5::integer,
+          now() - interval '500 days', now() + $6::integer * interval '1 day',
+          now() + $7::integer * interval '1 day', 'active')`,
+      [vaultId, name, crypto.randomUUID(), from, until, updated, recalled]);
+    }
   });
 
   afterAll(async () => {
@@ -32,51 +46,17 @@ describe.skipIf(!databaseUrl)('scheduled memory staleness (PostgreSQL)', () => {
     await closeDefaultPool();
   });
 
-  it('preserves scheduled rows and grants inactivity time from activation', async () => {
-    // All fixtures were ingested long ago. Only their activation dates differ.
-    const fixtures = [
-      ['future', 1, 1, 0.1],
-      ['future-zero-confidence', 1, 0, 0.1],
-      ['activates-today', 0, 1, 0.1],
-      ['within-decay-interval', -(decayDays - 1), 1, 1],
-      ['after-decay-interval', -(decayDays + 1), 1, 1],
-      ['low-salience-decay', -(decayDays + 1), 0.8, 0.1],
-      ['within-ttl', -(ttlDays - 1), 1, 1],
-      ['after-ttl', -(ttlDays + 1), 1, 1],
-      ['unbounded-old', null, 1, 1]
-    ] as const;
-    for (const [data, activationDays, confidence, salience] of fixtures) {
-      await testPool.query(
-        `INSERT INTO memories (
-           vault_id, data, subject, hash, scope, scope_key, confidence, salience,
-           valid_from, created_at, updated_at, status
-         ) VALUES (
-           $1, $2, 'validity', $3, 'project', 'staleness-project', $4, $5,
-           (now() AT TIME ZONE 'UTC')::date + $6::integer,
-           now() - (($7::integer + 1000)::text || ' days')::interval,
-           now() - (($7::integer + 1000)::text || ' days')::interval,
-           CASE WHEN $4::double precision = 0 THEN 'candidate' ELSE 'active' END
-         )`,
-        [vaultId, data, crypto.randomUUID(), confidence, salience, activationDays, ttlDays]
-      );
-    }
-
+  it('keeps history/confidence by default and uses actual activity under explicit retention', async () => {
+    settings.MEMORY_ARCHIVE_TTL_DAYS = 0;
     await archiveStaleMemories();
-
-    const result = await testPool.query<{ data: string; confidence: number; archived: boolean; status: string }>(
-      `SELECT data, confidence, archived_at IS NOT NULL AS archived, status
-       FROM memories WHERE vault_id = $1 ORDER BY data`,
-      [vaultId]
-    );
-    const rows = new Map(result.rows.map((row) => [row.data, row]));
-    for (const name of ['future', 'activates-today', 'within-decay-interval']) {
-      expect(rows.get(name)).toMatchObject({ archived: false, confidence: 1 });
-    }
-    expect(rows.get('future-zero-confidence')).toMatchObject({ archived: false, confidence: 0 });
-    expect(rows.get('after-decay-interval')).toMatchObject({ archived: false, confidence: 0, status: 'needs_review' });
-    expect(rows.get('low-salience-decay')).toMatchObject({ archived: true, confidence: 0, status: 'needs_review' });
-    expect(rows.get('within-ttl')).toMatchObject({ archived: false });
-    expect(rows.get('after-ttl')).toMatchObject({ archived: true });
-    expect(rows.get('unbounded-old')).toMatchObject({ archived: true });
+    const unchanged = await testPool.query('SELECT status, confidence, archived_at FROM memories WHERE vault_id = $1', [vaultId]);
+    expect(unchanged.rows).toHaveLength(5);
+    for (const row of unchanged.rows) expect(row).toMatchObject({ status: 'active', confidence: 0.8, archived_at: null });
+    settings.MEMORY_ARCHIVE_TTL_DAYS = 90;
+    await archiveStaleMemories();
+    const retained = await testPool.query('SELECT data FROM memories WHERE vault_id = $1 AND archived_at IS NULL ORDER BY data', [vaultId]);
+    expect(retained.rows.map(row => row.data)).toEqual(['future', 'recent-correction', 'recent-recall']);
+    const all = await testPool.query('SELECT confidence FROM memories WHERE vault_id = $1', [vaultId]);
+    expect(all.rows.every(row => row.confidence === 0.8)).toBe(true);
   });
 });

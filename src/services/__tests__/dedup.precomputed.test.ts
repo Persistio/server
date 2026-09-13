@@ -1,450 +1,87 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-
-const { decryptForVaultMock, enforceMemoryCreationLimitMock, extractorMock, recordMemoryCountDeltaMock } = vi.hoisted(() => ({
-  decryptForVaultMock: vi.fn(),
-  enforceMemoryCreationLimitMock: vi.fn(),
-  extractorMock: {
-    arbitrateConflict: vi.fn()
-  },
-  recordMemoryCountDeltaMock: vi.fn()
-}));
-
-vi.mock('../crypto', () => ({
-  computeSubjectHmac: vi.fn(() => 'subject-hmac'),
-  decryptForVault: decryptForVaultMock,
-  encryptForVault: vi.fn(async (_vault, value: string) => value),
-  encryptSubjectForVault: vi.fn(async () => null),
-  isVaultEncryptionActive: vi.fn(() => false)
-}));
-
-vi.mock('../extractor', () => ({ ExtractorService: class { arbitrateConflict = extractorMock.arbitrateConflict; } }));
-
-vi.mock('../entity-resolver', () => ({
-  normaliseSubject: vi.fn((subject: string) => subject.toLowerCase().trim()),
-  resolveCanonical: vi.fn(async () => null)
-}));
-
-vi.mock('../usage', () => ({
-  reserveMemoryCreationInTransaction: enforceMemoryCreationLimitMock,
-  recordCommittedApiQuotaReservation: vi.fn(),
-  recordMemoryCountDelta: recordMemoryCountDeltaMock
-}));
-
-vi.mock('../../telemetry', () => ({
-  meter: {
-    createCounter: vi.fn(() => ({ add: vi.fn() })),
-    createHistogram: vi.fn(() => ({ record: vi.fn() })),
-    createObservableGauge: vi.fn(() => ({ addCallback: vi.fn() }))
-  },
-  withSpan: async (_name: string, _attributes: Record<string, unknown>, fn: (span: {
-    setAttribute: (key: string, value: string | number | boolean) => void;
-  }) => Promise<unknown>) => fn({ setAttribute: vi.fn() })
-}));
-
-import { deduplicateMemoryInTransaction, fingerprintDedupInput, getDedupEscalationRequest, type DedupInput, type DedupOptions } from '../dedup';
-import type { WorkerEffect } from '../worker-effects';
-const effects: WorkerEffect[] = [];
-const preparedCrypto = {
-  assertCurrent: vi.fn(async () => {}),
-  encrypt: (_vault: unknown, value: string) => value,
-  decrypt: (_vault: unknown, value: string) => value,
-  subject: () => null,
-  subjectMatch: (_vault: unknown, value: string) => value
-};
-const apply = (value: DedupInput, db: ReturnType<typeof createDb>, options: DedupOptions = {}) =>
-  deduplicateMemoryInTransaction(value, db as never, preparedCrypto, effects,
-    { precomputedConflictInput: fingerprintDedupInput(value), ...options });
-
-function input(): DedupInput {
-  return {
-    vaultId: 'vault-1',
-    fact: 'User prefers batched escalation.',
-    score: 8,
-    subject: 'User',
-    embedding: [0.1, 0.2],
-    sourceChunks: ['00000000-0000-0000-0000-000000000001'],
-    salience: 0.8,
-    sensitivity: 'low',
-    type: 'user_preference',
-    scope: 'global',
-    scopeKey: null,
-    polarity: 'neutral',
-    status: 'active',
-    volatility: 'low',
-    evidence: null,
-    validFrom: null,
-    validUntil: null,
-    sourceSegmentId: null
-  };
+const mocks=vi.hoisted(()=>({reserve:vi.fn(),publish:vi.fn(),extractor:vi.fn()}));
+vi.mock('../crypto',()=>({isVaultEncryptionActive:()=>false}));
+vi.mock('../entity-resolver',()=>({normaliseSubject:(s:string)=>s.toLowerCase().trim(),resolveCanonical:async()=>null}));
+vi.mock('../usage',()=>({reserveMemoryCreationInTransaction:mocks.reserve}));
+vi.mock('../worker-effects',()=>({publishCommittedWorkerEffects:mocks.publish}));
+vi.mock('../extractor',()=>({ExtractorService:class{arbitrateConflict=mocks.extractor;}}));
+import {deduplicateMemoryInTransaction,fingerprintDedupInput,getDedupEscalationRequest,type DedupInput} from '../dedup';
+const prepared={assertCurrent:vi.fn(async()=>{}),encrypt:(_v:unknown,s:string)=>s,decrypt:(_v:unknown,s:string)=>s,
+  subject:()=>null,subjectMatch:(_v:unknown,s:string)=>s};
+const input=():DedupInput=>({vaultId:'vault',fact:'Incoming durable fact',subject:'topic',embedding:[1,0],sourceChunks:['source'],
+  score:8,salience:0.8,sensitivity:'low',type:'system_fact',scope:'session',scopeKey:'s1',polarity:'neutral',
+  status:'active',volatility:'low',validFrom:null,validUntil:null});
+function database(options:{none?:boolean;exact?:boolean;revision?:string;missingSource?:boolean;similarity?:number}={}){
+  const row={id:'existing',data:options.exact?input().fact:'Prior durable fact',subject:'topic',scope:'session',scope_key:'s1',
+    polarity:'neutral',type:'system_fact',status:'active',row_version:'1',valid_from:null,valid_until:null,
+    source_chunks:['prior-source'],sensitivity:'low',similarity:options.similarity??0.9};
+  return{query:vi.fn(async(sql:string,_values?:unknown[])=>{
+    if(sql.includes('FROM vaults'))return{rowCount:1,rows:[{id:'vault',encrypted_dek:null,vault_encryption_enabled:false}]};
+    if(sql.includes('FROM raw_chunks'))return{rowCount:options.missingSource?0:1,rows:[{id:'source'}]};
+    if(sql.includes('FROM memories m WHERE'))return{rowCount:options.none?0:1,rows:options.none?[]:[row]};
+    if(sql.includes('FOR UPDATE'))return{rowCount:1,rows:[{row_version:options.revision??'1'}]};
+    if(sql.includes('INSERT INTO memories'))return{rowCount:1,rows:[{id:'inserted'}]};
+    return{rowCount:1,rows:[]};
+  })};
 }
-
-function createDb(options: {
-  exactMatch?: { scope: DedupInput['scope']; status: DedupInput['status']; evidence?: unknown };
-  hasSubjectMatch?: boolean;
-  matchEvidence?: unknown;
-  matchScope?: DedupInput['scope'];
-  matchStatus?: DedupInput['status'];
-  similarity?: number;
-} = {}) {
-  const {
-    exactMatch,
-    hasSubjectMatch = true,
-    matchEvidence = null,
-    matchScope = 'project',
-    matchStatus = 'active',
-    similarity = 0.82
-  } = options;
-  return {
-    query: vi.fn(async (sql: string) => {
-      if (sql.includes('FROM vaults')) {
-        return {
-          rowCount: 1,
-          rows: [{ id: 'vault-1', account_id: 'account-1', encrypted_dek: null, vault_encryption_enabled: false }]
-        };
-      }
-
-      if (sql.includes('AND hash = $2')) {
-        return exactMatch
-          ? { rowCount: 1, rows: [{ id: 'exact-memory', ...exactMatch, row_version: 'revision-1' }] }
-          : { rowCount: 0, rows: [] };
-      }
-
-      if (sql.includes('FROM memories AS m')) {
-        if (!hasSubjectMatch) {
-          return { rowCount: 0, rows: [] };
-        }
-
-        return {
-          rowCount: 1,
-          rows: [{
-            account_id: 'account-1',
-            id: 'memory-1',
-            data: 'Existing fact',
-            confidence: 1,
-            score: 8,
-            salience: 0.8,
-            type: 'user_preference',
-            scope: matchScope,
-            polarity: 'neutral',
-            status: matchStatus,
-            volatility: 'low',
-            evidence: matchEvidence,
-            row_version: 'revision-1',
-            encrypted_dek: null,
-            vault_encryption_enabled: false,
-            similarity
-          }]
-        };
-      }
-
-      if (sql.includes('RETURNING id')) {
-        return { rowCount: 1, rows: [{ id: 'inserted-memory' }] };
-      }
-
-      return { rowCount: 1, rows: [] };
-    })
-  };
-}
-
-describe('deduplicateMemory precomputed conflict decisions', () => {
-  beforeEach(() => {
-    effects.length = 0;
-    decryptForVaultMock.mockReset();
-    decryptForVaultMock.mockResolvedValue('Existing fact');
-    enforceMemoryCreationLimitMock.mockReset();
-    extractorMock.arbitrateConflict.mockReset();
-    recordMemoryCountDeltaMock.mockReset();
+describe('prepared baseline dedup decisions',()=>{
+  beforeEach(()=>{vi.clearAllMocks();mocks.reserve.mockResolvedValue({});});
+  const decision=(value:DedupInput)=>({precomputedConflictInput:fingerprintDedupInput(value),precomputedConflictMemoryId:'existing',
+    precomputedConflictMemoryRevision:'1',precomputedConflictDecision:'merge' as const});
+  it('uses a matching prepared decision without live model I/O or rewriting supported text',async()=>{
+    const value=input(),db=database();
+    expect(await deduplicateMemoryInTransaction(value,db as never,prepared,[],decision(value))).toEqual({action:'updated',memoryId:'existing'});
+    expect(db.query.mock.calls.some(([sql])=>sql.includes('SET source_chunks'))).toBe(true);
+    expect(db.query.mock.calls.some(([sql])=>sql.includes('SET data'))).toBe(false);
+    expect(mocks.extractor).not.toHaveBeenCalled();
   });
-
-  it('uses a precomputed decision when it matches the current best memory', async () => {
-    const db = createDb();
-
-    await apply(input(), db, {
-      precomputedConflictDecision: 'merge',
-      precomputedConflictMemoryId: 'memory-1',
-      precomputedConflictMemoryRevision: 'revision-1'
-    });
-
-    expect(extractorMock.arbitrateConflict).not.toHaveBeenCalled();
-    expect(db.query.mock.calls.some(([sql]) => String(sql).includes('SET data = $2'))).toBe(true);
+  it.each(['target','revision','input'])('retains the new fact separately for stale %s decisions',async change=>{
+    const value=input(),db=database(),options=decision(value);
+    if(change==='target')options.precomputedConflictMemoryId='other';
+    if(change==='revision')options.precomputedConflictMemoryRevision='0';
+    if(change==='input')options.precomputedConflictInput='stale';
+    expect((await deduplicateMemoryInTransaction(value,db as never,prepared,[],options)).action).toBe('inserted');
+    expect(db.query.mock.calls.some(([sql])=>sql.startsWith('UPDATE memories'))).toBe(false);
+    expect(mocks.extractor).not.toHaveBeenCalled();
   });
-
-  it('never calls live arbitration in a transaction when the precomputed memory no longer matches', async () => {
-    const db = createDb();
-    extractorMock.arbitrateConflict.mockResolvedValue('discard_new');
-
-    await apply(input(), db, {
-      precomputedConflictDecision: 'merge',
-      precomputedConflictMemoryId: 'different-memory',
-      precomputedConflictMemoryRevision: 'revision-1'
-    });
-
-    expect(extractorMock.arbitrateConflict).not.toHaveBeenCalled();
+  it('requires unchanged locked revisions even after matching input selection',async()=>{
+    const value=input(),db=database({revision:'2'});
+    await expect(deduplicateMemoryInTransaction(value,db as never,prepared,[],decision(value))).rejects.toThrow('changed during');
+    expect(mocks.reserve).not.toHaveBeenCalled();
+    expect(db.query.mock.calls.some(([sql])=>sql.startsWith('UPDATE memories'))).toBe(false);
   });
-
-  it('does not reuse a precomputed decision after the same memory revision changes', async () => {
-    const db = createDb();
-    extractorMock.arbitrateConflict.mockResolvedValue('discard_new');
-
-    await apply(input(), db, {
-      precomputedConflictDecision: 'merge',
-      precomputedConflictMemoryId: 'memory-1',
-      precomputedConflictMemoryRevision: 'stale-revision'
-    });
-
-    expect(extractorMock.arbitrateConflict).not.toHaveBeenCalled();
-    expect(db.query.mock.calls.some(([sql]) => String(sql).includes('SET data = $2'))).toBe(false);
+  it('bounds same-subject same-binding similarity without excluding history by current time',async()=>{
+    const db=database();await getDedupEscalationRequest(input(),'request',db as never,prepared);
+    const sql=db.query.mock.calls.find(([sql])=>sql.includes('FROM memories m WHERE'))![0];
+    expect(sql).toContain('m.scope_key IS NOT DISTINCT FROM');
+    expect(sql).toContain('m.subject=$5');expect(sql).toContain('LIMIT 10');
+    expect(sql).toContain("m.status='active'");expect(sql).not.toContain('current_date');
+    expect(sql).not.toContain('authority');expect(sql).not.toContain('now()');
   });
-
-  it('limits subject similarity lookup to the best matching memory', async () => {
-    const db = createDb();
-
-    await apply(input(), db, {
-      precomputedConflictDecision: 'merge',
-      precomputedConflictMemoryId: 'memory-1',
-      precomputedConflictMemoryRevision: 'revision-1'
-    });
-
-    const similarityQuery = db.query.mock.calls
-      .map(([sql]) => String(sql))
-      .find((sql) => sql.includes('FROM memories AS m'));
-
-    expect(similarityQuery).toMatch(/ORDER BY similarity DESC\s+LIMIT 1/);
-    expect(similarityQuery).toContain('m.valid_from IS NULL');
-    expect(similarityQuery).toContain('m.valid_until IS NULL');
-    expect(similarityQuery).toContain('m.valid_until IS NULL OR $5::date IS NULL');
-    expect(similarityQuery).toContain('$6::date IS NULL OR m.valid_from IS NULL');
-    expect(similarityQuery).toContain("m.status = 'active'");
+  it('treats even very high similarity as a signal, never automatic equivalence',async()=>{
+    const db=database({similarity:0.999});
+    expect((await deduplicateMemoryInTransaction(input(),db as never,prepared,[])).action).toBe('inserted');
+    expect(mocks.extractor).not.toHaveBeenCalled();
   });
-
-  it('excludes out-of-window exact matches before automatic consolidation', async () => {
-    const db = createDb({ exactMatch: { scope: 'project', status: 'active' } });
-
-    await apply(input(), db);
-
-    const exactQuery = db.query.mock.calls.find(([sql]) => String(sql).includes('hash = $2'));
-    expect(String(exactQuery?.[0])).toContain('memories.valid_from IS NULL');
-    expect(String(exactQuery?.[0])).toContain('memories.valid_until IS NULL');
-    expect(String(exactQuery?.[0])).toContain('memories.valid_until IS NULL OR $4::date IS NULL');
-    expect(String(exactQuery?.[0])).toContain('$5::date IS NULL OR memories.valid_from IS NULL');
-    expect(String(exactQuery?.[0])).toContain("status = 'active'");
-    expect(exactQuery?.[1]?.[2]).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  it('collects effects for the caller to publish only after commit',async()=>{
+    const effects:any[]=[];
+    await deduplicateMemoryInTransaction(input(),database({none:true}) as never,prepared,effects);
+    expect(effects.map(e=>e.kind)).toEqual(['quota','memory-count']);
+    expect(mocks.publish).not.toHaveBeenCalled();
   });
-
-  it('does not publish a memory count delta from an uncommitted inner insert', async () => {
-    const db = createDb({ hasSubjectMatch: false });
-
-    await apply(input(), db);
-
-    expect(recordMemoryCountDeltaMock).not.toHaveBeenCalled();
-
-    const insertCallIndex = db.query.mock.calls.findIndex(([sql]) => String(sql).includes('INSERT INTO memories'));
-    expect(insertCallIndex).toBeGreaterThanOrEqual(0);
+  it.each([
+    {status:'needs_review'}, {status:'candidate'}, {policyRejections:[{code:'invalid',field:'scope',reason:'invalid'}]},
+    {fact:'api_key=sk-example-secret-value-123456789'}, {scope:'unknown'}, {scopeKey:null},
+    {validFrom:'2026-02-30'}, {validFrom:'2026-12-01',validUntil:'2026-01-01'}, {salience:NaN}
+  ])('rejects invalid input before reads or writes: %j',extra=>{
+    const db=database();
+    return expect(deduplicateMemoryInTransaction({...input(),...extra} as any,db as never,prepared,[])).rejects.toThrow()
+      .then(()=>expect(db.query).not.toHaveBeenCalled());
   });
-
-  it('keeps the narrower existing scope when an exact match proposes widening', async () => {
-    const db = createDb({ exactMatch: { scope: 'session', status: 'active' } });
-
-    await apply({ ...input(), scope: 'global' }, db);
-
-    const update = db.query.mock.calls.find(([sql]) => String(sql).includes('SET source_chunks'));
-    expect(update).toBeDefined();
-    expect(update?.[1]?.[6]).toBe('global');
-    expect(String(update?.[0])).toContain("status = 'active'");
-    expect(String(update?.[0])).toContain('archived_at IS NULL');
-    expect(String(update?.[0])).toContain("evidence -> 'policy_rejections'");
-    expect(String(update?.[0])).toContain('xmin::text = $18');
-    expect(String(update?.[0])).toContain('scope AS previous_scope');
-    expect(String(update?.[0])).toContain('scope = target.previous_scope');
-    expect(String(update?.[0])).toContain('scope_key IS NOT DISTINCT FROM $16::text');
-    expect(String(update?.[0])).toContain('valid_from AS previous_valid_from');
-    expect(String(update?.[0])).toContain('GREATEST(target.previous_valid_from, $11::date)');
-    expect(String(update?.[0])).toContain('LEAST(target.previous_valid_until, $12::date)');
-    expect(String(update?.[0])).toContain('INSERT INTO memory_scope_change_log');
-    expect(String(update?.[0])).toContain('INSERT INTO memory_authority_events');
-    expect(String(update?.[0])).toContain('AND vault_id = $14');
-  });
-
-  it('requires the locked row to retain the same binding during an automatic high-similarity merge', async () => {
-    const db = createDb({ matchScope: 'project', similarity: 0.95 });
-
-    await apply({ ...input(), scope: 'session', scopeKey: 'session-1' }, db);
-
-    const update = db.query.mock.calls.find(([sql]) => String(sql).includes('SET data = $2'));
-    expect(update).toBeDefined();
-    expect(update?.[1]?.[9]).toBe('session');
-    expect(String(update?.[0])).toContain("status = 'active'");
-    expect(String(update?.[0])).toContain('archived_at IS NULL');
-    expect(String(update?.[0])).toContain("evidence -> 'policy_rejections'");
-    expect(String(update?.[0])).toContain('xmin::text = $21');
-    expect(String(update?.[0])).toContain('scope AS previous_scope');
-    expect(String(update?.[0])).toContain('scope = target.previous_scope');
-    expect(String(update?.[0])).toContain('scope_key IS NOT DISTINCT FROM $19::text');
-    expect(String(update?.[0])).toContain('GREATEST(target.previous_valid_from, $14::date)');
-    expect(String(update?.[0])).toContain('LEAST(target.previous_valid_until, $15::date)');
-    expect(String(update?.[0])).toContain('INSERT INTO memory_scope_change_log');
-    expect(String(update?.[0])).toContain("THEN 'proposed' ELSE authority_state END");
-    expect(String(update?.[0])).toContain('THEN NULL ELSE approved_by END');
-    expect(String(update?.[0])).toContain('AND vault_id = $17');
-    expect(String(update?.[0])).toContain("'invalidate'");
-  });
-
-  it('derives conflict-merge scope from the row locked by the update', async () => {
-    const db = createDb({ matchScope: 'session', similarity: 0.82 });
-
-    await apply({ ...input(), scope: 'global' }, db, {
-      precomputedConflictDecision: 'merge',
-      precomputedConflictMemoryId: 'memory-1',
-      precomputedConflictMemoryRevision: 'revision-1'
-    });
-
-    const update = db.query.mock.calls.find(([sql]) => String(sql).includes('SET data = $2'));
-    expect(update).toBeDefined();
-    expect(update?.[1]?.[9]).toBe('global');
-    expect(String(update?.[0])).toContain('scope AS previous_scope');
-    expect(String(update?.[0])).toContain('scope = target.previous_scope');
-    expect(String(update?.[0])).toContain('scope_key IS NOT DISTINCT FROM $19::text');
-    expect(String(update?.[0])).toContain('GREATEST(target.previous_valid_from, $14::date)');
-    expect(String(update?.[0])).toContain('LEAST(target.previous_valid_until, $15::date)');
-    expect(String(update?.[0])).toContain('INSERT INTO memory_scope_change_log');
-    expect(String(update?.[0])).toContain('AND vault_id = $17');
-  });
-
-  it('requires a still-active eligible row at the write-side lock', async () => {
-    const db = createDb({ matchScope: 'session', matchStatus: 'needs_review', similarity: 0.95 });
-
-    await apply({ ...input(), scope: 'session', scopeKey: 'session-1' }, db);
-
-    const update = db.query.mock.calls.find(([sql]) => String(sql).includes('SET data = $2'));
-    expect(update).toBeDefined();
-    expect(String(update?.[0])).toContain("status = 'active'");
-    expect(String(update?.[0])).toContain('archived_at IS NULL');
-    expect(String(update?.[0])).toContain("sensitivity <> 'restricted'");
-    expect(String(update?.[0])).toContain("evidence -> 'policy_rejections'");
-  });
-
-  it('does not request conflict arbitration for quarantined input', async () => {
-    const db = createDb();
-
-    const request = await getDedupEscalationRequest({
-      ...input(),
-      status: 'needs_review',
-      policyRejections: [{
-        code: 'invalid_memory_scope',
-        field: 'scope',
-        reason: 'unsupported'
-      }]
-    }, 'quarantined-memory', db);
-
-    expect(request).toBeNull();
-    expect(db.query).not.toHaveBeenCalled();
-    expect(decryptForVaultMock).not.toHaveBeenCalled();
-    expect(extractorMock.arbitrateConflict).not.toHaveBeenCalled();
-  });
-
-  it('preserves policy rejection evidence when an exact-match update remains quarantined', async () => {
-    const db = createDb({
-      exactMatch: {
-        scope: 'session',
-        status: 'needs_review',
-        evidence: {
-          summary: null,
-          policy_rejections: [{
-            code: 'invalid_memory_scope',
-            field: 'scope',
-            reason: 'unsupported'
-          }]
-        }
-      }
-    });
-
-    await apply({ ...input(), scope: 'session', scopeKey: 'session-1', evidence: 'Later supporting evidence.' }, db);
-
-    const update = db.query.mock.calls.find(([sql]) => String(sql).includes('SET source_chunks'));
-    const evidence = JSON.parse(String(update?.[1]?.[9]));
-    expect(evidence.summary).toBe('Later supporting evidence.');
-    expect(evidence.policy_rejections).toEqual([{
-      code: 'invalid_memory_scope',
-      field: 'scope',
-      reason: 'unsupported'
-    }]);
-  });
-
-  it('preserves policy rejection evidence across automatic similarity merges', async () => {
-    const db = createDb({
-      matchScope: 'session',
-      matchStatus: 'needs_review',
-      matchEvidence: {
-        summary: 'Original evidence.',
-        policy_rejections: [{
-          code: 'global_behavioral_memory_requires_approval',
-          field: 'scope',
-          reason: 'approval_missing'
-        }]
-      },
-      similarity: 0.95
-    });
-
-    await apply({ ...input(), scope: 'session', scopeKey: 'session-1', evidence: 'Updated evidence.' }, db);
-
-    const update = db.query.mock.calls.find(([sql]) => String(sql).includes('SET data = $2'));
-    const evidence = JSON.parse(String(update?.[1]?.[12]));
-    expect(evidence.summary).toBe('Updated evidence.');
-    expect(evidence.policy_rejections).toEqual([{
-      code: 'global_behavioral_memory_requires_approval',
-      field: 'scope',
-      reason: 'approval_missing'
-    }]);
-  });
-
-  it('inserts quarantined input without mutating a matching active memory', async () => {
-    const db = createDb({ exactMatch: { scope: 'global', status: 'active' } });
-
-    await apply({
-      ...input(),
-      scope: 'session',
-      status: 'needs_review',
-      policyRejections: [{
-        code: 'invalid_memory_scope',
-        field: 'scope',
-        reason: 'unsupported'
-      }]
-    }, db);
-
-    const insert = db.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO memories'));
-    expect(insert).toBeDefined();
-    expect(insert?.[1]?.[12]).toBe('session');
-    expect(insert?.[1]?.[15]).toBe('needs_review');
-    expect(insert?.[1]?.[17]).toContain('invalid_memory_scope');
-    expect(insert?.[1]?.[17]).toContain('unsupported');
-    expect(db.query.mock.calls.some(([sql]) => String(sql).includes('UPDATE memories'))).toBe(false);
-  });
-
-  it('forces policy-rejected input into quarantine even when its caller requests active', async () => {
-    const db = createDb({ exactMatch: { scope: 'global', status: 'active' } });
-
-    await apply({
-      ...input(),
-      status: 'active',
-      policyRejections: [{
-        code: 'untrusted_provenance',
-        field: 'provenance',
-        reason: 'imported'
-      }]
-    }, db);
-
-    const insert = db.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO memories'));
-    expect(insert?.[1]?.[15]).toBe('needs_review');
-    expect(db.query.mock.calls.some(([sql]) => String(sql).includes('UPDATE memories'))).toBe(false);
-  });
-
-  it('rejects secret-like content before any dedup read or write', async () => {
-    const db = createDb();
-
-    await expect(apply({
-      ...input(),
-      fact: 'api_key=sk-example-secret-value-123456789'
-    }, db)).rejects.toThrow('rejected by secret policy');
-    expect(db.query).not.toHaveBeenCalled();
+  it('checks source ownership and encryption identity before any memory write',async()=>{
+    const db=database({missingSource:true});
+    await expect(deduplicateMemoryInTransaction(input(),db as never,prepared,[])).rejects.toThrow('does not belong');
+    expect(prepared.assertCurrent).toHaveBeenCalledOnce();
+    expect(db.query.mock.calls.some(([sql])=>sql.includes('INSERT INTO memories'))).toBe(false);
   });
 });

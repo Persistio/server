@@ -15,7 +15,7 @@ const context: ConflictArbitrationContext = {
 describe('contradiction arbitration context', () => {
   beforeEach(() => {
     createMock.mockReset();
-    createMock.mockResolvedValue({ choices: [{ finish_reason: 'stop', message: { content: 'NEEDS_REVIEW' } }] });
+    createMock.mockResolvedValue({ choices: [{ finish_reason: 'stop', message: { content: 'KEEP_BOTH' } }] });
     openAiMock.mockImplementation(function OpenAIMock() {
       return { chat: { completions: { create: createMock } } };
     });
@@ -28,13 +28,10 @@ describe('contradiction arbitration context', () => {
 
     const [request] = createMock.mock.calls[0];
     const system = request.messages[0].content;
-    expect(system).toContain('Neither position implies recency or authority');
-    expect(system).toContain('createdAt is the storage creation time, not necessarily the time of the fact');
-    expect(system).toContain('A later timestamp alone does not establish');
-    expect(system).toContain('If the conflict or temporal relationship is ambiguous, choose NEEDS_REVIEW');
-    expect(system).toContain('retain B and mark A contradicted');
-    expect(system).toContain('retain A and mark B contradicted');
-    expect(system).toContain('subsume B into A, retain and strengthen A, and mark B superseded; no text is combined');
+    expect(system).toContain('Position, storage order, updated time and a later source timestamp alone do not establish a correction');
+    expect(system).toContain('validity bounds describe applicability');
+    expect(system).toContain('KEEP_BOTH for ambiguous conflict');
+    expect(system).toContain('server retains A text, not a combined rewrite');
     expect(JSON.parse(request.messages[1].content)).toEqual({
       'Memory A': { text: a, ...context.existing },
       'Memory B': { text: b, ...context.incoming }
@@ -45,18 +42,18 @@ describe('contradiction arbitration context', () => {
 
   it.each([
     ['SUPERSEDE_OLD', 'supersede_old'], ['DISCARD_NEW', 'discard_new'],
-    ['MERGE', 'merge'], ['NEEDS_REVIEW', 'needs_review']
+    ['MERGE', 'merge'], ['KEEP_BOTH', 'keep_both']
   ])('retains the decision mapping for %s', async (output, decision) => {
     createMock.mockResolvedValue({ choices: [{ finish_reason: 'stop', message: { content: output } }] });
     await expect(new ExtractorService().arbitrateConflict('A', 'B', 'vault-1', context)).resolves.toBe(decision);
   });
 
-  it('keeps the existing dedup prompt when no scheduled-memory context is supplied', async () => {
+  it('uses the same neutral full-text contract even without timestamp metadata', async () => {
     await new ExtractorService().arbitrateConflict('Existing content', 'New content', 'vault-1');
     const [request] = createMock.mock.calls[0];
-    expect(request.messages[0].content).toContain('Decide whether a new memory candidate should survive');
+    expect(request.messages[0].content).toContain('Never infer that A is older or B more authoritative from its position');
     expect(request.messages[1]).toEqual({
-      role: 'user', content: 'Existing fact: "Existing content"\n\nNew fact: "New content"\n\nWhat should we do?'
+      role: 'user', content: JSON.stringify({'Memory A':{text:'Existing content'},'Memory B':{text:'New content'}})
     });
   });
 });

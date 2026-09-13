@@ -1,276 +1,112 @@
-import type { Client, PoolClient } from 'pg';
-
-import { query, withTransaction } from '../db/client';
+import type { Client,PoolClient } from 'pg';
+import { query,withTransaction } from '../db/client';
 import { getConfig } from '../config';
-import { decryptForVault, MemoryCiphertextError, type VaultEncryptionContext } from './crypto';
-import type { ExtractorService } from './extractor';
-import { memoryValidityPredicateSql } from './memory-validity';
-import { memoryAuthorityPredicateSql, type GlobalRulePolicy } from './memory-authority';
-import { memoryPolicyEventCounter } from './observability-effects';
+import { decryptForVault,prepareVaultCrypto,type VaultEncryptionContext } from './crypto';
+import type { ExtractorService,ConflictResolution } from './extractor';
+import { enqueueCurationWork } from './curation-work';
+import { publishCommittedWorkerEffects } from './worker-effects';
+import crypto from 'node:crypto';
 
-type ConflictDecision = 'supersede_old' | 'needs_review' | 'merge' | 'discard_new';
-const VALID_DECISIONS: ConflictDecision[] = ['supersede_old', 'discard_new', 'needs_review', 'merge'];
-type ScanClient = Client | PoolClient;
-const DATABASE_UTC_DATE = "(statement_timestamp() AT TIME ZONE 'UTC')::date";
+type ScanClient=Client|PoolClient;
 interface MemoryCandidateRow extends VaultEncryptionContext {
-  memory_id: string;
-  data: string;
-  status: string;
-  similarity: number;
-  scope: string;
-  scope_key: string | null;
-  row_version: string;
-  authority_eligible: boolean;
-  source_timestamp: string | null;
-  valid_from: string | null;
-  valid_until: string | null;
-  created_at: string;
+  memory_id:string;data:string;status:string;similarity:number;scope:string;scope_key:string|null;row_version:string;
+  source_timestamp:string|null;valid_from:string|null;valid_until:string|null;created_at:string;account_id:string|null;
+  type:string|null;polarity:string;
 }
+export interface ContradictionScanOptions {client?:ScanClient;budget?:{remaining:number};maxArbitrations?:number}
+export interface ContradictionScanResult {completedMemoryIds:string[];deferredMemoryIds:string[]}
+const eligible=(a:string)=>`${a}.status='active' AND ${a}.archived_at IS NULL AND ${a}.sensitivity<>'restricted'
+  AND ${a}.confidence>0 AND ${a}.confidence<=1
+  AND (${a}.source_timestamp IS NULL OR ${a}.source_timestamp<=clock_timestamp()+interval '5 minutes')`;
+const columns=(a:string)=>`${a}.id AS memory_id,${a}.data,${a}.status,${a}.scope,${a}.scope_key,${a}.revision::text AS row_version,
+  ${a}.source_timestamp::text,${a}.valid_from::text,${a}.valid_until::text,${a}.created_at::text,${a}.type,${a}.polarity`;
+const sameMeaning=(a:MemoryCandidateRow,b:MemoryCandidateRow)=>a.valid_from===b.valid_from && a.valid_until===b.valid_until && a.type===b.type && a.polarity===b.polarity;
 
-export interface ContradictionScanOptions {
-  client?: ScanClient;
-  budget?: { remaining: number };
-  maxArbitrations?: number;
-  globalRulePolicy?: GlobalRulePolicy;
-}
-export interface ContradictionScanResult {
-  completedMemoryIds: string[];
-  deferredMemoryIds: string[];
-}
-
-/** Static applicability shared by input selection and commit-time validation. */
-function eligibleSql(alias: string, date: string): string {
-  return `${alias}.status = 'active' AND ${alias}.archived_at IS NULL
-    AND ((${alias}.scope = 'global' AND ${alias}.scope_key IS NULL)
-      OR (${alias}.scope IN ('project', 'task', 'session') AND ${alias}.scope_key IS NOT NULL))
-    AND ${alias}.sensitivity <> 'restricted'
-    AND ${alias}.confidence > 0 AND ${alias}.confidence <= 1
-    AND CASE WHEN ${alias}.evidence ? 'policy_rejections' THEN
-      CASE WHEN jsonb_typeof(${alias}.evidence -> 'policy_rejections') = 'array'
-        THEN jsonb_array_length(${alias}.evidence -> 'policy_rejections') = 0
-        ELSE false END
-      ELSE true END
-    AND (${alias}.source_timestamp IS NULL OR ${alias}.source_timestamp <= statement_timestamp() + interval '5 minutes')
-    AND ${memoryValidityPredicateSql(alias, date)}`;
-}
-
-function sameValidityWindow(first: MemoryCandidateRow, second: MemoryCandidateRow): boolean {
-  return first.valid_from === second.valid_from && first.valid_until === second.valid_until;
-}
-
-export async function scanForContradictions(
-  vaultId: string,
-  newMemoryIds: string[],
-  extractor: ExtractorService,
-  options: ContradictionScanOptions = {}
-): Promise<ContradictionScanResult> {
-  const config = getConfig();
-  const policy = options.globalRulePolicy ?? config.GLOBAL_RULE_POLICY;
-  const result: ContradictionScanResult = { completedMemoryIds: [], deferredMemoryIds: [] };
-  const budget = options.budget ?? { remaining: config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH };
-  const execute = options.client ? options.client.query.bind(options.client) : query;
-  const transaction = async <T>(run: (client: ScanClient) => Promise<T>): Promise<T> => {
-    const freshSnapshotTransaction = async (client: ScanClient) => {
-      // Authority events can change without updating the memory's xmin. A fresh
-      // statement snapshot after lock acquisition is required, even if the
-      // connection's default isolation level is stronger than READ COMMITTED.
-      await client.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
-      return run(client);
-    };
-    if (!options.client) return withTransaction(freshSnapshotTransaction);
-    // The scheduler's advisory-lock connection also owns every decision commit.
-    // A lost connection cannot commit stale work through another pooled client.
-    await options.client.query('BEGIN');
-    try {
-      const value = await freshSnapshotTransaction(options.client);
-      await options.client.query('COMMIT');
-      return value;
-    } catch (error) {
-      await options.client.query('ROLLBACK');
-      throw error;
-    }
+export async function scanForContradictions(vaultId:string,memoryIds:string[],extractor:ExtractorService,options:ContradictionScanOptions={}):Promise<ContradictionScanResult>{
+  const config=getConfig(),budget=options.budget ?? {remaining:config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH};
+  const execute=options.client ? options.client.query.bind(options.client):query;
+  const result:ContradictionScanResult={completedMemoryIds:[],deferredMemoryIds:[]};
+  const transaction=async<T>(fn:(client:ScanClient)=>Promise<T>):Promise<T>=>{
+    if(!options.client)return withTransaction(fn);
+    await options.client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+    try{const value=await fn(options.client);await options.client.query('COMMIT');return value;}
+    catch(error){await options.client.query('ROLLBACK');throw error;}
   };
-
-  for (const memoryId of newMemoryIds) {
-    const startingBudget = budget.remaining;
-    const memoryLimit = options.maxArbitrations ?? config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH;
-    if (!config.CONTRADICTION_SCAN_ENABLED || budget.remaining <= 0) {
-      result.deferredMemoryIds.push(memoryId);
-      continue;
-    }
-    const currentResult = await execute<MemoryCandidateRow>(
-      `SELECT m.id AS memory_id, m.data, m.status, m.scope, m.scope_key, m.xmin::text AS row_version,
-              m.source_timestamp::text, m.valid_from::text, m.valid_until::text, m.created_at::text,
-              1.0 AS similarity, ${memoryAuthorityPredicateSql('m', '$3')} AS authority_eligible,
-              v.id, v.encrypted_dek, v.vault_encryption_enabled
-       FROM memories m JOIN vaults v ON v.id = m.vault_id
-       WHERE m.vault_id = $1 AND m.id = $2 AND ${eligibleSql('m', DATABASE_UTC_DATE)}`,
-      [vaultId, memoryId, policy]
-    );
-    const current = currentResult.rows[0];
-    if (!current || current.status !== 'active') {
-      result.completedMemoryIds.push(memoryId);
-      continue;
-    }
-    if (!current.authority_eligible) {
-      result.deferredMemoryIds.push(memoryId);
-      continue;
-    }
-    let currentFact: string;
-    try {
-      currentFact = await decryptForVault(current, current.data);
-    } catch (error) {
-      if (!(error instanceof MemoryCiphertextError)) throw error;
-      await quarantineCiphertext(current, vaultId, execute);
-      result.deferredMemoryIds.push(memoryId);
-      continue;
-    }
-
-    const limit = Math.min(budget.remaining, memoryLimit) + 1;
-    const candidates = await execute<MemoryCandidateRow>(
-      `SELECT m.id AS memory_id, m.data, m.status, m.scope, m.scope_key, m.xmin::text AS row_version,
-              m.source_timestamp::text, m.valid_from::text, m.valid_until::text, m.created_at::text,
-              1 - (m.embedding <=> current.embedding) AS similarity,
-              v.id, v.encrypted_dek, v.vault_encryption_enabled
-       FROM memories current JOIN memories m ON m.vault_id = current.vault_id
-       JOIN vaults v ON v.id = m.vault_id
-       WHERE current.id = $2 AND current.vault_id = $1 AND current.xmin::text = $4
-         AND ${eligibleSql('current', DATABASE_UTC_DATE)} AND ${memoryAuthorityPredicateSql('current', '$5')}
-         AND m.id <> current.id AND m.scope = current.scope
-         AND m.scope_key IS NOT DISTINCT FROM current.scope_key
-         AND ${eligibleSql('m', DATABASE_UTC_DATE)} AND ${memoryAuthorityPredicateSql('m', '$5')}
-         AND current.embedding IS NOT NULL AND m.embedding IS NOT NULL
-         AND 1 - (m.embedding <=> current.embedding) > $3
-       ORDER BY similarity DESC, m.id
-       LIMIT $6`,
-      [vaultId, memoryId, config.CONTRADICTION_SCAN_MIN_SIMILARITY,
-        current.row_version, policy, limit]
-    );
-    if (!candidates.rows.length) {
-      const unchanged = await execute(
-        'SELECT 1 FROM memories WHERE vault_id = $1 AND id = $2 AND xmin::text = $3',
-        [vaultId, memoryId, current.row_version]
-      );
-      if (unchanged.rowCount !== 1) {
-        result.deferredMemoryIds.push(memoryId);
-        continue;
+  for(const memoryId of memoryIds){
+    if(!config.CONTRADICTION_SCAN_ENABLED || budget.remaining<=0){result.deferredMemoryIds.push(memoryId);continue;}
+    const current=(await execute<MemoryCandidateRow>(`SELECT ${columns('m')},1.0 AS similarity,
+      v.id,v.encrypted_dek,v.vault_encryption_enabled,v.account_id::text FROM memories m JOIN vaults v ON v.id=m.vault_id
+      WHERE m.vault_id=$1 AND m.id=$2 AND ${eligible('m')}`,[vaultId,memoryId])).rows[0];
+    if(!current){result.completedMemoryIds.push(memoryId);continue;}
+    // Corrupt technical input fails this scan; never mutate memory into a review state.
+    const currentFact=await decryptForVault(current,current.data);
+    const limit=Math.min(budget.remaining,options.maxArbitrations ?? config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH);
+    const candidates=(await execute<MemoryCandidateRow>(`SELECT ${columns('m')},
+      1-(m.embedding <=> original.embedding) AS similarity,v.id,v.encrypted_dek,v.vault_encryption_enabled,v.account_id::text
+      FROM memories original JOIN memories m ON m.vault_id=original.vault_id JOIN vaults v ON v.id=m.vault_id
+      WHERE original.vault_id=$1 AND original.id=$2 AND original.revision=$3::bigint AND ${eligible('original')}
+        AND m.id<>original.id AND m.scope=original.scope AND m.scope_key IS NOT DISTINCT FROM original.scope_key
+        AND ${eligible('m')} AND original.embedding IS NOT NULL AND m.embedding IS NOT NULL
+        AND 1-(m.embedding <=> original.embedding)>=$4
+        AND NOT EXISTS(SELECT 1 FROM contradiction_scan_log l WHERE l.vault_id=$1
+          AND ((l.memory_id_a=original.id AND l.revision_a=original.revision AND l.memory_id_b=m.id AND l.revision_b=m.revision)
+            OR (l.memory_id_b=original.id AND l.revision_b=original.revision AND l.memory_id_a=m.id AND l.revision_a=m.revision)))
+      ORDER BY similarity DESC,m.id LIMIT $5`,[vaultId,memoryId,current.row_version,config.CONTRADICTION_SCAN_MIN_SIMILARITY,limit+1])).rows;
+    let complete=candidates.length<=limit;
+    for(const candidate of candidates.slice(0,limit)){
+      const fact=await decryptForVault(candidate,candidate.data);
+      let decision:ConflictResolution='keep_both';
+      if(sameMeaning(current,candidate)){
+        if(fact===currentFact)decision='merge';
+        else{
+          budget.remaining--;
+          const temporal=(m:MemoryCandidateRow)=>({sourceTimestamp:m.source_timestamp,validFrom:m.valid_from,validUntil:m.valid_until,createdAt:m.created_at});
+          decision=await extractor.arbitrateConflict(fact,currentFact,vaultId,{existing:temporal(candidate),incoming:temporal(current)});
+        }
       }
-    }
-
-    let complete = candidates.rows.length < limit;
-    for (const candidate of candidates.rows) {
-      if (budget.remaining <= 0 || startingBudget - budget.remaining >= memoryLimit) { complete = false; break; }
-      if (candidate.status !== 'active') continue;
-      let candidateFact: string;
-      try {
-        candidateFact = await decryptForVault(candidate, candidate.data);
-      } catch (error) {
-        if (!(error instanceof MemoryCiphertextError)) throw error;
-        // Attribute the defect to the offending row. It must not poison the
-        // current memory or hide good candidates behind repeated retries.
-        await quarantineCiphertext(candidate, vaultId, execute);
-        complete = false;
-        continue;
-      }
-      let decision: ConflictDecision;
-      if (!sameValidityWindow(current, candidate)) {
-        // Current overlap does not authorize retiring either record's entire
-        // temporal scope. Keep both records and their bounds for explicit review,
-        // including exact text matches whose intended horizons still differ.
-        decision = 'needs_review';
-      } else if (candidateFact === currentFact) {
-        decision = 'merge';
-      } else {
-        // Recheck before spending; both inputs are locked and checked again at commit.
-        const unchanged = await execute(
-          `SELECT 1 FROM memories WHERE vault_id = $1
-           AND ((id = $2 AND xmin::text = $4) OR (id = $3 AND xmin::text = $5))`,
-          [vaultId, memoryId, candidate.memory_id, current.row_version, candidate.row_version]
-        );
-        if (unchanged.rowCount !== 2) { complete = false; break; }
-        budget.remaining -= 1;
-        // Scheduling order conveys no chronology. Explicit neutral pair context
-        // prevents a backfilled old reminder from masquerading as newer evidence.
-        const temporalContext = (memory: MemoryCandidateRow) => ({
-          sourceTimestamp: memory.source_timestamp,
-          validFrom: memory.valid_from,
-          validUntil: memory.valid_until,
-          createdAt: memory.created_at
-        });
-        decision = await extractor.arbitrateConflict(candidateFact, currentFact, vaultId, {
-          existing: temporalContext(candidate), incoming: temporalContext(current)
-        });
-      }
-      if (!VALID_DECISIONS.includes(decision)) {
-        throw new Error(`Invalid contradiction arbitration decision: ${String(decision)}`);
-      }
-      await transaction(async client => {
-        const eligibleInputsSql = `SELECT m.id FROM memories m
-           WHERE m.vault_id = $1
-             AND ((m.id = $2 AND m.xmin::text = $4) OR (m.id = $3 AND m.xmin::text = $5))
-             AND ${eligibleSql('m', DATABASE_UTC_DATE)}
-             AND ${memoryAuthorityPredicateSql('m', '$6')}`;
-        const inputParameters = [vaultId, memoryId, candidate.memory_id,
-          current.row_version, candidate.row_version, policy];
-        const locked = await client.query(`${eligibleInputsSql} ORDER BY m.id FOR UPDATE OF m`, inputParameters);
-        if (locked.rowCount !== 2) throw new Error('Contradiction inputs changed after arbitration');
-        // A lock wait may outlive a committed revocation or UTC date boundary.
-        // Re-evaluate after the locks with a new snapshot and statement clock.
-        // Deferred authority-event reconciliation must acquire these same row
-        // locks, so later event transactions cannot commit before this decision.
-        const applicable = await client.query(eligibleInputsSql, inputParameters);
-        if (applicable.rowCount !== 2) throw new Error('Contradiction inputs changed after arbitration');
-        await applyDecision(client, vaultId, current, candidate, decision);
-        await client.query(
-          `INSERT INTO contradiction_scan_log (vault_id, memory_id_a, memory_id_b, decision, similarity)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [vaultId, memoryId, candidate.memory_id, decision, candidate.similarity]
-        );
+      if(!['supersede_old','discard_new','keep_both','merge'].includes(decision))throw new Error('Invalid conflict decision');
+      const prepared=await prepareVaultCrypto(current);
+      let retired=false;
+      await transaction(async client=>{
+        await client.query('SELECT id FROM vaults WHERE id=$1 FOR NO KEY UPDATE',[vaultId]);
+        // These helpers use only the pg query interface on the same advisory-lock
+        // owning connection, not a second pool transaction.
+        await prepared.assertCurrent(client as PoolClient);
+        const locked=await client.query(`SELECT id FROM memories m WHERE vault_id=$1
+          AND ((id=$2 AND revision=$4::bigint) OR (id=$3 AND revision=$5::bigint))
+          AND ${eligible('m')} ORDER BY id FOR UPDATE`,[vaultId,current.memory_id,candidate.memory_id,current.row_version,candidate.row_version]);
+        if(locked.rowCount!==2)throw new Error('Conflict inputs changed after arbitration');
+        if(decision!=='keep_both'){
+          const survivor=decision==='supersede_old'?current.memory_id:candidate.memory_id;
+          const removed=decision==='supersede_old'?candidate.memory_id:current.memory_id;
+          if(decision==='merge'){
+            await client.query(`UPDATE memories target SET source_chunks=ARRAY(
+              SELECT DISTINCT source FROM memories m,unnest(m.source_chunks) source WHERE m.vault_id=$1 AND m.id=ANY($3::uuid[]) ORDER BY source),
+              sensitivity=CASE WHEN EXISTS(SELECT 1 FROM memories WHERE vault_id=$1 AND id=ANY($3::uuid[]) AND sensitivity='high') THEN 'high'
+                WHEN EXISTS(SELECT 1 FROM memories WHERE vault_id=$1 AND id=ANY($3::uuid[]) AND sensitivity='medium') THEN 'medium' ELSE 'low' END,
+              source_timestamp=(SELECT max(source_timestamp) FROM memories WHERE vault_id=$1 AND id=ANY($3::uuid[])),updated_at=now()
+              WHERE target.vault_id=$1 AND target.id=$2`,[vaultId,survivor,[current.memory_id,candidate.memory_id]]);
+            await enqueueCurationWork(client as PoolClient,{vaultId,workKey:'conflict:'+crypto.randomUUID(),memoryIds:[survivor]});
+          }
+          await client.query(`UPDATE memories SET status=$3,archived_at=now(),updated_at=now() WHERE vault_id=$1 AND id=$2`,
+            [vaultId,removed,decision==='merge'?'superseded':'contradicted']);
+          retired=true;
+        }
+        // A is the first model input, B the second; log exact resulting revisions.
+        await client.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+          SELECT $1,a.id,b.id,$4,$5,a.revision,b.revision FROM memories a,memories b
+          WHERE a.vault_id=$1 AND b.vault_id=$1 AND a.id=$2 AND b.id=$3`,
+          [vaultId,candidate.memory_id,current.memory_id,decision,candidate.similarity]);
       });
-      if (decision !== 'supersede_old') { complete = true; break; }
+      if(retired)publishCommittedWorkerEffects([{kind:'memory-count',vaultId,accountId:current.account_id,delta:-1,source:'extraction_worker'}]);
+      if(decision==='merge' || decision==='discard_new'){complete=true;break;}
     }
-    (complete ? result.completedMemoryIds : result.deferredMemoryIds).push(memoryId);
+    // An empty neighbour query is not completion of a concurrently changed input.
+    if(!candidates.length){
+      const unchanged=await execute('SELECT 1 FROM memories WHERE vault_id=$1 AND id=$2 AND revision=$3::bigint',[vaultId,memoryId,current.row_version]);
+      complete=unchanged.rowCount===1;
+    }
+    (complete?result.completedMemoryIds:result.deferredMemoryIds).push(memoryId);
   }
   return result;
-}
-
-async function quarantineCiphertext(
-  memory: MemoryCandidateRow,
-  vaultId: string,
-  execute: typeof query
-): Promise<void> {
-  const changed = await execute(
-    `UPDATE memories SET status = 'needs_review', updated_at = now()
-     WHERE vault_id = $1 AND id = $2 AND xmin::text = $3 AND status = 'active' AND archived_at IS NULL`,
-    [vaultId, memory.memory_id, memory.row_version]
-  );
-  if (changed.rowCount === 1) memoryPolicyEventCounter.add(1, {
-    event: 'quarantine', source: 'contradiction_scanner', reason: 'invalid_ciphertext'
-  });
-}
-
-async function applyDecision(
-  client: ScanClient,
-  vaultId: string,
-  current: MemoryCandidateRow,
-  candidate: MemoryCandidateRow,
-  decision: ConflictDecision
-): Promise<void> {
-  // Both exact revisions and applicability were checked under ordered row locks.
-  const targetIds = decision === 'needs_review' ? [current.memory_id, candidate.memory_id]
-    : [decision === 'supersede_old' ? candidate.memory_id : current.memory_id];
-  const status = decision === 'needs_review' ? 'needs_review' : decision === 'merge' ? 'superseded' : 'contradicted';
-  const updated = await client.query(
-    'UPDATE memories SET status = $3, updated_at = now() WHERE vault_id = $1 AND id = ANY($2::uuid[])',
-    [vaultId, targetIds, status]
-  );
-  if (updated.rowCount !== targetIds.length) throw new Error('Contradiction target changed after arbitration');
-  if (decision === 'merge') {
-    const strengthened = await client.query(
-      `UPDATE memories SET confidence = LEAST(confidence + 0.1, 1), updated_at = now()
-       WHERE vault_id = $1 AND id = $2`,
-      [vaultId, candidate.memory_id]
-    );
-    if (strengthened.rowCount !== 1) throw new Error('Contradiction merge target changed after arbitration');
-  }
 }

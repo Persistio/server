@@ -24,12 +24,12 @@ describe.skipIf(!databaseUrl)('memory capacity and inventory (PostgreSQL)', () =
 
     await testPool.query(
       `INSERT INTO vaults (id, name, api_key_hash, rate_limit_override)
-       VALUES ($1, 'capacity-regression', $2, '{"memories_max":15}')`,
+       VALUES ($1, 'capacity-regression', $2, '{"memories_max":12}')`,
       [vaultId, crypto.randomUUID()]
     );
-    // Every status reserves capacity, including future memories. Expired rows
-    // stay visible in inventory until archival, but must not block writes.
-    for (const status of ['active', 'candidate', 'needs_review', 'contradicted', 'superseded']) {
+    // Every retained status reserves capacity, including historical and future memories.
+    // Only archival releases storage; applicability is not retention.
+    for (const status of ['active', 'contradicted', 'superseded']) {
       await testPool.query(
         `INSERT INTO memories (vault_id, data, subject, hash, status, scope, scope_key, valid_from, valid_until)
          SELECT $1, $2 || '-' || kind, 'capacity', $3 || '-' || kind, $2, 'project', 'capacity-test',
@@ -49,7 +49,7 @@ describe.skipIf(!databaseUrl)('memory capacity and inventory (PostgreSQL)', () =
     await closeDefaultPool();
   });
 
-  it('uses inclusive UTC expiry regardless of the connection timezone', async () => {
+  it('counts all retained dates regardless of the connection timezone', async () => {
     const client = await testPool.connect();
     try {
       for (const timezone of ['Pacific/Kiritimati', 'Etc/GMT+12']) {
@@ -60,7 +60,7 @@ describe.skipIf(!databaseUrl)('memory capacity and inventory (PostgreSQL)', () =
            ORDER BY m.data`,
           [vaultId]
         );
-        expect(result.rows.map((row) => row.data)).toEqual(['active-future', 'active-today', 'active-unbounded']);
+        expect(result.rows.map((row) => row.data)).toEqual(['active-expired', 'active-future', 'active-today', 'active-unbounded']);
       }
     } finally {
       client.release();
@@ -69,14 +69,14 @@ describe.skipIf(!databaseUrl)('memory capacity and inventory (PostgreSQL)', () =
 
   it('reports the same capacity and override used by both admission paths while preserving inventory', async () => {
     expect((await getVaultStats(vaultId))?.memories).toEqual({
-      active: 4, candidate: 4, needs_review: 4, contradicted: 4,
-      superseded: 4, archived: 5, capacity_used: 15, limit: 15
+      active: 4, contradicted: 4,
+      superseded: 4, archived: 3, capacity_used: 12, limit: 12
     });
     await expect(canCreateMemory(vaultId)).resolves.toBe(false);
     await expect(enforceMemoryCreationLimit(vaultId)).rejects.toMatchObject({ name: 'QuotaExceededError' });
 
-    await testPool.query(`UPDATE vaults SET rate_limit_override = '{"memories_max":16}' WHERE id = $1`, [vaultId]);
-    expect((await getVaultStats(vaultId))?.memories).toMatchObject({ active: 4, capacity_used: 15, limit: 16 });
+    await testPool.query(`UPDATE vaults SET rate_limit_override = '{"memories_max":13}' WHERE id = $1`, [vaultId]);
+    expect((await getVaultStats(vaultId))?.memories).toMatchObject({ active: 4, capacity_used: 12, limit: 13 });
     await expect(canCreateMemory(vaultId)).resolves.toBe(true);
     const client = await testPool.connect();
     try {
@@ -94,7 +94,7 @@ describe.skipIf(!databaseUrl)('memory capacity and inventory (PostgreSQL)', () =
     } finally {
       client.release();
     }
-    expect((await getVaultStats(vaultId))?.memories.capacity_used).toBe(16);
+    expect((await getVaultStats(vaultId))?.memories.capacity_used).toBe(13);
     await expect(canCreateMemory(vaultId)).resolves.toBe(false);
   });
 });

@@ -199,16 +199,16 @@ export function getCurrentUsagePeriod(now = new Date()): string {
 }
 
 export function applyRateLimitHeaders(reply: FastifyReply, snapshot: RateLimitSnapshot) {
-  if (snapshot.limit !== null) {
+  if (typeof snapshot.limit === 'number' && Number.isFinite(snapshot.limit)) {
     reply.header('X-RateLimit-Limit', snapshot.limit);
   }
-  if (snapshot.remaining !== null) {
+  if (typeof snapshot.remaining === 'number' && Number.isFinite(snapshot.remaining)) {
     reply.header('X-RateLimit-Remaining', snapshot.remaining);
   }
-  if (snapshot.resetAtEpochSeconds !== null) {
+  if (typeof snapshot.resetAtEpochSeconds === 'number' && Number.isFinite(snapshot.resetAtEpochSeconds)) {
     reply.header('X-RateLimit-Reset', snapshot.resetAtEpochSeconds);
   }
-  if (snapshot.retryAfterSeconds !== null) {
+  if (typeof snapshot.retryAfterSeconds === 'number' && Number.isFinite(snapshot.retryAfterSeconds)) {
     reply.header('Retry-After', snapshot.retryAfterSeconds);
   }
 }
@@ -650,6 +650,12 @@ export async function enforceMemoryCreationLimit(
 ): Promise<void> {
   await assertMemoryCapacity(vaultId);
   await consumeApiQuota(vaultId, 'memory_adds', source);
+}
+
+/** Read-only cost preflight. The locked reservation remains the commit authority. */
+export async function checkMemoryCreationCapacity(vaultId: string): Promise<void> {
+  await assertMemoryCapacity(vaultId);
+  await checkQuota(vaultId, 'memory_adds');
 }
 
 export async function reserveMemoryCreationInTransaction(

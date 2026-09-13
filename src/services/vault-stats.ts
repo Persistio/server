@@ -8,8 +8,6 @@ export interface VaultStats {
   period: string;
   memories: {
     active: number;
-    candidate: number;
-    needs_review: number;
     contradicted: number;
     superseded: number;
     archived: number;
@@ -80,8 +78,6 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
 
   const memoryResult = await query<{
     active: string;
-    candidate: string;
-    needs_review: string;
     contradicted: string;
     superseded: string;
     archived: string;
@@ -89,8 +85,6 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
   }>(
     `SELECT
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'active')::text AS active,
-       COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'candidate')::text AS candidate,
-       COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'needs_review')::text AS needs_review,
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'contradicted')::text AS contradicted,
        COUNT(*) FILTER (WHERE archived_at IS NULL AND status = 'superseded')::text AS superseded,
        COUNT(*) FILTER (WHERE archived_at IS NOT NULL)::text AS archived,
@@ -126,8 +120,6 @@ export async function getVaultStats(vaultId: string, accountId: string | null = 
     period: usage.period ?? currentPeriod,
     memories: {
       active: Number(counts.active),
-      candidate: Number(counts.candidate),
-      needs_review: Number(counts.needs_review),
       contradicted: Number(counts.contradicted),
       superseded: Number(counts.superseded),
       archived: Number(counts.archived),

@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('crypto');
 import crypto from 'node:crypto';
 
 import { ManagedIdentityCredential } from '@azure/identity';
@@ -40,7 +42,7 @@ class AzureKeyVaultProvider implements KeyEncryptionProvider {
     const keyClient = new KeyClient(KEY_VAULT_URI, this.credential, KV_KEEP_ALIVE);
     const key = await keyClient.getKey(KEK_KEY_NAME);
     this.cryptoClient = new CryptographyClient(key, this.credential, KV_KEEP_ALIVE);
-    console.log('[persistio] Azure Key Vault crypto provider initialised');
+    operationalLog.log('[persistio] Azure Key Vault crypto provider initialised');
   }
 
   async wrapDek(dek: Buffer): Promise<string> {
@@ -76,7 +78,7 @@ class GcpKmsProvider implements KeyEncryptionProvider {
     if (!this.keyName) {
       throw new Error('GCP_KMS_KEY_NAME is required for GCP KMS crypto provider');
     }
-    console.log('[persistio] GCP Cloud KMS crypto provider initialised');
+    operationalLog.log('[persistio] GCP Cloud KMS crypto provider initialised');
   }
 
   async wrapDek(dek: Buffer): Promise<string> {

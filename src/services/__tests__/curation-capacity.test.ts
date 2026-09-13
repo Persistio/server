@@ -171,7 +171,7 @@ describe('curation capacity service', () => {
       [5, expect.stringMatching(/^\d{4}-\d{2}$/), 'worker-1']
     );
     expect(queryMock).toHaveBeenCalledWith(
-      expect.stringContaining("curator_input_tokens_per_call'), (p.limits->>'curator_input_tokens_per_call'), '0')::int > 0"),
+      expect.stringContaining("curator_input_tokens_per_call'), (p.limits->>'curator_input_tokens_per_call'), '0')::int >= 12000"),
       [5, expect.stringMatching(/^\d{4}-\d{2}$/), 'worker-1']
     );
     expect(queryMock).toHaveBeenCalledWith(
@@ -210,7 +210,8 @@ describe('curation capacity service', () => {
         0,
         100,
         25,
-        3
+        3,
+        1
       ]
     );
   });
@@ -400,14 +401,23 @@ describe('curation capacity service', () => {
     }))).toBe('curator output token limit exhausted');
   });
 
-  it('reports zero per-call token caps as not currently eligible', async () => {
+  it.each([100,2000,8000,11999,12000.5])('blocks unsupported input budget %s without raising the override', cap => {
+    const limits=mergeCuratorLimits('unlimited',null,{curator_input_tokens_per_call:cap});
+    expect(limits.curator_input_tokens_per_call).toBe(cap);
+    expect(getCuratorPlanBlockReason(limits)).toContain('at least 12000 whole tokens');
+  });
+  it.each([12000,16000])('accepts supported input budget %s', cap => {
+    expect(getCuratorPlanBlockReason(mergeCuratorLimits('unlimited',null,{curator_input_tokens_per_call:cap}))).toBeNull();
+  });
+
+  it.each([0,2000,11999])('reports unsupported per-call input cap %s as not currently eligible', async cap => {
     queryMock.mockResolvedValueOnce({
       rowCount: 1,
       rows: [{
         plan_id: 'unlimited',
         limits: {
           curator_enabled: true,
-          curator_input_tokens_per_call: 0
+          curator_input_tokens_per_call: cap
         },
         rate_limit_override: null,
         curator_runs: '0',
@@ -430,7 +440,7 @@ describe('curation capacity service', () => {
     await expect(getCurationStatus('dff718f2-9d97-43b2-a3cc-a14099ed42c3')).resolves.toMatchObject({
       schedule: {
         eligible_now: false,
-        defer_reason: 'curator input token limit exhausted'
+        defer_reason: cap === 0 ? 'curator input token limit exhausted' : 'curator input budget must be at least 12000 whole tokens'
       }
     });
   });

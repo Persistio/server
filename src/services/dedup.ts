@@ -1,29 +1,16 @@
 import crypto from 'node:crypto';
 import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
-
 import { query, withTransaction } from '../db/client';
-import {
-  prepareVaultCrypto,
-  type PreparedVaultCrypto,
-  isVaultEncryptionActive,
-  type VaultEncryptionContext
-} from './crypto';
+import { prepareVaultCrypto, type PreparedVaultCrypto, isVaultEncryptionActive, type VaultEncryptionContext } from './crypto';
 import { normaliseSubject, resolveCanonical } from './entity-resolver';
-import { decideEscalation, defaultDecisionWithoutEscalator } from './escalation-routing';
-import { ExtractorService, type ConflictResolution } from './extractor';
+import { ExtractorService, type ConflictResolution, type ConflictArbitrationContext } from './extractor';
 import { reserveMemoryCreationInTransaction, type ApiQuotaReservation } from './usage';
 import { publishCommittedWorkerEffects, type WorkerEffect } from './worker-effects';
-import { withSpan } from '../telemetry';
-import { memoryPolicyEventCounter } from './observability-effects';
+import { enqueueCurationWork } from './curation-work';
 import type { MemoryScope } from './memory-scope';
 import { mergeMemoryEvidence } from './memory-evidence';
 import { isSecretLikeMemoryContent } from './deterministic-filter';
-import {
-  intersectValidityBoundSql,
-  memoryValidityPredicateSql,
-  toDateOnly,
-  validityWindowsOverlapPredicateSql
-} from './memory-validity';
+import { isValidDateOnly, validityWindowsOverlapPredicateSql } from './memory-validity';
 
 export interface DedupInput {
   vaultId: string;
@@ -38,7 +25,7 @@ export interface DedupInput {
   scope: MemoryScope;
   scopeKey: string | null;
   polarity: 'positive' | 'negative' | 'neutral';
-  status: 'active' | 'candidate' | 'superseded' | 'contradicted' | 'needs_review';
+  status: 'active';
   volatility: 'very_low' | 'low' | 'medium' | 'high';
   evidence?: string | null;
   validFrom: string | null;
@@ -59,6 +46,7 @@ interface MemoryRow {
   confidence: number;
   score: number;
   salience: number;
+  sensitivity: DedupInput['sensitivity'];
   type: DedupInput['type'];
   scope: MemoryScope;
   scope_key: string | null;
@@ -99,836 +87,184 @@ export interface DedupEscalationRequest {
   existingMemoryId: string;
   existingMemoryRevision: string;
   reasons: string[];
+  context: ConflictArbitrationContext;
 }
 
-interface DedupMatchResolution {
-  dedupDate: string;
-  hash: string;
+
+interface DedupVaultContext extends VaultEncryptionContext { account_id: string | null; }
+interface MatchedMemory extends MemoryRow {
+  source_chunks: string[];
+  valid_from: string | null;
+  valid_until: string | null;
+  source_timestamp: string | null;
+  similarity: number;
+}
+interface Match {
   vault: DedupVaultContext;
+  hash: string;
   canonicalSubject: string;
-  exactMatch?: Pick<MemoryRow, 'id' | 'scope' | 'scope_key' | 'status' | 'evidence' | 'row_version'>;
-  bestMatch?: MemoryRow & { similarity: number };
+  exact?: MatchedMemory;
+  related?: MatchedMemory;
 }
 
-interface DedupVaultContext extends VaultEncryptionContext {
-  account_id: string | null;
-}
-
-export async function deduplicateMemory(
-  input: DedupInput,
-  extractor?: ExtractorService,
-  options: DedupOptions = {}
-): Promise<DedupResult> {
-  if (isSecretLikeMemoryContent(`${input.subject}\n${input.fact}`)) {
-    throw new Error('Memory content rejected by secret policy');
+function validateInput(input: DedupInput): void {
+  if (input.status !== 'active' || input.policyRejections?.length) throw new Error('Invalid baseline memory state');
+  if (!input.fact.trim() || !input.subject.trim() || input.fact.length > 10000 || input.subject.length > 500
+    || isSecretLikeMemoryContent(input.subject + '\n' + input.fact)) throw new Error('Invalid memory content');
+  if (!['global','project','task','session'].includes(input.scope)
+    || (input.scope === 'global' ? input.scopeKey !== null
+      : !input.scopeKey || input.scopeKey.trim() !== input.scopeKey || input.scopeKey.length > 512 || /[\u0000-\u001f\u007f]/.test(input.scopeKey))) {
+    throw new Error('Invalid memory binding');
   }
-  const preparedCrypto = await prepareDedupCrypto(input.vaultId, { query });
-  let transactionOptions = options;
-  if (extractor && !options.precomputedConflictDecision) {
-    const request = await getDedupEscalationRequest(input, 'transaction-preflight', { query }, preparedCrypto);
-    if (request) {
-      transactionOptions = {
-        ...options,
-        precomputedConflictDecision: await extractor.arbitrateConflict(
-          request.existingFact,
-          request.newFact,
-          input.vaultId
-        ),
-        precomputedConflictMemoryId: request.existingMemoryId,
-        precomputedConflictMemoryRevision: request.existingMemoryRevision,
-        precomputedConflictInput: request.inputFingerprint
-      };
-    }
-  }
-  // Never hold a database transaction open across a model call. If the
-  // preflight match changes before the transactional recheck, the inner call
-  // has no live escalator and takes the safe needs_review path.
-  const effects: WorkerEffect[] = [];
-  const result = await withTransaction((client) => deduplicateMemoryInTransaction(
-    input, client, preparedCrypto, effects, transactionOptions
-  ));
-  publishCommittedWorkerEffects(effects);
-  return result;
+  if (![input.validFrom,input.validUntil].every(value => value === null || isValidDateOnly(value))
+    || (input.validFrom !== null && input.validUntil !== null && input.validFrom > input.validUntil)) throw new Error('Invalid memory dates');
+  if (!Number.isFinite(input.salience) || input.salience < 0 || input.salience > 1
+    || !Number.isInteger(input.score) || input.score < 1 || input.score > 10) throw new Error('Invalid memory quality');
 }
 
 export function fingerprintDedupInput(input: DedupInput): string {
   return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
 }
 
-/** SQL/local-crypto only. The outer commit owner alone may publish effects. */
-export async function deduplicateMemoryInTransaction(
-  input: DedupInput,
-  db: PoolClient,
-  preparedCrypto: PreparedVaultCrypto,
-  effects: WorkerEffect[],
-  options: DedupOptions = {}
-): Promise<DedupResult> {
-  if (isSecretLikeMemoryContent(`${input.subject}\n${input.fact}`)) {
-    throw new Error('Memory content rejected by secret policy');
-  }
-  await preparedCrypto.assertCurrent(db);
-  if (input.policyRejections?.length) {
-    input = { ...input, status: 'needs_review' };
-  }
-  if (input.scope === 'global' && input.scopeKey !== null) {
-    throw new Error('Global memories must not have a scope key');
-  }
-  if (input.scope !== 'global' && input.scopeKey === null && input.status !== 'needs_review') {
-    throw new Error('Non-global memories require a scope key');
-  }
-  return withSpan('memory.deduplicate', {
-    'vault.id': input.vaultId,
-    'memory.subject': input.subject,
-    'memory.source_chunks_count': input.sourceChunks.length
-  }, async (span) => {
-    const { dedupDate, hash, vault, canonicalSubject, exactMatch, bestMatch } = await resolveDedupMatch(input, db, preparedCrypto);
-
-    if (input.status === 'candidate' || input.status === 'needs_review') {
-      const reservation = await reserveMemoryCreationInTransaction(db, input.vaultId);
-      const inserted = await insertMemory(db, vault, input, hash, canonicalSubject, preparedCrypto);
-      await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
-      recordSuccessfulInsert(effects, reservation, input.vaultId, vault.account_id);
-      span.setAttribute('dedup.result', 'inserted');
-      return {
-        action: 'inserted',
-        memoryId: inserted.rows[0].id
-      };
-    }
-
-    if (exactMatch) {
-      const mergedScopeSql = 'target.previous_scope';
-      const mergedValidFromSql = intersectValidityBoundSql('target.previous_valid_from', '$11', 'lower');
-      const mergedValidUntilSql = intersectValidityBoundSql('target.previous_valid_until', '$12', 'upper');
-      const updateResult = await db.query(
-        `WITH target AS (
-           SELECT id,
-                  scope AS previous_scope,
-                  valid_from AS previous_valid_from,
-                  valid_until AS previous_valid_until,
-                  authority_state AS previous_authority_state,
-                  authority_version AS previous_authority_version
-           FROM memories
-           WHERE id = $1
-             AND vault_id = $14
-             AND scope = $7
-             AND scope_key IS NOT DISTINCT FROM $16::text
-             AND status = 'active'
-             AND archived_at IS NULL
-             AND sensitivity <> 'restricted'
-             AND confidence > 0 AND confidence <= 1
-             AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-             AND ${memoryValidityPredicateSql('memories', '$17')}
-             AND ${validityWindowsOverlapPredicateSql('memories', '$11', '$12')}
-             AND CASE WHEN evidence ? 'policy_rejections' THEN
-               CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-                 THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-                 ELSE false END
-               ELSE true END
-             AND xmin::text = $18
-           FOR UPDATE
-         ), updated AS (
-           UPDATE memories
-           SET source_chunks = (
-               SELECT array_agg(DISTINCT u)
-               FROM unnest(array_cat(source_chunks, $2::uuid[])) AS u
-             ),
-             score = GREATEST(score, $3),
-             salience = GREATEST(salience, $4),
-             sensitivity = CASE
-               WHEN $5 = 'restricted' OR sensitivity = 'restricted' THEN 'restricted'
-               WHEN $5 = 'high'       OR sensitivity = 'high'       THEN 'high'
-               WHEN $5 = 'medium'     OR sensitivity = 'medium'     THEN 'medium'
-               ELSE 'low'
-             END,
-             type = COALESCE($6, type),
-             scope = ${mergedScopeSql},
-             polarity = $8,
-             authority_state = CASE
-               WHEN (
-                 authority_required
-                 OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               ) AND (
-                 ($6 IS NOT NULL AND $6 IS DISTINCT FROM type)
-                 OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope
-               )
-               THEN 'proposed' ELSE authority_state END,
-             approved_by = CASE WHEN (
-               authority_required OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-             ) AND (($6 IS NOT NULL AND $6 IS DISTINCT FROM type) OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope) THEN NULL ELSE approved_by END,
-             approved_at = CASE WHEN (
-               authority_required OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-             ) AND (($6 IS NOT NULL AND $6 IS DISTINCT FROM type) OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope) THEN NULL ELSE approved_at END,
-             approval_source = CASE WHEN (
-               authority_required OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-             ) AND (($6 IS NOT NULL AND $6 IS DISTINCT FROM type) OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope) THEN NULL ELSE approval_source END,
-             revoked_by = CASE WHEN (
-               authority_required OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-             ) AND (($6 IS NOT NULL AND $6 IS DISTINCT FROM type) OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope) THEN NULL ELSE revoked_by END,
-             revoked_at = CASE WHEN (
-               authority_required OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-             ) AND (($6 IS NOT NULL AND $6 IS DISTINCT FROM type) OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope) THEN NULL ELSE revoked_at END,
-             authority_version = CASE
-               WHEN (
-                 authority_required
-                 OR $6 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               ) AND (
-                 ($6 IS NOT NULL AND $6 IS DISTINCT FROM type)
-                 OR (${mergedScopeSql}) IS DISTINCT FROM target.previous_scope
-               )
-               THEN authority_version + 1 ELSE authority_version END,
-             volatility = COALESCE($9::memory_volatility, volatility),
-             evidence = COALESCE($10::jsonb, evidence),
-             valid_from = ${mergedValidFromSql},
-             valid_until = ${mergedValidUntilSql},
-             source_timestamp = CASE
-               WHEN $13::timestamptz IS NULL THEN source_timestamp
-               WHEN source_timestamp IS NULL OR source_timestamp < $13::timestamptz THEN $13::timestamptz
-               ELSE source_timestamp
-             END,
-             updated_at = now()
-           FROM target
-           WHERE memories.id = target.id
-           RETURNING memories.id, memories.scope, memories.authority_state, memories.authority_version,
-                     target.previous_scope,
-                     target.previous_authority_state, target.previous_authority_version
-         ), scope_audit AS (
-           INSERT INTO memory_scope_change_log (
-             vault_id, memory_id, old_scope, new_scope, actor_type, actor_id, source, reason
-           )
-           SELECT $14, updated.id, updated.previous_scope, updated.scope,
-                  'worker', NULL, 'extraction_worker',
-                  'Exact-match extraction retained the least-privileged scope under row lock.'
-           FROM updated
-           WHERE updated.scope <> updated.previous_scope
-           RETURNING id
-         ), authority_audit AS (
-           INSERT INTO memory_authority_events (
-             vault_id, memory_id, event_type, old_state, new_state, old_version, new_version,
-             actor_type, source, reason
-           )
-           SELECT $14, updated.id, 'invalidate', updated.previous_authority_state, updated.authority_state,
-                  updated.previous_authority_version, updated.authority_version,
-                  'worker', 'extraction_worker', $15
-           FROM updated
-           WHERE updated.authority_version <> updated.previous_authority_version
-           RETURNING id
-         )
-         SELECT id FROM updated`,
-        [
-          exactMatch.id,
-          input.sourceChunks,
-          input.score,
-          input.salience,
-          input.sensitivity,
-          input.type,
-          input.scope,
-          input.polarity,
-          input.volatility,
-          serializeEvidence(input, exactMatch.evidence),
-          input.validFrom,
-          input.validUntil,
-          input.sourceTimestamp ?? null,
-          input.vaultId,
-          'Exact-match extraction changed prompt-bearing metadata; approval requires review.',
-          input.scopeKey,
-          dedupDate,
-          exactMatch.row_version
-        ]
-      );
-      if (updateResult.rowCount === 0) {
-        if (options.staleRetryAttempted) return { action: 'skipped' };
-        return deduplicateMemoryInTransaction(input, db, preparedCrypto, effects, { ...options, staleRetryAttempted: true });
-      }
-      await syncEmbeddingRecord(db, exactMatch.id, input.embedding);
-      span.setAttribute('dedup.result', 'updated');
-      return {
-        action: 'updated',
-        memoryId: exactMatch.id
-      };
-    }
-    if (bestMatch) {
-      span.setAttribute('dedup.best_similarity', bestMatch.similarity);
-    }
-
-    if (bestMatch && bestMatch.similarity > 0.90) {
-      const storedFact = preparedCrypto.encrypt(getVaultContext(bestMatch, input.vaultId), input.fact);
-      const mergedScopeSql = 'target.previous_scope';
-      const mergedValidFromSql = intersectValidityBoundSql('target.previous_valid_from', '$14', 'lower');
-      const mergedValidUntilSql = intersectValidityBoundSql('target.previous_valid_until', '$15', 'upper');
-      const updateResult = await db.query(
-        `WITH target AS (
-           SELECT id,
-                  scope AS previous_scope,
-                  valid_from AS previous_valid_from,
-                  valid_until AS previous_valid_until,
-                  authority_state AS previous_authority_state,
-                  authority_version AS previous_authority_version
-           FROM memories
-           WHERE id = $1
-             AND vault_id = $17
-             AND scope = $10
-             AND scope_key IS NOT DISTINCT FROM $19::text
-             AND status = 'active'
-             AND archived_at IS NULL
-             AND sensitivity <> 'restricted'
-             AND confidence > 0 AND confidence <= 1
-             AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-             AND ${memoryValidityPredicateSql('memories', '$20')}
-             AND ${validityWindowsOverlapPredicateSql('memories', '$14', '$15')}
-             AND CASE WHEN evidence ? 'policy_rejections' THEN
-               CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-                 THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-                 ELSE false END
-               ELSE true END
-             AND xmin::text = $21
-           FOR UPDATE
-         ), updated AS (
-           UPDATE memories
-           SET data = $2, hash = $3, embedding = $4::vector,
-             source_chunks = (
-               SELECT array_agg(DISTINCT chunk_id)
-               FROM unnest(array_cat(COALESCE(memories.source_chunks, '{}'::uuid[]), $5::uuid[])) AS chunk_id
-             ), score = GREATEST(score, $6),
-             salience = GREATEST(salience, $7),
-             sensitivity = CASE
-               WHEN $8 = 'restricted' OR sensitivity = 'restricted' THEN 'restricted'
-               WHEN $8 = 'high'       OR sensitivity = 'high'       THEN 'high'
-               WHEN $8 = 'medium'     OR sensitivity = 'medium'     THEN 'medium'
-               ELSE 'low'
-             END,
-             type = COALESCE($9, type),
-             scope = ${mergedScopeSql},
-             polarity = $11,
-             authority_state = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN 'proposed' ELSE authority_state END,
-             approved_by = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN NULL ELSE approved_by END,
-             approved_at = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN NULL ELSE approved_at END,
-             approval_source = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN NULL ELSE approval_source END,
-             revoked_by = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN NULL ELSE revoked_by END,
-             revoked_at = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN NULL ELSE revoked_at END,
-             authority_version = CASE
-               WHEN authority_required
-                 OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-               THEN authority_version + 1 ELSE authority_version END,
-             volatility = COALESCE($12::memory_volatility, volatility),
-             evidence = COALESCE($13::jsonb, evidence),
-             valid_from = ${mergedValidFromSql},
-             valid_until = ${mergedValidUntilSql},
-             source_timestamp = CASE
-               WHEN $16::timestamptz IS NULL THEN source_timestamp
-               WHEN source_timestamp IS NULL OR source_timestamp < $16::timestamptz THEN $16::timestamptz
-               ELSE source_timestamp
-             END,
-             updated_at = now()
-           FROM target
-           WHERE memories.id = target.id
-           RETURNING memories.id, memories.scope, memories.authority_state, memories.authority_version,
-                     target.previous_scope,
-                     target.previous_authority_state, target.previous_authority_version
-         ), scope_audit AS (
-           INSERT INTO memory_scope_change_log (
-             vault_id, memory_id, old_scope, new_scope, actor_type, actor_id, source, reason
-           )
-           SELECT $17, updated.id, updated.previous_scope, updated.scope,
-                  'worker', NULL, 'extraction_worker',
-                  'Automatic similarity merge retained the least-privileged scope under row lock.'
-           FROM updated
-           WHERE updated.scope <> updated.previous_scope
-           RETURNING id
-         ), authority_audit AS (
-           INSERT INTO memory_authority_events (
-             vault_id, memory_id, event_type, old_state, new_state, old_version, new_version,
-             actor_type, source, reason
-           )
-           SELECT $17, updated.id, 'invalidate', updated.previous_authority_state, updated.authority_state,
-                  updated.previous_authority_version, updated.authority_version,
-                  'worker', 'extraction_worker', $18
-           FROM updated
-           WHERE updated.authority_version <> updated.previous_authority_version
-           RETURNING id
-         )
-         SELECT id FROM updated`,
-        [
-          bestMatch.id,
-          storedFact,
-          hash,
-          JSON.stringify(input.embedding),
-          input.sourceChunks,
-          input.score,
-          input.salience,
-          input.sensitivity,
-          input.type,
-          input.scope,
-          input.polarity,
-          input.volatility,
-          serializeEvidence(input, bestMatch.evidence),
-          input.validFrom,
-          input.validUntil,
-          input.sourceTimestamp ?? null,
-          input.vaultId,
-          'Automatic similarity merge rewrote prompt-bearing memory content; approval requires review.',
-          input.scopeKey,
-          dedupDate,
-          bestMatch.row_version
-        ]
-      );
-      if (updateResult.rowCount === 0) {
-        if (options.staleRetryAttempted) return { action: 'skipped' };
-        return deduplicateMemoryInTransaction(input, db, preparedCrypto, effects, { ...options, staleRetryAttempted: true });
-      }
-      await syncEmbeddingRecord(db, bestMatch.id, input.embedding);
-      span.setAttribute('dedup.result', 'updated');
-      return { action: 'updated', memoryId: bestMatch.id };
-    }
-
-    if (bestMatch && bestMatch.similarity >= 0.80) {
-      const bestMatchVault = getVaultContext(bestMatch, input.vaultId);
-      const escalation = decideEscalation(input, {
-        similarity: bestMatch.similarity,
-        confidence: bestMatch.confidence,
-        status: bestMatch.status,
-        type: bestMatch.type,
-        polarity: bestMatch.polarity,
-        volatility: bestMatch.volatility,
-        score: bestMatch.score,
-        salience: bestMatch.salience
-      });
-      span.setAttribute('dedup.escalated', escalation.escalate);
-      span.setAttribute('dedup.escalation_reasons', escalation.reasons.join(','));
-
-      const canUsePrecomputedDecision = Boolean(
-        escalation.escalate &&
-        options.precomputedConflictDecision &&
-        options.precomputedConflictInput === fingerprintDedupInput(input) &&
-        options.precomputedConflictMemoryId === bestMatch.id &&
-        options.precomputedConflictMemoryRevision === bestMatch.row_version
-      );
-      const decision: ConflictResolution | 'keep_both' = canUsePrecomputedDecision
-        ? options.precomputedConflictDecision!
-        : defaultDecisionWithoutEscalator(escalation.escalate);
-      span.setAttribute('dedup.conflict_decision', decision);
-
-      if (decision === 'keep_both') {
-        const reservation = await reserveMemoryCreationInTransaction(db, input.vaultId);
-        const inserted = await insertMemory(db, bestMatchVault, input, hash, canonicalSubject, preparedCrypto);
-        await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
-        recordSuccessfulInsert(effects, reservation, input.vaultId, bestMatchVault.account_id);
-        span.setAttribute('dedup.result', 'inserted');
-        return { action: 'inserted', memoryId: inserted.rows[0].id };
-      }
-
-      if (decision === 'merge') {
-        const storedFact = preparedCrypto.encrypt(bestMatchVault, input.fact);
-        const mergedScopeSql = 'target.previous_scope';
-        const mergedValidFromSql = intersectValidityBoundSql('target.previous_valid_from', '$14', 'lower');
-        const mergedValidUntilSql = intersectValidityBoundSql('target.previous_valid_until', '$15', 'upper');
-        const updateResult = await db.query(
-          `WITH target AS (
-             SELECT id,
-                    scope AS previous_scope,
-                    valid_from AS previous_valid_from,
-                    valid_until AS previous_valid_until,
-                    authority_state AS previous_authority_state,
-                    authority_version AS previous_authority_version
-             FROM memories
-             WHERE id = $1
-               AND vault_id = $17
-               AND scope = $10
-               AND scope_key IS NOT DISTINCT FROM $19::text
-               AND status = 'active'
-               AND archived_at IS NULL
-               AND sensitivity <> 'restricted'
-               AND confidence > 0 AND confidence <= 1
-               AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-               AND ${memoryValidityPredicateSql('memories', '$20')}
-               AND ${validityWindowsOverlapPredicateSql('memories', '$14', '$15')}
-               AND CASE WHEN evidence ? 'policy_rejections' THEN
-                 CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-                   THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-                   ELSE false END
-                 ELSE true END
-               AND xmin::text = $21
-             FOR UPDATE
-           ), updated AS (
-             UPDATE memories
-             SET data = $2, hash = $3, embedding = $4::vector,
-               source_chunks = (
-                 SELECT array_agg(DISTINCT chunk_id)
-                 FROM unnest(array_cat(COALESCE(memories.source_chunks, '{}'::uuid[]), $5::uuid[])) AS chunk_id
-               ), score = GREATEST(score, $6),
-               salience = GREATEST(salience, $7),
-               sensitivity = CASE
-                 WHEN $8 = 'restricted' OR sensitivity = 'restricted' THEN 'restricted'
-                 WHEN $8 = 'high'       OR sensitivity = 'high'       THEN 'high'
-                 WHEN $8 = 'medium'     OR sensitivity = 'medium'     THEN 'medium'
-                 ELSE 'low'
-               END,
-               type = COALESCE($9, type),
-               scope = ${mergedScopeSql},
-               polarity = $11,
-               authority_state = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN 'proposed' ELSE authority_state END,
-               approved_by = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN NULL ELSE approved_by END,
-               approved_at = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN NULL ELSE approved_at END,
-               approval_source = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN NULL ELSE approval_source END,
-               revoked_by = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN NULL ELSE revoked_by END,
-               revoked_at = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN NULL ELSE revoked_at END,
-               authority_version = CASE
-                 WHEN authority_required
-                   OR $9 IN ('user_preference', 'user_rule', 'task_pattern', 'workflow', 'constraint')
-                 THEN authority_version + 1 ELSE authority_version END,
-               volatility = COALESCE($12::memory_volatility, volatility),
-               evidence = COALESCE($13::jsonb, evidence),
-               valid_from = ${mergedValidFromSql},
-               valid_until = ${mergedValidUntilSql},
-               source_timestamp = CASE
-                 WHEN $16::timestamptz IS NULL THEN source_timestamp
-                 WHEN source_timestamp IS NULL OR source_timestamp < $16::timestamptz THEN $16::timestamptz
-                 ELSE source_timestamp
-               END,
-               updated_at = now()
-             FROM target
-             WHERE memories.id = target.id
-             RETURNING memories.id, memories.scope, memories.authority_state, memories.authority_version,
-                       target.previous_scope,
-                       target.previous_authority_state, target.previous_authority_version
-           ), scope_audit AS (
-             INSERT INTO memory_scope_change_log (
-               vault_id, memory_id, old_scope, new_scope, actor_type, actor_id, source, reason
-             )
-             SELECT $17, updated.id, updated.previous_scope, updated.scope,
-                    'worker', NULL, 'extraction_worker',
-                    'Conflict-arbitrated merge retained the least-privileged scope under row lock.'
-             FROM updated
-             WHERE updated.scope <> updated.previous_scope
-             RETURNING id
-           ), authority_audit AS (
-             INSERT INTO memory_authority_events (
-               vault_id, memory_id, event_type, old_state, new_state, old_version, new_version,
-               actor_type, source, reason
-             )
-             SELECT $17, updated.id, 'invalidate', updated.previous_authority_state, updated.authority_state,
-                    updated.previous_authority_version, updated.authority_version,
-                    'worker', 'extraction_worker', $18
-             FROM updated
-             WHERE updated.authority_version <> updated.previous_authority_version
-             RETURNING id
-           )
-           SELECT id FROM updated`,
-          [
-            bestMatch.id,
-            storedFact,
-            hash,
-            JSON.stringify(input.embedding),
-            input.sourceChunks,
-            input.score,
-            input.salience,
-            input.sensitivity,
-            input.type,
-            input.scope,
-            input.polarity,
-            input.volatility,
-            serializeEvidence(input, bestMatch.evidence),
-            input.validFrom,
-            input.validUntil,
-            input.sourceTimestamp ?? null,
-            input.vaultId,
-            'Conflict-arbitrated merge rewrote prompt-bearing memory content; approval requires review.',
-            input.scopeKey,
-            dedupDate,
-            bestMatch.row_version
-          ]
-        );
-        if (updateResult.rowCount === 0) {
-          if (options.staleRetryAttempted) return { action: 'skipped' };
-          return deduplicateMemoryInTransaction(input, db, preparedCrypto, effects, { ...options, staleRetryAttempted: true });
-        }
-        await syncEmbeddingRecord(db, bestMatch.id, input.embedding);
-        span.setAttribute('dedup.result', 'updated');
-        return { action: 'updated', memoryId: bestMatch.id };
-      }
-
-      if (decision === 'discard_new') {
-        span.setAttribute('dedup.result', 'skipped');
-        return { action: 'skipped', memoryId: bestMatch.id };
-      }
-
-      if (decision === 'supersede_old') {
-        const superseded = await db.query(
-          `UPDATE memories
-           SET status = 'superseded',
-               updated_at = now()
-           WHERE id = $1
-             AND vault_id = $2
-             AND scope = $3
-             AND scope_key IS NOT DISTINCT FROM $4::text
-             AND status = 'active'
-             AND archived_at IS NULL
-             AND sensitivity <> 'restricted'
-             AND confidence > 0 AND confidence <= 1
-             AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-             AND CASE WHEN evidence ? 'policy_rejections' THEN
-               CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-                 THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-                 ELSE false END
-               ELSE true END
-             AND xmin::text = $5`,
-          [bestMatch.id, input.vaultId, input.scope, input.scopeKey, bestMatch.row_version]
-        );
-        if (superseded.rowCount !== 1) {
-          throw new Error(`Dedup supersede target ${bestMatch.id} changed after arbitration`);
-        }
-      } else if (decision === 'needs_review') {
-        // Without a usable decision neither side may remain active. Quarantine
-        // the old target under CAS and insert the incoming side as review-only.
-        const quarantined = await db.query(
-          `UPDATE memories
-           SET status = 'needs_review',
-               updated_at = now()
-           WHERE id = $1
-             AND vault_id = $2
-             AND scope = $3
-             AND scope_key IS NOT DISTINCT FROM $4::text
-             AND status = 'active'
-             AND archived_at IS NULL
-             AND sensitivity <> 'restricted'
-             AND confidence > 0 AND confidence <= 1
-             AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-             AND CASE WHEN evidence ? 'policy_rejections' THEN
-               CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-                 THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-                 ELSE false END
-               ELSE true END
-             AND xmin::text = $5`,
-          [bestMatch.id, input.vaultId, input.scope, input.scopeKey, bestMatch.row_version]
-        );
-        if (quarantined.rowCount !== 1) {
-          memoryPolicyEventCounter.add(1, {
-            event: 'quarantine_failure',
-            source: 'dedup',
-            reason: 'concurrent_change'
-          });
-          throw new Error(`Dedup review target ${bestMatch.id} changed after arbitration`);
-        }
-      }
-
-      const reservation = await reserveMemoryCreationInTransaction(db, input.vaultId);
-      const inserted = await insertMemory(db, bestMatchVault,
-        decision === 'needs_review' ? { ...input, status: 'needs_review' } : input,
-        hash, canonicalSubject, preparedCrypto);
-      await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
-      recordSuccessfulInsert(effects, reservation, input.vaultId, bestMatchVault.account_id);
-      span.setAttribute('dedup.result', 'inserted');
-      return { action: 'inserted', memoryId: inserted.rows[0].id };
-    }
-
-    const reservation = await reserveMemoryCreationInTransaction(db, input.vaultId);
-    const inserted = await insertMemory(db, vault, input, hash, canonicalSubject, preparedCrypto);
-    await syncEmbeddingRecord(db, inserted.rows[0].id, input.embedding);
-    recordSuccessfulInsert(effects, reservation, input.vaultId, vault.account_id);
-
-    span.setAttribute('dedup.result', 'inserted');
-    return {
-      action: 'inserted',
-      memoryId: inserted.rows[0].id
+export async function deduplicateMemory(input: DedupInput, extractor?: ExtractorService, options: DedupOptions = {}): Promise<DedupResult> {
+  validateInput(input);
+  const prepared = await prepareDedupCrypto(input.vaultId, { query });
+  let decisionOptions = options;
+  if (extractor && !options.precomputedConflictDecision) {
+    const request = await getDedupEscalationRequest(input, 'preflight', { query }, prepared);
+    if (request) decisionOptions = {
+      ...options,
+      precomputedConflictDecision: await extractor.arbitrateConflict(request.existingFact, request.newFact, input.vaultId,request.context),
+      precomputedConflictMemoryId: request.existingMemoryId,
+      precomputedConflictMemoryRevision: request.existingMemoryRevision,
+      precomputedConflictInput: request.inputFingerprint
     };
+  }
+  const effects: WorkerEffect[] = [];
+  const result = await withTransaction(async client => {
+    const result = await deduplicateMemoryInTransaction(input, client, prepared, effects, decisionOptions);
+    if (result.action !== 'skipped' && result.memoryId) await enqueueCurationWork(client, {
+      vaultId: input.vaultId, workKey: 'dedup:' + crypto.randomUUID(), memoryIds: [result.memoryId], segmentId: input.sourceSegmentId
+    });
+    return result;
   });
+  publishCommittedWorkerEffects(effects);
+  return result;
+}
+
+/** Serialise short mutation/capacity checks per vault, never provider IO. */
+export async function lockMemoryWriteVault(client: PoolClient, vaultId: string): Promise<void> {
+  const result = await client.query('SELECT id FROM vaults WHERE id=$1 FOR NO KEY UPDATE', [vaultId]);
+  if (!result.rowCount) throw new Error('Memory vault does not exist');
+}
+
+export async function deduplicateMemoryInTransaction(
+  input: DedupInput, db: PoolClient, preparedCrypto: PreparedVaultCrypto,
+  effects: WorkerEffect[], options: DedupOptions = {}
+): Promise<DedupResult> {
+  validateInput(input);
+  await lockMemoryWriteVault(db, input.vaultId);
+  await preparedCrypto.assertCurrent(db);
+  // Source arrays have no SQL element FK. Validate ownership before persistence.
+  if (input.sourceChunks.length) {
+    const sources = await db.query('SELECT id FROM raw_chunks WHERE vault_id=$1 AND id=ANY($2::uuid[]) FOR KEY SHARE',
+      [input.vaultId,[...new Set(input.sourceChunks)]]);
+    if (sources.rowCount !== new Set(input.sourceChunks).size) throw new Error('Memory source does not belong to vault');
+  }
+  const match = await findMatch(input, db, preparedCrypto);
+  const previous = match.exact ?? match.related;
+  if (previous) {
+    const locked = await db.query<{ row_version: string }>(
+      'SELECT revision::text AS row_version FROM memories WHERE id=$1 AND vault_id=$2 FOR UPDATE', [previous.id,input.vaultId]);
+    if (locked.rows[0]?.row_version !== previous.row_version) throw new Error('Memory changed during deduplication');
+  }
+  if (match.exact) {
+    const previous = match.exact;
+    const sources = [...new Set([...previous.source_chunks,...input.sourceChunks])].sort();
+    // An exact source retry is no new evidence, quota, revision or Curator work.
+    const sensitivityRank={low:0,medium:1,high:2};
+    if (sources.length === new Set(previous.source_chunks).size
+      && sensitivityRank[input.sensitivity]<=sensitivityRank[previous.sensitivity]) return { action: 'skipped', memoryId: previous.id };
+    await db.query(`UPDATE memories SET source_chunks=$3::uuid[],
+      sensitivity=CASE WHEN sensitivity='high' OR $4='high' THEN 'high'
+        WHEN sensitivity='medium' OR $4='medium' THEN 'medium' ELSE 'low' END,
+      source_timestamp=GREATEST(source_timestamp,$5::timestamptz),updated_at=now() WHERE id=$1 AND vault_id=$2`,
+      [previous.id,input.vaultId,sources,input.sensitivity,input.sourceTimestamp ?? null]);
+    return { action: 'updated', memoryId: previous.id };
+  }
+
+  const related = match.related;
+  const usableDecision = related && related.valid_from === input.validFrom && related.valid_until === input.validUntil
+    && related.type === input.type && related.polarity === input.polarity && options.precomputedConflictInput === fingerprintDedupInput(input)
+    && options.precomputedConflictMemoryId === related.id
+    && options.precomputedConflictMemoryRevision === related.row_version;
+  const decision = usableDecision ? options.precomputedConflictDecision ?? 'keep_both' : 'keep_both';
+  // Similarity alone never proves equivalence or chooses which historical fact wins.
+  if (related && (decision === 'merge' || decision === 'discard_new')) {
+    const sources = [...new Set([...related.source_chunks,...input.sourceChunks])].sort();
+    await db.query(`UPDATE memories SET source_chunks=$3::uuid[],
+      sensitivity=CASE WHEN sensitivity='high' OR $4='high' THEN 'high'
+        WHEN sensitivity='medium' OR $4='medium' THEN 'medium' ELSE 'low' END,
+      source_timestamp=GREATEST(source_timestamp,$5::timestamptz),updated_at=now() WHERE id=$1 AND vault_id=$2`,
+      [related.id,input.vaultId,sources,input.sensitivity,input.sourceTimestamp ?? null]);
+    return { action: 'updated', memoryId: related.id };
+  }
+  if (related && decision === 'supersede_old') {
+    await db.query("UPDATE memories SET status='superseded',archived_at=now(),updated_at=now() WHERE id=$1 AND vault_id=$2", [related.id,input.vaultId]);
+  }
+  if (related && decision === 'supersede_old') effects.push({kind:'memory-count',vaultId:input.vaultId,accountId:match.vault.account_id,delta:-1,source:'extraction_worker'});
+  const reservation = await reserveMemoryCreationInTransaction(db,input.vaultId);
+  const inserted = await insertMemory(db,match.vault,input,match.hash,match.canonicalSubject,preparedCrypto);
+  const id = inserted.rows[0].id;
+  await syncEmbeddingRecord(db,id,input.embedding);
+  recordSuccessfulInsert(effects,reservation,input.vaultId,match.vault.account_id);
+  if (related) {
+    await db.query(`INSERT INTO contradiction_scan_log
+      (vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+      SELECT $1,a.id,b.id,$4,$5,a.revision,b.revision FROM memories a,memories b
+      WHERE a.id=$2 AND b.id=$3 AND a.vault_id=$1 AND b.vault_id=$1`,
+      [input.vaultId,related.id,id,decision === 'supersede_old' ? 'supersede_old' : 'keep_both',related.similarity]);
+  }
+  return { action: 'inserted', memoryId: id };
 }
 
 export async function getDedupEscalationRequest(
-  input: DedupInput,
-  id: string,
-  db: Queryable = { query },
-  preparedCrypto?: PreparedVaultCrypto
+  input: DedupInput, id: string, db: Queryable = { query }, preparedCrypto?: PreparedVaultCrypto
 ): Promise<DedupEscalationRequest | null> {
-  if (isSecretLikeMemoryContent(`${input.subject}\n${input.fact}`)) {
-    throw new Error('Memory content rejected by secret policy');
-  }
-  if (input.status === 'candidate' || input.status === 'needs_review') {
-    return null;
-  }
-
-  const localCrypto = preparedCrypto ?? await prepareDedupCrypto(input.vaultId, db);
-  const { bestMatch, exactMatch } = await resolveDedupMatch(input, db, localCrypto);
-  if (exactMatch) {
-    return null;
-  }
-  if (!bestMatch || bestMatch.similarity > 0.90 || bestMatch.similarity < 0.80) {
-    return null;
-  }
-
-  const escalation = decideEscalation(input, {
-    similarity: bestMatch.similarity,
-    confidence: bestMatch.confidence,
-    status: bestMatch.status,
-    type: bestMatch.type,
-    polarity: bestMatch.polarity,
-    volatility: bestMatch.volatility,
-    score: bestMatch.score,
-    salience: bestMatch.salience
-  });
-  if (!escalation.escalate) {
-    return null;
-  }
-
-  return {
-    id,
-    inputFingerprint: fingerprintDedupInput(input),
-    existingFact: localCrypto.decrypt(getVaultContext(bestMatch, input.vaultId), bestMatch.data),
-    newFact: input.fact,
-    existingMemoryId: bestMatch.id,
-    existingMemoryRevision: bestMatch.row_version,
-    reasons: escalation.reasons
-  };
+  validateInput(input);
+  const prepared = preparedCrypto ?? await prepareDedupCrypto(input.vaultId,db);
+  const match = await findMatch(input,db,prepared);
+  if (match.exact || !match.related) return null;
+  return { id, inputFingerprint: fingerprintDedupInput(input),
+    existingFact: prepared.decrypt(match.vault,match.related.data), newFact: input.fact,
+    existingMemoryId: match.related.id, existingMemoryRevision: match.related.row_version,
+    context:{existing:{sourceTimestamp:match.related.source_timestamp,validFrom:match.related.valid_from,validUntil:match.related.valid_until,createdAt:null},
+      incoming:{sourceTimestamp:input.sourceTimestamp ?? null,validFrom:input.validFrom,validUntil:input.validUntil,createdAt:null}},
+    reasons: ['possible_conflict'] };
 }
 
-async function resolveDedupMatch(
-  input: DedupInput,
-  db: Queryable,
-  preparedCrypto: PreparedVaultCrypto
-): Promise<DedupMatchResolution> {
-  const dedupDate = toDateOnly(new Date());
-  if (!dedupDate) {
-    throw new Error('Unable to derive a valid deduplication date');
-  }
-  const hash = crypto.createHash('md5').update(input.fact).digest('hex');
-  const normalisedSubject = normaliseSubject(input.subject);
-  const canonicalSubject = await resolveCanonical(
-    input.vaultId,
-    normalisedSubject,
-    input.scope,
-    input.scopeKey,
-    db
-  ) ?? normalisedSubject;
-  const vaultResult = await db.query<DedupVaultContext>(
-    `SELECT id, account_id::text AS account_id, encrypted_dek, vault_encryption_enabled
-     FROM vaults
-     WHERE id = $1
-     LIMIT 1`,
-    [input.vaultId]
-  );
-  const vault = vaultResult.rows[0];
-  if (!vault) {
-    throw new Error(`Vault ${input.vaultId} not found`);
-  }
-  // Validate the input-vault binding even when an exact match skips HMAC lookup.
-  const subjectMatchTarget = preparedCrypto.subjectMatch(vault, canonicalSubject);
-
-  const exactMatch = await db.query<Pick<MemoryRow, 'id' | 'scope' | 'scope_key' | 'status' | 'evidence' | 'row_version'>>(
-    `SELECT id, scope, scope_key, status, evidence, xmin::text AS row_version
-     FROM memories
-     WHERE vault_id = $1
-       AND hash = $2
-       AND scope = $6
-       AND scope_key IS NOT DISTINCT FROM $7::text
-       AND archived_at IS NULL
-       AND status = 'active'
-       AND sensitivity <> 'restricted'
-       AND confidence > 0 AND confidence <= 1
-       AND (source_timestamp IS NULL OR source_timestamp <= now() + interval '5 minutes')
-       AND CASE WHEN evidence ? 'policy_rejections' THEN
-         CASE WHEN jsonb_typeof(evidence -> 'policy_rejections') = 'array'
-           THEN jsonb_array_length(evidence -> 'policy_rejections') = 0
-           ELSE false END
-         ELSE true END
-       AND ${memoryValidityPredicateSql('memories', '$3')}
-       AND ${validityWindowsOverlapPredicateSql('memories', '$4', '$5')}
-     LIMIT 1`,
-    [input.vaultId, hash, dedupDate, input.validFrom, input.validUntil, input.scope, input.scopeKey]
-  );
-
-  if (exactMatch.rowCount) {
-    return {
-      dedupDate,
-      hash,
-      vault,
-      canonicalSubject,
-      exactMatch: exactMatch.rows[0]
-    };
-  }
-
-  const subjectMatchColumn = isVaultEncryptionActive(vault) ? 'm.subject_hmac' : 'm.subject';
-  const subjectMatches = await db.query<(MemoryRow & { similarity: number })>(
-    `SELECT m.id, m.data, m.confidence, m.score, m.salience, m.type, m.scope, m.scope_key, m.polarity, m.status, m.volatility, m.evidence,
-            m.xmin::text AS row_version,
-            v.account_id::text AS account_id,
-            v.encrypted_dek, v.vault_encryption_enabled,
-            1 - (m.embedding <=> $3::vector) AS similarity
-     FROM memories AS m
-     JOIN vaults AS v
-       ON v.id = m.vault_id
-     WHERE m.vault_id = $1
-       AND ${subjectMatchColumn} = $2
-       AND m.scope = $7
-       AND m.scope_key IS NOT DISTINCT FROM $8::text
-       AND m.archived_at IS NULL
-       AND m.status = 'active'
-       AND m.sensitivity <> 'restricted'
-       AND m.confidence > 0 AND m.confidence <= 1
-       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
-       AND CASE WHEN m.evidence ? 'policy_rejections' THEN
-         CASE WHEN jsonb_typeof(m.evidence -> 'policy_rejections') = 'array'
-           THEN jsonb_array_length(m.evidence -> 'policy_rejections') = 0
-           ELSE false END
-         ELSE true END
-       AND ${memoryValidityPredicateSql('m', '$4')}
-       AND ${validityWindowsOverlapPredicateSql('m', '$5', '$6')}
-       AND m.embedding IS NOT NULL
-     ORDER BY similarity DESC
-     LIMIT 1`,
-    [input.vaultId, subjectMatchTarget, JSON.stringify(input.embedding), dedupDate, input.validFrom, input.validUntil, input.scope, input.scopeKey]
-  );
-
-  return {
-    dedupDate,
-    hash,
-    vault,
-    canonicalSubject,
-    bestMatch: subjectMatches.rows[0]
-  };
-}
-
-function getVaultContext(row: MemoryRow, vaultId: string): DedupVaultContext {
-  return {
-    account_id: row.account_id,
-    id: vaultId,
-    encrypted_dek: row.encrypted_dek,
-    vault_encryption_enabled: row.vault_encryption_enabled
-  };
+async function findMatch(input: DedupInput, db: Queryable, prepared: PreparedVaultCrypto): Promise<Match> {
+  const vault = (await db.query<DedupVaultContext>(
+    'SELECT id,account_id::text,encrypted_dek,vault_encryption_enabled FROM vaults WHERE id=$1', [input.vaultId])).rows[0];
+  if (!vault) throw new Error('Memory vault does not exist');
+  const canonicalSubject = await resolveCanonical(input.vaultId,normaliseSubject(input.subject),input.scope,input.scopeKey,db)
+    ?? normaliseSubject(input.subject);
+  const hash = crypto.createHash('sha256').update(input.fact).digest('hex');
+  const rows = await db.query<MatchedMemory>(
+    `SELECT m.*,m.revision::text AS row_version,1-(m.embedding <=> $7::vector) AS similarity
+     FROM memories m WHERE m.vault_id=$1 AND m.scope=$2 AND m.scope_key IS NOT DISTINCT FROM $3::text
+       AND m.status='active' AND m.archived_at IS NULL AND m.sensitivity<>'restricted'
+       AND m.confidence>0 AND m.confidence<=1
+       AND ${isVaultEncryptionActive(vault) ? 'm.subject_hmac' : 'm.subject'}=$5
+       AND ${validityWindowsOverlapPredicateSql('m','$8','$9')}
+       AND (m.hash=$4 OR 1-(m.embedding <=> $7::vector)>=$6)
+     ORDER BY (m.hash=$4) DESC,similarity DESC NULLS LAST,m.id LIMIT 10`,
+    [input.vaultId,input.scope,input.scopeKey,hash,prepared.subjectMatch(vault,canonicalSubject),0.8,
+      JSON.stringify(input.embedding),input.validFrom,input.validUntil]);
+  const exact = rows.rows.find(row => row.polarity === input.polarity && row.type === input.type
+    && row.valid_from === input.validFrom && row.valid_until === input.validUntil
+    && prepared.decrypt(vault,row.data) === input.fact);
+  return { vault,hash,canonicalSubject,exact,related: exact ? undefined : rows.rows.find(row => row.similarity >= 0.8) };
 }
 
 async function prepareDedupCrypto(vaultId: string, db: Queryable): Promise<PreparedVaultCrypto> {
@@ -1003,11 +339,12 @@ function serializeEvidence(
   if (!input.evidence && (input.policyRejections?.length ?? 0) === 0) {
     return null;
   }
-  return mergeMemoryEvidence(
-    existingEvidence,
-    input.evidence ?? undefined,
-    input.policyRejections
-  );
+  let supplied: unknown;
+  try { supplied = input.evidence ? JSON.parse(input.evidence) : null; } catch { supplied=null; }
+  if (supplied && typeof supplied==='object' && !Array.isArray(supplied)) {
+    return mergeMemoryEvidence({...((existingEvidence && typeof existingEvidence==='object') ? existingEvidence : {}),...supplied},undefined,input.policyRejections);
+  }
+  return mergeMemoryEvidence(existingEvidence,input.evidence ?? undefined,input.policyRejections);
 }
 
 async function syncEmbeddingRecord(db: Queryable, memoryId: string, embedding: number[]) {

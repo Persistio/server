@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('customer-analytics');
 import type { AppConfig } from '../config';
 import {
   createAnalyticsSnapshotCache,
@@ -379,7 +381,7 @@ export class CustomerAnalyticsService {
     try {
       return await this.snapshotCache.getWorkspaceSummary(input);
     } catch (error) {
-      console.warn('Failed to read workspace analytics snapshot cache', { error });
+      operationalLog.warn('Failed to read workspace analytics snapshot cache', { error });
       return null;
     }
   }
@@ -392,7 +394,7 @@ export class CustomerAnalyticsService {
     try {
       await this.snapshotCache.setWorkspaceSummary(input, result);
     } catch (error) {
-      console.warn('Failed to write workspace analytics snapshot cache', { error });
+      operationalLog.warn('Failed to write workspace analytics snapshot cache', { error });
     }
   }
 
@@ -401,7 +403,7 @@ export class CustomerAnalyticsService {
     try {
       return await this.snapshotCache.getVaultMetrics(input);
     } catch (error) {
-      console.warn('Failed to read vault analytics snapshot cache', { error });
+      operationalLog.warn('Failed to read vault analytics snapshot cache', { error });
       return null;
     }
   }
@@ -414,7 +416,7 @@ export class CustomerAnalyticsService {
     try {
       await this.snapshotCache.setVaultMetrics(input, result);
     } catch (error) {
-      console.warn('Failed to write vault analytics snapshot cache', { error });
+      operationalLog.warn('Failed to write vault analytics snapshot cache', { error });
     }
   }
 
@@ -423,7 +425,7 @@ export class CustomerAnalyticsService {
     try {
       return await this.snapshotCache.getTopVaults(input);
     } catch (error) {
-      console.warn('Failed to read top-vault analytics snapshot cache', { error });
+      operationalLog.warn('Failed to read top-vault analytics snapshot cache', { error });
       return null;
     }
   }
@@ -436,7 +438,7 @@ export class CustomerAnalyticsService {
     try {
       await this.snapshotCache.setTopVaults(input, result);
     } catch (error) {
-      console.warn('Failed to write top-vault analytics snapshot cache', { error });
+      operationalLog.warn('Failed to write top-vault analytics snapshot cache', { error });
     }
   }
 

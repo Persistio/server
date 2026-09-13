@@ -76,7 +76,7 @@ describeWithPostgres('worker fencing and vault integrity (PostgreSQL)', () => {
       [vaultB, segmentA]
     )).rejects.toMatchObject({ code: '23503' });
     await expect(pool.query(
-      `INSERT INTO curation_queue (vault_id, segment_id) VALUES ($1, $2)`,
+      `INSERT INTO curation_queue (vault_id, segment_id, work_key) VALUES ($1, $2, gen_random_uuid()::text)`,
       [vaultB, segmentA]
     )).rejects.toMatchObject({ code: '23503' });
   });
@@ -84,12 +84,12 @@ describeWithPostgres('worker fencing and vault integrity (PostgreSQL)', () => {
   it('rejects cross-vault evidence, parents, and graph edges', async () => {
     const memoryA = (await pool.query<{ id: string }>(
       `INSERT INTO memories (vault_id, data, subject, hash, scope, status, source_chunks, source_segment_id)
-       VALUES ($1, 'a', 'a', $2, 'global', 'candidate', $3::uuid[], $4) RETURNING id`,
+       VALUES ($1, 'a', 'a', $2, 'global', 'active', $3::uuid[], $4) RETURNING id`,
       [vaultA, crypto.randomUUID(), [chunkA], segmentA]
     )).rows[0].id;
     const memoryB = (await pool.query<{ id: string }>(
       `INSERT INTO memories (vault_id, data, subject, hash, scope, status, source_chunks)
-       VALUES ($1, 'b', 'b', $2, 'global', 'candidate', $3::uuid[]) RETURNING id`,
+       VALUES ($1, 'b', 'b', $2, 'global', 'active', $3::uuid[]) RETURNING id`,
       [vaultB, crypto.randomUUID(), [chunkB]]
     )).rows[0].id;
 
@@ -117,7 +117,7 @@ describeWithPostgres('worker fencing and vault integrity (PostgreSQL)', () => {
       );
       await client.query(
         `INSERT INTO memories (id, vault_id, data, subject, hash, scope, status)
-         VALUES ($1, $2, 'rolled back', 'fencing', $3, 'global', 'candidate')`,
+         VALUES ($1, $2, 'rolled back', 'fencing', $3, 'global', 'active')`,
         [rolledBackMemoryId, vaultA, crypto.randomUUID()]
       );
       await client.query('ROLLBACK');

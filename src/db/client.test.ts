@@ -109,12 +109,12 @@ describe('pool error recovery', () => {
     expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
       level: 50,
       msg: 'postgres idle connection failed; removed from pool',
-      error: 'Connection terminated unexpectedly',
-      code: 'ECONNRESET',
+      error_code: 'ECONNRESET',
       total: 4,
       idle: 2,
       waiting: 1
     });
+    expect(log.mock.calls[0][0]).not.toContain('Connection terminated unexpectedly');
   });
 });
 

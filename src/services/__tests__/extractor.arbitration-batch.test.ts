@@ -57,7 +57,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
       { id: 'pair-1', existingFact: 'Old fact', newFact: 'New fact' }
     ], 'vault-1');
 
-    expect(arbitrateConflictSpy).toHaveBeenCalledWith('Old fact', 'New fact', 'vault-1');
+    expect(arbitrateConflictSpy).toHaveBeenCalledWith('Old fact', 'New fact', 'vault-1', undefined);
     expect(result).toEqual(new Map([['pair-1', 'merge']]));
     expect(createMock).not.toHaveBeenCalled();
   });
@@ -128,7 +128,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
 
   it.each([
     ['explanatory text', 'The answer is MERGE because they overlap.'],
-    ['unknown text', 'KEEP_BOTH'],
+    ['unknown text', 'NEEDS_REVIEW'],
     ['empty text', '']
   ])('rejects %s instead of interpreting a substring or defaulting', async (_label, content) => {
     createMock.mockResolvedValue({
@@ -143,7 +143,7 @@ describe('ExtractorService.arbitrateConflictsBatch', () => {
   it.each([
     ['omitted', '["merge"]'],
     ['extra', '["merge","discard_new","needs_review"]'],
-    ['unknown', '["merge","keep_both"]']
+    ['unknown', '["merge","needs_review"]']
   ])('rejects %s batch decisions without returning a mutable fallback', async (_label, content) => {
     createMock.mockResolvedValue({
       usage: undefined,

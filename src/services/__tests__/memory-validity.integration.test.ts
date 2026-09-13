@@ -12,14 +12,12 @@ describeWithPostgres('memory validity lifecycle (PostgreSQL)', () => {
   const testPool = new Pool({ connectionString: databaseUrl });
   const vaultId = crypto.randomUUID();
   let archiveStaleMemories: () => Promise<void>;
-  let evidenceRecallSql: () => string;
   let closeDefaultPool = async () => {};
 
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
     ({ closePool: closeDefaultPool } = await import('../../db/client'));
     ({ archiveStaleMemories } = await import('../staleness'));
-    ({ evidenceRecallSql } = await import('../../routes/recall'));
 
     await testPool.query(
       `INSERT INTO vaults (id, name, api_key_hash)
@@ -72,19 +70,7 @@ describeWithPostgres('memory validity lifecycle (PostgreSQL)', () => {
     )).rejects.toMatchObject({ code: '23514' });
   });
 
-  it('executes the evidence authority and validity recheck SQL on PostgreSQL', async () => {
-    const result = await testPool.query(
-      evidenceRecallSql(),
-      [
-        JSON.stringify([]), vaultId, 200, false, new Date().toISOString(), 'approved_only',
-        new Date().toISOString().slice(0, 10), null, null, null, false, new Date().toISOString()
-      ]
-    );
-
-    expect(result.rows).toEqual([]);
-  });
-
-  it('archives only rows whose end date is before the current UTC date', async () => {
+  it('does not archive historical facts merely because applicability ended', async () => {
     await testPool.query(
       `INSERT INTO memories (vault_id, data, subject, hash, scope, scope_key, valid_until)
        VALUES
@@ -106,7 +92,7 @@ describeWithPostgres('memory validity lifecycle (PostgreSQL)', () => {
     );
     expect(result.rows).toEqual([
       { data: 'future-cleanup', archived: false },
-      { data: 'past-cleanup', archived: true },
+      { data: 'past-cleanup', archived: false },
       { data: 'today-cleanup', archived: false },
       { data: 'unbounded-cleanup', archived: false }
     ]);

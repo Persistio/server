@@ -39,6 +39,10 @@ async function parseConfig(overrides: NodeJS.ProcessEnv = {}) {
 }
 
 describe('config environment normalization', () => {
+  it('refuses raw provider debug logging before any provider client can be constructed',async()=>{
+    await expect(parseConfig({DEBUG:'true'})).rejects.toThrow('Raw provider debug logging must be disabled');
+    await expect(parseConfig({DEBUG:'false'})).resolves.toBeDefined();
+  });
   beforeEach(() => {
     vi.resetModules();
     process.env = { ...baseEnv() };
@@ -85,10 +89,10 @@ describe('config environment normalization', () => {
     expect(custom.RAW_CHUNK_RECONCILE_BATCH_SIZE).toBe(25);
   });
 
-  it('defaults global behavioral recall to approved-only and validates emergency modes', async () => {
-    expect((await parseConfig()).GLOBAL_RULE_POLICY).toBe('approved_only');
-    expect((await parseConfig({ GLOBAL_RULE_POLICY: 'off' })).GLOBAL_RULE_POLICY).toBe('off');
-    expect((await parseConfig({ GLOBAL_RULE_POLICY: 'legacy' })).GLOBAL_RULE_POLICY).toBe('legacy');
+  it('has no approval policy or automatic ageing configuration', async () => {
+    expect(await parseConfig()).not.toHaveProperty('GLOBAL_RULE_POLICY');
+    expect((await parseConfig()).MEMORY_ARCHIVE_TTL_DAYS).toBe(0);
+    expect(await parseConfig()).not.toHaveProperty('CONFIDENCE_DECAY_RATE');
   });
 
   it('keeps storage embedding dimensions upgrade-safe by default', async () => {
@@ -187,6 +191,11 @@ describe('config environment normalization', () => {
 
     expect(config.PLATFORM_AUTH_MODE).toBe('api_key');
     expect(config.PLATFORM_OAUTH_CLIENT_POLICIES).toBe('');
+  });
+
+  it('has no global arbitration configuration',async()=>{
+    const config=await parseConfig();
+    expect(Object.keys(config).filter(key=>key.startsWith('GLOBAL_ARBITRATION_'))).toEqual([]);
   });
 
   it('requires OAuth issuer and audience in platform OAuth mode', async () => {

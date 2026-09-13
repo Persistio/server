@@ -39,20 +39,6 @@ export function scopeKeyForContext(scope: MemoryScope, context: RecallContext): 
   return parsed.success && parsed.data === key ? parsed.data : null;
 }
 
-export function canIncludeGlobalRules(
-  requested: boolean,
-  mode: 'agent' | 'factual',
-  context: RecallContext
-): boolean {
-  return requested
-    && mode === 'agent'
-    && Boolean(context.agent_id)
-    && (context.trigger_type === 'direct'
-      || context.trigger_type === 'delegated'
-      || context.trigger_type === 'event'
-      || context.trigger_type === 'api');
-}
-
 export interface ApplicableMemory {
   type: string | null;
   scope: MemoryScope;
@@ -65,7 +51,6 @@ export interface ApplicableMemory {
 export function isMemoryApplicable(
   memory: ApplicableMemory,
   context: RecallContext,
-  includeGlobalRules: boolean,
   now = new Date()
 ): boolean {
   if (memory.sensitivity === 'restricted' || !(memory.confidence > 0 && memory.confidence <= 1)) {
@@ -78,7 +63,7 @@ export function isMemoryApplicable(
     }
   }
   if (memory.scope === 'global') {
-    return memory.scope_key == null && (memory.type !== 'user_rule' || includeGlobalRules);
+    return memory.scope_key == null;
   }
   const expectedKey = scopeKeyForContext(memory.scope, context);
   return expectedKey !== null && memory.scope_key === expectedKey;
@@ -88,14 +73,10 @@ export function memoryApplicabilityPredicateSql(
   memoryAlias: string,
   sessionParameter: string,
   projectParameter: string,
-  taskParameter: string,
-  includeGlobalRulesParameter: string
+  taskParameter: string
 ): string {
   return `(
-    (${memoryAlias}.scope = 'global' AND ${memoryAlias}.scope_key IS NULL AND (
-      ${memoryAlias}.type IS DISTINCT FROM 'user_rule'
-      OR ${includeGlobalRulesParameter}::boolean
-    ))
+    (${memoryAlias}.scope = 'global' AND ${memoryAlias}.scope_key IS NULL)
     OR (${memoryAlias}.scope = 'project' AND ${memoryAlias}.scope_key IS NOT NULL AND ${memoryAlias}.scope_key = ${projectParameter}::text)
     OR (${memoryAlias}.scope = 'task' AND ${memoryAlias}.scope_key IS NOT NULL AND ${memoryAlias}.scope_key = ${taskParameter}::text)
     OR (${memoryAlias}.scope = 'session' AND ${memoryAlias}.scope_key IS NOT NULL AND ${memoryAlias}.scope_key = ${sessionParameter}::text)

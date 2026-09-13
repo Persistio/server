@@ -1,3 +1,6 @@
+import { createOperationalLogger } from '../operational-metadata';
+import { safeErrorCode } from '../operational-metadata';
+const operationalLog=createOperationalLogger('client');
 import fs from 'node:fs';
 import path from 'node:path';
 import { isMainThread, workerData } from 'node:worker_threads';
@@ -72,16 +75,14 @@ export const pool = new Pool({
 
 export function createPoolErrorHandler(
   poolState: Pick<Pool, 'totalCount' | 'idleCount' | 'waitingCount'>,
-  log: (message: string) => void = console.error
+  log: (message: string) => void = operationalLog.error
 ): (error: Error) => void {
   return (error) => {
     const code = (error as Error & { code?: unknown }).code;
     log(JSON.stringify({
       level: 50,
       msg: 'postgres idle connection failed; removed from pool',
-      error: error.message,
-      stack: error.stack,
-      code: typeof code === 'string' ? code : undefined,
+      error_code: safeErrorCode(error),
       total: poolState.totalCount,
       idle: poolState.idleCount,
       waiting: poolState.waitingCount
@@ -245,7 +246,7 @@ export function warnIfPoolNearExhaustion(now = Date.now()) {
   }
 
   lastPoolWarningAt = now;
-  console.warn(JSON.stringify({
+  operationalLog.warn(JSON.stringify({
     level: 40,
     msg: 'postgres pool nearing capacity',
     total: pool.totalCount,

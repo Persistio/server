@@ -24,8 +24,8 @@ describe.skipIf(!databaseUrl)('production worker lease lifecycle (PostgreSQL)', 
     vaults.push(vault);
     await pool.query('INSERT INTO vaults(id,name,api_key_hash) VALUES ($1,$2,$3)', [vault, 'lease-regression', crypto.randomUUID()]);
     await pool.query("INSERT INTO segments(id,vault_id,session_id,chunk_ids) VALUES ($1,$2,'lease','{}')", [segment, vault]);
-    await pool.query(`INSERT INTO ${kind}_queue(id,vault_id,segment_id,claimed_at,claimed_by,claim_token,lease_expires_at)
-      VALUES ($1,$2,$3,now(),'worker',$4,now()+interval '10 minutes')`, [queueId, vault, segment, claimToken]);
+    await pool.query(`INSERT INTO ${kind}_queue(id,vault_id,segment_id,claimed_at,claimed_by,claim_token,lease_expires_at${kind==='curation'?',work_key':''})
+      VALUES ($1,$2,$3,now(),'worker',$4,now()+interval '10 minutes'${kind==='curation'?',gen_random_uuid()::text':''})`, [queueId, vault, segment, claimToken]);
     if (kind === 'curation') await pool.query(`INSERT INTO vault_curation_state(vault_id,curator_claimed_by,curator_claim_token,curator_claimed_until)
       VALUES ($1,'worker',$2,now()+interval '10 minutes')`, [vault, vaultClaimToken]);
     const lease: import('../worker-lease').WorkerLease = kind === 'curation'

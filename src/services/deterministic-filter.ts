@@ -47,7 +47,7 @@ const implementationDetailPatterns = [
 export function filterMemoryCandidates<TFact extends ExtractedFact>(candidates: TFact[]): CandidateFilterResult<TFact> {
   const accepted: Array<FilteredCandidate<TFact>> = [];
   const dropped: Array<DroppedCandidate<TFact>> = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, FilteredCandidate<TFact>>();
 
   for (const fact of candidates) {
     const normalizedFact = normalizeCandidateText(fact.fact);
@@ -64,13 +64,17 @@ export function filterMemoryCandidates<TFact extends ExtractedFact>(candidates: 
       continue;
     }
 
-    const hashInput = `${normalizedSubject}:${normalizedFact}`;
+    // Equal prose in different temporal states/types is not duplicate knowledge.
+    // Exact duplicates retain every cited source, not just the first item seen.
+    const hashInput = JSON.stringify([normalizedSubject, normalizedFact, fact.scope,
+      fact.type, fact.polarity, fact.valid_from, fact.valid_until, fact.sensitivity]);
     const hash = crypto.createHash('sha256').update(hashInput).digest('hex');
-    if (seen.has(hash)) {
+    const duplicate = seen.get(hash);
+    if (duplicate) {
+      duplicate.fact.source_refs = [...new Set([...(duplicate.fact.source_refs ?? []), ...(fact.source_refs ?? [])])];
       dropped.push({ fact, reason: 'duplicate' });
       continue;
     }
-    seen.add(hash);
 
     if (isImplementationDetail(normalizedFact)) {
       dropped.push({ fact, reason: 'implementation_detail' });
@@ -82,7 +86,7 @@ export function filterMemoryCandidates<TFact extends ExtractedFact>(candidates: 
       continue;
     }
 
-    accepted.push({
+    const candidate: FilteredCandidate<TFact> = {
       fact: {
         ...fact,
         fact: fact.fact.trim(),
@@ -90,7 +94,9 @@ export function filterMemoryCandidates<TFact extends ExtractedFact>(candidates: 
       } as TFact,
       normalizedFact,
       hash
-    });
+    };
+    seen.set(hash, candidate);
+    accepted.push(candidate);
   }
 
   return { accepted, dropped };

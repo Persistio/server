@@ -83,7 +83,7 @@ export function setCustomerMetricVaultId(request: FastifyRequest, vaultId: strin
 }
 
 export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: FastifyReply): void {
-  const route = request.routeOptions.url ?? request.url;
+  const route = request.routeOptions.url ?? '/unmatched';
   const operation = customerMetricOperationForRoute(route, request.method);
   if (!operation) return;
 

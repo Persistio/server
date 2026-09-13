@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  canIncludeGlobalRules,
   contextIdentitySchema,
   isMemoryApplicable,
   memoryApplicabilityPredicateSql,
@@ -41,31 +40,29 @@ describe('memory applicability', () => {
   });
   it('requires exact bound identities and rejects unbound legacy rows', () => {
     const now = new Date('2026-09-09T10:01:00.000Z');
-    expect(isMemoryApplicable(base, { project_id: 'project-a' }, false, now)).toBe(true);
-    expect(isMemoryApplicable(base, { project_id: 'project-b' }, false, now)).toBe(false);
-    expect(isMemoryApplicable({ ...base, scope_key: null }, { project_id: 'project-a' }, false, now)).toBe(false);
-    expect(isMemoryApplicable({ ...base, scope: 'task', scope_key: 'task-a' }, { project_id: 'project-a', task_id: 'task-a' }, false, now)).toBe(true);
-    expect(isMemoryApplicable({ ...base, scope: 'session', scope_key: 'session-a' }, { session_id: 'session-b' }, false, now)).toBe(false);
+    expect(isMemoryApplicable(base, { project_id: 'project-a' }, now)).toBe(true);
+    expect(isMemoryApplicable(base, { project_id: 'project-b' }, now)).toBe(false);
+    expect(isMemoryApplicable({ ...base, scope_key: null }, { project_id: 'project-a' }, now)).toBe(false);
+    expect(isMemoryApplicable({ ...base, scope: 'task', scope_key: 'task-a' }, { project_id: 'project-a', task_id: 'task-a' }, now)).toBe(true);
+    expect(isMemoryApplicable({ ...base, scope: 'session', scope_key: 'session-a' }, { session_id: 'session-b' }, now)).toBe(false);
   });
 
-  it('requires deliberate identified non-scheduled agent opt-in for global rules', () => {
-    expect(canIncludeGlobalRules(false, 'agent', { agent_id: 'main', trigger_type: 'direct' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'factual', { agent_id: 'main', trigger_type: 'direct' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'agent', { trigger_type: 'direct' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'agent', { agent_id: 'main' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'agent', { agent_id: 'main', trigger_type: 'scheduled' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'agent', { agent_id: 'main', trigger_type: 'unknown' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'agent', { agent_id: 'main', trigger_type: 'backfill' })).toBe(false);
-    expect(canIncludeGlobalRules(true, 'agent', { agent_id: 'main', trigger_type: 'direct' })).toBe(true);
+  it('makes vault-wide memories eligible across sessions without a rule policy', () => {
+    const now = new Date('2026-09-09T10:01:00.000Z');
+    for (const type of ['system_fact', 'user_preference', 'user_rule']) {
+      const memory = { ...base, type, scope: 'global' as const, scope_key: null };
+      expect(isMemoryApplicable(memory, {session_id:'another-session'}, now)).toBe(true);
+      expect(isMemoryApplicable({...memory,scope_key:'invalid'}, {}, now)).toBe(false);
+    }
   });
 
   it('excludes restricted, invalid-confidence, and future-dated memories', () => {
     const now = new Date('2026-09-09T10:01:00.000Z');
     const context = { project_id: 'project-a' };
-    expect(isMemoryApplicable({ ...base, sensitivity: 'restricted' }, context, false, now)).toBe(false);
-    expect(isMemoryApplicable({ ...base, confidence: 0 }, context, false, now)).toBe(false);
-    expect(isMemoryApplicable({ ...base, confidence: Number.NaN }, context, false, now)).toBe(false);
-    expect(isMemoryApplicable({ ...base, source_timestamp: '2026-09-09T10:07:00.000Z' }, context, false, now)).toBe(false);
+    expect(isMemoryApplicable({ ...base, sensitivity: 'restricted' }, context, now)).toBe(false);
+    expect(isMemoryApplicable({ ...base, confidence: 0 }, context, now)).toBe(false);
+    expect(isMemoryApplicable({ ...base, confidence: Number.NaN }, context, now)).toBe(false);
+    expect(isMemoryApplicable({ ...base, source_timestamp: '2026-09-09T10:07:00.000Z' }, context, now)).toBe(false);
   });
 
   it('strictly validates structured context instead of interpreting prompt text', () => {
@@ -75,11 +72,11 @@ describe('memory applicability', () => {
   });
 
   it('emits a fail-closed SQL predicate for every scoped retrieval path', () => {
-    const sql = memoryApplicabilityPredicateSql('m', '$1', '$2', '$3', '$4');
+    const sql = memoryApplicabilityPredicateSql('m', '$1', '$2', '$3');
     expect(sql).toContain("m.scope = 'project'");
     expect(sql).toContain('m.scope_key IS NOT NULL');
     expect(sql).toContain('m.scope_key = $2::text');
-    expect(sql).toContain("m.type IS DISTINCT FROM 'user_rule'");
-    expect(sql).toContain('$4::boolean');
+    expect(sql).toContain("m.scope = 'global' AND m.scope_key IS NULL");
+    expect(sql).not.toContain('user_rule');
   });
 });

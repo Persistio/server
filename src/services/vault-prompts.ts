@@ -79,7 +79,7 @@ export function validateCustomPrompt(role: PromptRole, prompt: string | null | u
   if (Buffer.byteLength(value, 'utf8') > maxBytes) {
     const maxLabel = role === 'curation' ? '24KB' : '64KB';
     const reason = role === 'curation'
-      ? ' so each curator call still has room for candidate memories, active memories, and raw conversation'
+      ? ' so each curator call still has room for complete active memories and supporting sources'
       : '';
     feedback.push(`Shorten the ${role} prompt to ${maxLabel} or less${reason}.`);
   }
@@ -96,8 +96,8 @@ export function validateCustomPrompt(role: PromptRole, prompt: string | null | u
     if (value && !/\b(fact|subject|score|salience)\b/i.test(value)) {
       feedback.push('Mention the extraction schema fields such as fact, subject, score, and salience.');
     }
-  } else if (value && !/\b(nodes_to_create|nodes_to_update|discarded_candidates|edges_to_create)\b/i.test(value)) {
-    feedback.push('Mention the curation schema fields such as nodes_to_create, nodes_to_update, edges_to_create, and discarded_candidates.');
+  } else if (value && !/\b(keep|update|consolidate|archive|edges|scope_changes)\b/i.test(value)) {
+    feedback.push('Mention the curation schema fields keep, update, consolidate, archive, edges, and scope_changes.');
   }
 
   for (const guard of INJECTION_PATTERNS) {

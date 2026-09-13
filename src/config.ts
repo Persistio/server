@@ -123,17 +123,14 @@ const configSchema = z.object({
   SEGMENTATION_THRESHOLD: z.coerce.number().min(0).max(1).default(0.75),
   DEFAULT_TOKEN_BUDGET: z.coerce.number().int().positive().default(2000),
   DEFAULT_RECALL_TOP_K: z.coerce.number().int().positive().default(10),
-  GLOBAL_RULE_POLICY: z.enum(['off', 'approved_only', 'legacy']).default('approved_only'),
   MIN_RECALL_SIMILARITY: z.coerce.number().min(0).max(1).default(0.30),
   CIRCUIT_BREAKER_THRESHOLD: z.coerce.number().int().positive().default(3),
   CIRCUIT_BREAKER_PROBE_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
   CIRCUIT_BREAKER_MAX_PROBE_INTERVAL_MS: z.coerce.number().int().positive().default(600000),
-  MEMORY_ARCHIVE_TTL_DAYS: z.coerce.number().int().positive().default(90),
+  MEMORY_ARCHIVE_TTL_DAYS: z.coerce.number().int().nonnegative().default(0),
   CONTRADICTION_SCAN_ENABLED: booleanFlag,
   CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH: z.coerce.number().int().positive().default(20),
   CONTRADICTION_SCAN_MIN_SIMILARITY: z.coerce.number().min(0).max(1).default(0.70),
-  CONFIDENCE_DECAY_INTERVAL_DAYS: z.coerce.number().int().positive().default(30),
-  CONFIDENCE_DECAY_AUTO_ARCHIVE_SALIENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.3),
   SUBJECT_INJECTION_TOP_N: z.coerce.number().int().positive().default(10),
   SUBJECT_INJECTION_RECENT_N: z.coerce.number().int().positive().default(10),
   SUBJECT_TEXT_MATCH_DISTANCE: z.coerce.number().int().min(0).default(2),
@@ -391,6 +388,7 @@ export type AppConfig = z.infer<typeof configSchema>;
 let cachedConfig: AppConfig | undefined;
 
 export function getConfig(): AppConfig {
+  if(process.env.DEBUG==='true')throw new Error('Raw provider debug logging must be disabled');
   cachedConfig ??= configSchema.parse(normalizeConfigEnv(process.env));
   return cachedConfig;
 }

@@ -30,8 +30,6 @@ function mockStatsRows() {
   queryMock.mockResolvedValueOnce({
     rows: [{
       active: '10',
-      candidate: '2',
-      needs_review: '1',
       contradicted: '0',
       superseded: '4',
       archived: '5',
@@ -56,7 +54,7 @@ describe('getVaultStats', () => {
     )).resolves.toMatchObject({
       vault_id: 'dff718f2-9d97-43b2-a3cc-a14099ed42c3',
       plan: 'unlimited',
-      memories: { active: 10, candidate: 2, superseded: 4, archived: 5, capacity_used: 14, limit: 25 }
+      memories: { active: 10, superseded: 4, archived: 5, capacity_used: 14, limit: 25 }
     });
 
     expect(queryMock).toHaveBeenNthCalledWith(

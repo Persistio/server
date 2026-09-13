@@ -1,3 +1,5 @@
+import { createOperationalLogger } from './operational-metadata';
+const operationalLog=createOperationalLogger('preload');
 // IMPORTANT: This file must have no imports before telemetry is initialised.
 // It is loaded via node --require before the application entrypoints.
 import { useAzureMonitor, useOtlpTelemetry } from './azure-monitor';
@@ -17,9 +19,9 @@ switch (provider) {
           postgreSql: { enabled: true }
         }
       });
-      console.log('[persistio] OpenTelemetry: Azure Monitor initialised');
+      operationalLog.log('[persistio] OpenTelemetry: Azure Monitor initialised');
     } else {
-      console.log('[persistio] OpenTelemetry: APPLICATIONINSIGHTS_CONNECTION_STRING not set, telemetry disabled');
+      operationalLog.log('[persistio] OpenTelemetry: APPLICATIONINSIGHTS_CONNECTION_STRING not set, telemetry disabled');
     }
     break;
   case 'gcp_otlp':
@@ -34,13 +36,13 @@ switch (provider) {
         postgreSql: { enabled: true }
       }
     });
-    console.log('[persistio] OpenTelemetry: OTLP HTTP initialised');
+    operationalLog.log('[persistio] OpenTelemetry: OTLP HTTP initialised');
     break;
   case 'none':
-    console.log('[persistio] OpenTelemetry: telemetry disabled');
+    operationalLog.log('[persistio] OpenTelemetry: telemetry disabled');
     break;
   default:
-    console.log(`[persistio] OpenTelemetry: unknown TELEMETRY_PROVIDER=${provider}, telemetry disabled`);
+    operationalLog.log(`[persistio] OpenTelemetry: unknown TELEMETRY_PROVIDER=${provider}, telemetry disabled`);
 }
 
 function getTelemetryProvider(): string {

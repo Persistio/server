@@ -17,6 +17,8 @@ function candidate(overrides: Pick<ExtractedFact, 'fact' | 'subject'> & Partial<
     evidence: null,
     valid_from: null,
     valid_until: null,
+    source_refs: ['S1'],
+    scope_basis: 'Explicit project source',
     ...overrides
   };
 }
@@ -63,6 +65,18 @@ describe('filterMemoryCandidates', () => {
 
     assert.deepEqual(result.dropped.map((item) => item.reason), ['secret_like', 'secret_like']);
     assert.equal(result.accepted.length, 0);
+  });
+
+  it('retains dated states and unions citations for genuinely duplicate knowledge', () => {
+    const base={fact:'The project uses PostgreSQL.',subject:'Project database'};
+    const result=filterMemoryCandidates([
+      candidate({...base,source_refs:['S1'],valid_from:'2020-01-01',valid_until:'2020-12-31'}),
+      candidate({...base,source_refs:['S2'],valid_from:'2020-01-01',valid_until:'2020-12-31'}),
+      candidate({...base,source_refs:['S3'],valid_from:'2025-01-01',valid_until:null})
+    ]);
+    assert.equal(result.accepted.length,2);
+    assert.deepEqual(result.accepted[0].fact.source_refs,['S1','S2']);
+    assert.deepEqual(result.accepted[1].fact.source_refs,['S3']);
   });
 
   it('does not treat benign high-entropy identifiers as secrets', () => {

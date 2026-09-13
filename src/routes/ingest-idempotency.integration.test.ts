@@ -5,13 +5,15 @@ import Fastify from 'fastify';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fixture = vi.hoisted(() => ({
-  vaultId: '', loseCommit: false, storageUnavailable: false, blobs: new Map<string, string>(),
-  embed: vi.fn(), put: vi.fn(), get: vi.fn(), remove: vi.fn()
+  vaultId: '', loseCommit: false, loseReplay: false, storageUnavailable: false, blobs: new Map<string, string>(),
+  embed: vi.fn(), put: vi.fn(), get: vi.fn(), remove: vi.fn(), unwrap:vi.fn(),
+  encryptedDek:null as string|null, encryptionEnabled:false
 }));
 vi.mock('../middleware/auth', () => ({ requireVaultWriteAuth: async (request: { vault: unknown }) => {
   request.vault = { id: fixture.vaultId, name: 'ingest test', purpose: null, settings: {}, plan_id: 'unlimited',
-    status: 'active', encrypted_dek: null, vault_encryption_enabled: false };
+    status: 'active', encrypted_dek: fixture.encryptedDek, vault_encryption_enabled: fixture.encryptionEnabled };
 } }));
+vi.mock('@google-cloud/kms',()=>({KeyManagementServiceClient:class {decrypt=fixture.unwrap;}}));
 vi.mock('../services/embedder', () => ({
   OPENAI_EMBEDDING_MAX_TOKENS_PER_INPUT: 8192, estimateEmbeddingTokens: (s: string) => s.length,
   getEmbedder: () => ({ embedBatch: fixture.embed })
@@ -28,8 +30,15 @@ vi.mock('../db/client', async original => {
   return { ...actual, withTransaction: async <T>(run: Parameters<typeof actual.withTransaction<T>>[0]) => {
     let wroteRaw = false;
     const result = await actual.withTransaction(client => run(Object.assign(Object.create(client), {
-      query: (sql: string, values?: unknown[]) => {
+      query: async (sql: string, values?: unknown[]) => {
         if (sql.includes('WITH input AS')) wroteRaw = true;
+        if(fixture.loseReplay && sql==='SELECT id FROM vaults WHERE id = $1 FOR UPDATE'){
+          fixture.loseReplay=false;
+          const result=await client.query(sql,values);
+          await client.query('DELETE FROM segments WHERE vault_id=$1',[fixture.vaultId]);
+          await client.query('DELETE FROM raw_chunks WHERE vault_id=$1',[fixture.vaultId]);
+          return result;
+        }
         return client.query(sql, values);
       }
     })));
@@ -40,9 +49,9 @@ vi.mock('../db/client', async original => {
 
 import { pool } from '../db/client';
 import { registerIngestRoutes } from './ingest';
+import { registerPlatformErrorHandler } from '../http-error-handler';
 import { cleanupRawChunkWrite, registerRawChunkWrites, beginRawChunkUploads, MAX_OUTSTANDING_RAW_CHUNK_WRITES_PER_VAULT } from '../services/raw-chunk-write-lifecycle';
 import { reconcileStaleRawChunkBlobWrites } from '../services/raw-chunk-blob-reconciler';
-import { ingestPayloadHash } from '../services/ingest-replay';
 
 const databaseUrl = process.env.PERSISTIO_TEST_DATABASE_URL;
 describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', () => {
@@ -52,7 +61,7 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
   const chunk = (id = 'message', content = 'durable payload') => ({ role: 'user' as const, content,
     timestamp: '2026-06-01T00:00:00.000Z', source_event: { namespace: 'integration', id, ordinal: 0 } });
   const post = (chunks = [chunk()], url = '/v1/ingest') => app.inject({ method: 'POST', url,
-    payload: { session_id: 'test-session', chunks } });
+    payload: { session_id: 'test-session', context:{trigger_type:'backfill'}, chunks } });
   const counts = async () => (await pool.query(
     `SELECT (SELECT count(*)::int FROM raw_chunks WHERE vault_id=$1) AS raw,
       (SELECT count(*)::int FROM segments WHERE vault_id=$1) AS segments,
@@ -62,15 +71,20 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
   )).rows[0];
 
   beforeAll(async () => {
-    if (databaseUrl !== process.env.DATABASE_URL || !new URL(databaseUrl!).pathname.includes('pr369')) {
-      throw new Error('Use the same isolated pr369 database for DATABASE_URL and PERSISTIO_TEST_DATABASE_URL');
+    registerPlatformErrorHandler(app);
+    const parsed=new URL(databaseUrl!);
+    if (databaseUrl !== process.env.DATABASE_URL || !['localhost','127.0.0.1'].includes(parsed.hostname)
+      || !/^\/(persistio_test_pr369|persistio_restoration_\d{8}_[a-z])$/.test(parsed.pathname)) {
+      throw new Error('Use the same approved isolated loopback test database for both database variables');
     }
     const migrated = await pool.query("SELECT 1 FROM schema_migrations WHERE filename='055_raw_chunk_write_ownership.sql'");
     if (!migrated.rowCount) throw new Error('Apply migration 055 to the isolated test database first');
     await registerIngestRoutes(app, triggerExtraction);
   });
   beforeEach(async () => {
-    fixture.vaultId = crypto.randomUUID(); fixture.loseCommit = false; fixture.blobs.clear();
+    fixture.encryptedDek=null;fixture.encryptionEnabled=false;
+    (await import('../config')).getConfig().ENCRYPTION_ENABLED=false;
+    fixture.vaultId = crypto.randomUUID(); fixture.loseCommit = false; fixture.loseReplay=false; fixture.blobs.clear();
     fixture.storageUnavailable = false;
     triggerExtraction.mockReset();
     fixture.embed.mockReset().mockImplementation(async (texts: string[]) => texts.map(() => [1, ...Array(1535).fill(0)]));
@@ -132,23 +146,6 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     expect((await counts()).charges).toBe(1); expect(fixture.blobs.size).toBe(1);
   });
 
-  it('attests a legacy sentinel from the original blob, never the conflicting claimant', async () => {
-    expect((await post()).statusCode).toBe(202);
-    await pool.query("UPDATE raw_chunks SET source_event_payload_sha256=repeat('0',64) WHERE vault_id=$1", [fixture.vaultId]);
-    expect((await post([chunk('message', 'rogue replacement')])).statusCode).toBe(409);
-    const stored = (await pool.query('SELECT source_event_payload_sha256 FROM raw_chunks WHERE vault_id=$1', [fixture.vaultId])).rows[0];
-    expect(stored.source_event_payload_sha256).toBe(ingestPayloadHash(chunk()));
-    expect((await post()).statusCode).toBe(202); expect(fixture.get).toHaveBeenCalledTimes(1);
-    expect(fixture.embed).toHaveBeenCalledTimes(1);
-  });
-
-  it('fails closed when legacy original storage is missing', async () => {
-    expect((await post()).statusCode).toBe(202); fixture.blobs.clear();
-    await pool.query("UPDATE raw_chunks SET source_event_payload_sha256=repeat('0',64) WHERE vault_id=$1", [fixture.vaultId]);
-    expect((await post()).statusCode).toBe(503);
-    expect((await counts()).charges).toBe(1); expect(fixture.put).toHaveBeenCalledTimes(1);
-  });
-
   it('catches a live PUT completing after cleanup takeover', async () => {
     let started!: () => void, release!: () => void, key = '';
     const putStarted = new Promise<void>(r => { started = r; }); const finishPut = new Promise<void>(r => { release = r; });
@@ -195,6 +192,13 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     expect(fixture.embed).not.toHaveBeenCalled();
     expect(fixture.put).not.toHaveBeenCalled();
   });
+  it('preserves 503 if an accepted replay disappears between preflight and locked verification',async()=>{
+    expect((await post()).statusCode).toBe(202);
+    fixture.loseReplay=true;
+    const res=await post();expect(res.statusCode,res.body).toBe(503);
+    expect(res.json()).toEqual({error:'Internal server error',code:'http_503'});
+    expect(await counts()).toEqual({raw:1,segments:1,queue:1,intents:0,charges:1});
+  });
 
   it.each(['failed', 'completed', 'deleted'])('bulk replay preserves acceptance when submission metadata is %s', async status => {
     const original = await post([chunk()], '/v1/ingest/bulk');
@@ -230,42 +234,6 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     expect((await pool.query('SELECT status FROM jobs WHERE id=$1', [groupedReplay.json().job_id])).rows[0].status).toBe('completed');
     expect(triggerExtraction).toHaveBeenCalledTimes(url.endsWith('bulk') ? 2 : 0);
     expect(await counts()).toEqual({ raw: 2, segments: 2, queue: 2, intents: 0, charges: 2 });
-  });
-
-  it('does not let opposing concurrent legacy claimants certify their submitted content', async () => {
-    expect((await post()).statusCode).toBe(202);
-    await pool.query("UPDATE raw_chunks SET source_event_payload_sha256=repeat('0',64) WHERE vault_id=$1", [fixture.vaultId]);
-    let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; }); let reads = 0;
-    fixture.get.mockImplementation(async (key: string) => {
-      if (++reads === 2) release(); await barrier; return fixture.blobs.get(key)!;
-    });
-    const [legitimate, conflicting] = await Promise.all([post(), post([chunk('message', 'conflicting claimant')])]);
-    expect(legitimate.statusCode, legitimate.body).toBe(202);
-    expect(conflicting.statusCode, conflicting.body).toBe(409);
-    expect((await pool.query('SELECT source_event_payload_sha256 FROM raw_chunks WHERE vault_id=$1', [fixture.vaultId])).rows[0])
-      .toEqual({ source_event_payload_sha256: ingestPayloadHash(chunk()) });
-    expect(fixture.embed).toHaveBeenCalledTimes(1);
-    expect(await counts()).toEqual({ raw: 1, segments: 1, queue: 1, intents: 0, charges: 1 });
-  });
-
-  it('discards legacy proof if its stored blob reference changes before the proof lock', async () => {
-    expect((await post()).statusCode).toBe(202);
-    await pool.query("UPDATE raw_chunks SET source_event_payload_sha256=repeat('0',64) WHERE vault_id=$1", [fixture.vaultId]);
-    fixture.get.mockImplementationOnce(async (key: string) => {
-      await pool.query("UPDATE raw_chunks SET blob_key='changed-original' WHERE vault_id=$1", [fixture.vaultId]);
-      return fixture.blobs.get(key)!;
-    });
-    const response = await post(); expect(response.statusCode, response.body).toBe(503);
-    expect((await pool.query('SELECT source_event_payload_sha256 FROM raw_chunks WHERE vault_id=$1', [fixture.vaultId])).rows[0])
-      .toEqual({ source_event_payload_sha256: '0'.repeat(64) });
-    expect(fixture.put).toHaveBeenCalledTimes(1);
-  });
-
-  it('never sends a legacy proof read to the wrong provider', async () => {
-    expect((await post()).statusCode).toBe(202);
-    await pool.query("UPDATE raw_chunks SET source_event_payload_sha256=repeat('0',64),blob_store='gcs' WHERE vault_id=$1", [fixture.vaultId]);
-    expect((await post()).statusCode).toBe(503);
-    expect(fixture.get).not.toHaveBeenCalled(); expect(fixture.put).toHaveBeenCalledTimes(1);
   });
 
   it('defers a large rollback cleanup without losing ownership or the quota error', async () => {
@@ -317,4 +285,56 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     expect((await pool.query(`SELECT column_name FROM information_schema.columns
       WHERE table_name='raw_chunk_blob_write_intents' AND column_name IN ('revoked','write_phase')`)).rows).toHaveLength(2);
   });
+  it('refuses accepted metadata changes instead of repairing or reattesting history',async()=>{
+    expect((await post()).statusCode).toBe(202);
+    for(const assignment of ["source_event_payload_sha256=repeat('0',64)","blob_key='replacement'","blob_store='gcs'","capture_context='{}'::jsonb","role='assistant'"]) {
+      await expect(pool.query('UPDATE raw_chunks SET '+assignment+' WHERE vault_id=$1',[fixture.vaultId]))
+        .rejects.toThrow(/Accepted source metadata is immutable/);
+    }
+    fixture.blobs.clear();
+    expect((await post()).statusCode).toBe(202);
+    expect(fixture.get).not.toHaveBeenCalled();expect(fixture.put).toHaveBeenCalledTimes(1);
+  });
+  it('rejects changed payload or capture context under the same identity without provider work',async()=>{
+    expect((await post()).statusCode).toBe(202);
+    expect((await post([chunk('message','Conflicting submitted content')])).statusCode).toBe(409);
+    const response=await app.inject({method:'POST',url:'/v1/ingest',payload:{session_id:'test-session',
+      context:{trigger_type:'backfill',project_id:'different'},chunks:[chunk()]}});
+    expect(response.statusCode).toBe(409);
+    expect(fixture.get).not.toHaveBeenCalled();expect(fixture.embed).toHaveBeenCalledTimes(1);expect(fixture.put).toHaveBeenCalledTimes(1);
+    expect((await counts()).charges).toBe(1);
+  });
+  it.each(['flag','wrapped-key'])('rejects a changed vault %s after preparation without accepting ciphertext or charging',async change=>{
+    fixture.embed.mockImplementation(async()=>{
+      await pool.query(change==='flag'?'UPDATE vaults SET vault_encryption_enabled=true WHERE id=$1':
+        "UPDATE vaults SET encrypted_dek='different-key' WHERE id=$1",[fixture.vaultId]);
+      return [[1,...Array(1535).fill(0)]];
+    });
+    expect((await post()).statusCode).toBe(500);
+    expect(await counts()).toEqual({raw:0,segments:0,queue:0,intents:0,charges:0});
+    expect(fixture.blobs.size).toBe(0);
+  });
+  it('prepares one encryption key before locks, encrypts raw and segment data, and performs no key work for replay',async()=>{
+    const config=(await import('../config')).getConfig(),crypt=await import('../services/crypto');
+    const key=Buffer.alloc(32,27);config.ENCRYPTION_ENABLED=true;config.KEY_PROVIDER='gcp_kms';
+    config.GCP_KMS_KEY_NAME='projects/test/locations/global/keyRings/test/cryptoKeys/test';
+    fixture.encryptionEnabled=true;fixture.encryptedDek=Buffer.from('synthetic-wrapped-ingest-key').toString('base64');
+    await pool.query('UPDATE vaults SET vault_encryption_enabled=true,encrypted_dek=$2 WHERE id=$1',[fixture.vaultId,fixture.encryptedDek]);
+    fixture.unwrap.mockReset().mockImplementation(async()=>{
+      const client=await pool.connect();
+      try{await client.query('BEGIN');await client.query('SELECT id FROM vaults WHERE id=$1 FOR UPDATE NOWAIT',[fixture.vaultId]);}
+      finally{await client.query('ROLLBACK');client.release();}
+      return [{plaintext:key}];
+    });
+    await crypt.initCryptoClient();
+    expect((await post()).statusCode).toBe(202);
+    expect(fixture.unwrap).toHaveBeenCalledOnce();
+    const raw=(await pool.query('SELECT blob_key FROM raw_chunks WHERE vault_id=$1',[fixture.vaultId])).rows[0];
+    expect(crypt.decryptField(fixture.blobs.get(raw.blob_key)!,key)).toBe('durable payload');
+    const segment=(await pool.query('SELECT context FROM segments WHERE vault_id=$1',[fixture.vaultId])).rows[0];
+    if(segment.context)expect(crypt.decryptField(segment.context,key)).toContain('durable payload');
+    fixture.unwrap.mockRejectedValue(new Error('Synthetic key provider offline'));
+    expect((await post()).statusCode).toBe(202);expect(fixture.unwrap).toHaveBeenCalledOnce();
+  });
+
 });

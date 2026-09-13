@@ -34,9 +34,8 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
   const deltas = () => events.metric.mock.calls.map(([event]) => event).filter(event => event.event_type === 'quota_delta');
   async function usage(vaultId: string) { return (await pool.query('SELECT memory_adds FROM vault_usage WHERE vault_id=$1', [vaultId])).rows[0]?.memory_adds ?? 0; }
 
-  it.each(['candidate', 'needs_review', 'active', 'keep_both', 'conflict'] as const)('emits both dimensions after the %s insertion commits', async branch => {
+  it.each(['active', 'keep_both', 'conflict'] as const)('emits both dimensions after the %s insertion commits', async branch => {
     const { input, account } = await fixture();
-    if (branch === 'candidate' || branch === 'needs_review') input.status = branch;
     if (branch === 'keep_both' || branch === 'conflict') {
       await dedup.deduplicateMemory(input);
       events.metric.mockClear();
@@ -52,7 +51,7 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     const result = await dedup.deduplicateMemory(input); await Promise.all(visible);
     expect(result.action).toBe('inserted');
     const memory = (await pool.query('SELECT status FROM memories WHERE id=$1', [result.memoryId])).rows[0];
-    expect(memory.status).toBe(branch === 'conflict' ? 'needs_review' : branch === 'keep_both' ? 'active' : branch);
+    expect(memory.status).toBe('active');
     expect(deltas()).toEqual([
       expect.objectContaining({ operation: 'memory_adds', memory_adds_delta: 1, workspace_id: account, source: 'extraction_worker' }),
       expect.objectContaining({ operation: 'memory_count', memory_count_delta: 1, workspace_id: account, source: 'extraction_worker' })
@@ -96,11 +95,13 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     }) };
     await dedup.deduplicateMemory(input, provider as never);
     expect(provider.arbitrateConflict).toHaveBeenCalledOnce();
-    expect((await pool.query('SELECT status FROM memories WHERE vault_id=$1', [input.vaultId])).rows).toEqual([{ status: 'needs_review' }, { status: 'needs_review' }]);
+    expect((await pool.query('SELECT status FROM memories WHERE vault_id=$1', [input.vaultId])).rows).toEqual([{ status: 'active' }, { status: 'active' }]);
   });
   it('applies two prepared candidates targeting one revision without a live provider fallback', async () => {
     const { input } = await fixture(); input.type = 'user_preference'; await dedup.deduplicateMemory(input);
-    const first = { ...input, fact: 'First new preference', embedding: [0.85, Math.sqrt(1-0.85**2), ...vector.slice(2)] };
+    // The first merge makes a substantive sensitivity change; timestamp-only
+    // updates intentionally do not invalidate the second prepared decision.
+    const first = { ...input, sensitivity: 'high' as const, fact: 'First new preference', embedding: [0.85, Math.sqrt(1-0.85**2), ...vector.slice(2)] };
     const y = (0.85 - 0.85**2) / Math.sqrt(1-0.85**2);
     const second = { ...first, fact: 'Second new preference',
       embedding: [0.85, y, Math.sqrt(1-0.85**2-y**2), ...vector.slice(3)] };
@@ -118,7 +119,7 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     });
     expect(await usage(input.vaultId)).toBe(2);
     expect((await pool.query('SELECT status FROM memories WHERE vault_id=$1', [input.vaultId])).rows)
-      .toEqual([{ status: 'needs_review' }, { status: 'needs_review' }]);
+      .toEqual([{ status: 'active' }, { status: 'active' }]);
   });
   it('uses only its supplied client for canonical lookup in the locked phase', async () => {
     const { input } = await fixture();

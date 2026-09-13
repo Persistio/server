@@ -3,8 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { QueryResultRow } from 'pg';
 
-import { query } from '../db/client';
-import { memoryPolicyEventCounter } from '../services/observability-effects';
+import { query,withTransaction } from '../db/client';
 import {
   memoryArchivedEventType,
   memoryCreatedEventType,
@@ -16,10 +15,14 @@ import { getAuthAccountId, requireAdminScope, requireVaultReadAuth, requireVault
 import { setCustomerMetricVaultId } from '../services/customer-api-request-metrics';
 import { computeSubjectHmac, decryptForVault, encryptForVault, encryptSubjectForVault, isVaultEncryptionActive, unwrapDek } from '../services/crypto';
 import { getEmbedder } from '../services/embedder';
-import { pendingRecallCutoff } from '../services/pending-memory';
-import { enforceMemoryCreationLimit, recordMemoryCountDelta } from '../services/usage';
-import type { MemoryAuthorityState } from '../services/memory-authority';
-import { isScopeWidening, parseMemoryScope, type MemoryScope } from '../services/memory-scope';
+import { prepareVaultCrypto } from '../services/crypto';
+import { lockMemoryWriteVault } from '../services/dedup';
+import { enqueueCurationWork } from '../services/curation-work';
+import { isSecretLikeMemoryContent } from '../services/deterministic-filter';
+import { isValidDateOnly } from '../services/memory-validity';
+import { publishCommittedWorkerEffects,type WorkerEffect } from '../services/worker-effects';
+import { checkMemoryCreationCapacity, reserveMemoryCreationInTransaction, recordMemoryCountDelta } from '../services/usage';
+import { isScopeWidening, parseMemoryScope, resolveMemoryScopeChange, type MemoryScope } from '../services/memory-scope';
 import { contextIdentitySchema } from '../services/memory-applicability';
 
 const booleanQueryParam = z.preprocess((value) => {
@@ -50,10 +53,8 @@ const listQuerySchema = z.object({
   q: z.string().trim().min(1).max(200).optional(),
   sort: z.enum(['recent', 'oldest', 'confidence', 'salience']).optional().default('recent'),
   subject: z.string().trim().min(1).max(500).optional()
-});
-const adminListQuerySchema = listQuerySchema.extend({
-  include_pending: booleanQueryParam
-});
+}).strict();
+const adminListQuerySchema = listQuerySchema.strict();
 
 const subjectListQuerySchema = z.object({
   archived: z.enum(['true', 'false']).optional().default('false'),
@@ -63,13 +64,11 @@ const subjectListQuerySchema = z.object({
   sort: z.enum(['count', 'recent', 'name']).optional().default('count')
 });
 
-const readMemoryQuerySchema = z.object({
-  include_pending: booleanQueryParam
-});
+const readMemoryQuerySchema = z.object({}).strict();
 
 export const createMemoryShape = {
-  data: z.string().min(1),
-  subject: z.string().min(1),
+  data: z.string().trim().min(1).max(10000),
+  subject: z.string().trim().min(1).max(500),
   categories: z.array(z.string().min(1)).optional().default([]),
   parent_id: z.string().uuid().nullable().optional(),
   type: z.enum(['user_preference', 'user_rule', 'task_pattern', 'workflow', 'project', 'constraint', 'decision', 'system_fact', 'domain_knowledge']).optional().default('system_fact'),
@@ -78,7 +77,7 @@ export const createMemoryShape = {
   evidence: z.string().optional(),
   volatility: z.enum(['very_low', 'low', 'medium', 'high']).optional().default('low')
 };
-const createMemorySchema = z.object(createMemoryShape).superRefine((body, context) => {
+const createMemorySchema = z.object(createMemoryShape).strict().superRefine((body, context) => {
   if (body.scope === 'global' && body.scope_key != null) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['scope_key'], message: 'Global memories must not have a scope_key' });
   } else if (body.scope !== 'global' && !body.scope_key) {
@@ -87,8 +86,8 @@ const createMemorySchema = z.object(createMemoryShape).superRefine((body, contex
 });
 
 export const updateMemoryShape = {
-  data: z.string().min(1).optional(),
-  subject: z.string().min(1).optional(),
+  data: z.string().trim().min(1).max(10000).optional(),
+  subject: z.string().trim().min(1).max(500).optional(),
   categories: z.array(z.string().min(1)).optional(),
   confidence: z.number().positive().max(1).optional(),
   type: z.enum(['user_preference', 'user_rule', 'task_pattern', 'workflow', 'project', 'constraint', 'decision', 'system_fact', 'domain_knowledge']).optional(),
@@ -98,7 +97,7 @@ export const updateMemoryShape = {
   evidence: z.string().nullable().optional(),
   archived: z.boolean().optional()
 };
-const updateMemorySchema = z.object(updateMemoryShape).refine((body) => (
+const updateMemorySchema = z.object(updateMemoryShape).strict().refine((body) => (
   Object.keys(body).some((field) => field !== 'scope_change_reason')
 ), {
   message: 'At least one memory field is required'
@@ -106,24 +105,17 @@ const updateMemorySchema = z.object(updateMemoryShape).refine((body) => (
   path: ['scope_key'], message: 'Global memories must not have a scope_key'
 });
 
-const authorityTransitionSchema = z.object({
-  expected_version: z.number().int().positive(),
-  reason: z.string().trim().min(1).max(500)
-}).strict();
-
-const authorityControlFields = new Set([
-  'authority_state',
-  'authority_required',
-  'authority_version',
-  'approved_by',
-  'approved_at',
-  'approval_source',
-  'revoked_by',
-  'revoked_at'
-]);
-
-function containsAuthorityControlFields(value: unknown): boolean {
-  return Boolean(value && typeof value === 'object' && Object.keys(value).some((key) => authorityControlFields.has(key)));
+async function assertCompatibleScopeRelationships(
+  execute: (sql: string, values: unknown[]) => Promise<{rowCount: number | null}>,
+  vaultId: string, id: string, parentId: string | null, scope: MemoryScope, scopeKey: string | null
+): Promise<void> {
+  // Preflight avoids known-invalid paid work; the locked call is authoritative.
+  const incompatible=await execute(`SELECT 1 FROM memories m WHERE m.vault_id=$1 AND (m.id=$3 OR m.parent_id=$2)
+    AND (m.scope<>$4 OR m.scope_key IS DISTINCT FROM $5::text)
+    UNION ALL SELECT 1 FROM memory_edges e JOIN memories m ON m.id=CASE WHEN e.from_memory_id=$2 THEN e.to_memory_id ELSE e.from_memory_id END
+    WHERE e.vault_id=$1 AND (e.from_memory_id=$2 OR e.to_memory_id=$2)
+    AND (m.scope<>$4 OR m.scope_key IS DISTINCT FROM $5::text) LIMIT 1`,[vaultId,id,parentId,scope,scopeKey]);
+  if(incompatible.rowCount)throw Object.assign(new Error('Scope change conflicts with linked memory bindings'),{statusCode:409});
 }
 
 const graphEdgeTypes = [
@@ -156,7 +148,6 @@ function memoryResponseSelect(source: string, edgeSource = source): string {
   return `${source}.id, ${source}.vault_id, ${source}.data, ${source}.subject, ${source}.subject_encrypted, ${source}.hash, ${source}.source_chunks,
        ${source}.categories, ${source}.confidence, ${source}.score, ${source}.salience, ${source}.sensitivity, ${source}.type, ${source}.scope, ${source}.scope_key, ${source}.evidence, ${source}.polarity, ${source}.status,
        ${source}.valid_from, ${source}.valid_until, ${source}.source_timestamp, ${source}.archived_at, ${source}.created_at, ${source}.updated_at, ${source}.parent_id, ${source}.volatility,
-       ${source}.authority_state, ${source}.authority_required, ${source}.authority_version, ${source}.approved_by, ${source}.approved_at, ${source}.approval_source, ${source}.revoked_by, ${source}.revoked_at,
        COALESCE((SELECT COUNT(*)::int FROM memory_edges edge_counts WHERE edge_counts.from_memory_id = ${edgeSource}.id OR edge_counts.to_memory_id = ${edgeSource}.id), 0) AS edge_count`;
 }
 
@@ -183,7 +174,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     if (!vault) return reply.code(404).send({ error: 'Vault not found' });
 
     setCustomerMetricVaultId(request, vault.id);
-    const result = await listMemories(vault, qs, qs.include_pending);
+    const result = await listMemories(vault, qs);
     return {
       items: result.items,
       limit: qs.limit,
@@ -248,69 +239,49 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     };
   });
 
-  app.post('/v1/memories', { preHandler: requireVaultWriteAuth }, async (request, reply) => {
-    if (containsAuthorityControlFields(request.body)) {
-      return reply.code(400).send({ error: 'Memory authority can only be changed through authority endpoints' });
+  app.post('/v1/memories',{preHandler:requireVaultWriteAuth},async(request,reply)=>{
+    const parsed=createMemorySchema.safeParse(request.body);
+    if(!parsed.success)return reply.code(400).send({error:'Invalid memory payload'});
+    const body=parsed.data;
+    if(isSecretLikeMemoryContent(body.subject+'\n'+body.data))return reply.code(400).send({error:'Memory contains unsupported sensitive content'});
+    if(body.parent_id){
+      const parent=await query(`SELECT id FROM memories WHERE id=$1 AND vault_id=$2
+        AND status='active' AND archived_at IS NULL AND scope=$3 AND scope_key IS NOT DISTINCT FROM $4::text`,
+        [body.parent_id,request.vault.id,body.scope,body.scope_key ?? null]);
+      if(parent.rowCount!==1)return reply.code(400).send({error:'Parent must be an active same-binding memory'});
     }
-    const parsedBody = createMemorySchema.safeParse(request.body);
-    if (!parsedBody.success) {
-      return reply.code(400).send({ error: 'Invalid memory payload' });
-    }
-    const body = parsedBody.data;
-    await enforceMemoryCreationLimit(request.vault.id);
-
-    const embedder = getEmbedder();
-    const embedding = await embedder.embed(body.data, { vaultId: request.vault.id, modelRole: 'embedding', source: 'api', inputType: 'document' });
-    const hash = crypto.createHash('md5').update(body.data).digest('hex');
-    const storedData = await encryptForVault(request.vault, body.data);
-    const encryptedSubject = await encryptSubjectForVault(request.vault, body.subject);
-    const storedSubject = isVaultEncryptionActive(request.vault) ? '' : body.subject;
-
-    if (body.parent_id) {
-      const parentCheck = await query(
-        'SELECT id FROM memories WHERE id = $1 AND vault_id = $2',
-        [body.parent_id, request.vault.id]
-      );
-      if (parentCheck.rowCount === 0) {
-        return reply.status(400).send({ error: 'parent_id does not belong to this vault' });
+    await checkMemoryCreationCapacity(request.vault.id);
+    const prepared=await prepareVaultCrypto(request.vault);
+    const embedding=await getEmbedder().embed(body.data,{vaultId:request.vault.id,modelRole:'embedding',source:'api',inputType:'document'});
+    const subject=prepared.subject(request.vault,body.subject);
+    const effects:WorkerEffect[]=[];
+    const row=await withTransaction(async client=>{
+      await lockMemoryWriteVault(client,request.vault.id);await prepared.assertCurrent(client);
+      if(body.parent_id){
+        const parent=await client.query(`SELECT id FROM memories WHERE id=$1 AND vault_id=$2
+          AND status='active' AND archived_at IS NULL AND scope=$3 AND scope_key IS NOT DISTINCT FROM $4::text FOR KEY SHARE`,
+          [body.parent_id,request.vault.id,body.scope,body.scope_key ?? null]);
+        if(parent.rowCount!==1)throw Object.assign(new Error('Parent must be an active same-binding memory'),{statusCode:400});
       }
-    }
-
-    const result = await query<Record<string, unknown>>(
-      `INSERT INTO memories (
-         vault_id, data, subject, subject_encrypted, subject_hmac, hash, embedding, categories, parent_id, type, scope, scope_key, evidence, volatility
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::text[], $9, $10, $11, $12, $13::jsonb, $14::memory_volatility)
-       RETURNING ${memoryResponseSelect('memories')}`,
-      [
-        request.vault.id,
-        storedData,
-        storedSubject,
-        encryptedSubject?.encrypted ?? null,
-        encryptedSubject?.hmac ?? null,
-        hash,
-        JSON.stringify(embedding),
-        body.categories,
-        body.parent_id ?? null,
-        body.type,
-        body.scope,
-        body.scope_key ?? null,
-        body.evidence ? JSON.stringify({ summary: body.evidence }) : null,
-        body.volatility
-      ]
-    );
-
-    recordMemoryCountDelta(request.vault.id, request.vault.account_id, 1, 'api');
-    await recordMemoryCreatedActivity(request, String(result.rows[0].id));
-    await query(
-      `INSERT INTO memory_embeddings (memory_id, embedding, embedded_at)
-       VALUES ($1, $2::vector, now())
-       ON CONFLICT (memory_id)
-       DO UPDATE SET embedding = EXCLUDED.embedding, embedded_at = now()`,
-      [result.rows[0].id, JSON.stringify(embedding)]
-    );
-
-    return reply.code(201).send(await decryptMemoryRow(request.vault, result.rows[0]));
+      const reservation=await reserveMemoryCreationInTransaction(client,request.vault.id,'api');
+      const actor=platformActorForAudit(request.auth);
+      const inserted=await client.query<MemoryResponseRow>(`INSERT INTO memories
+        (vault_id,data,subject,subject_encrypted,subject_hmac,hash,embedding,categories,parent_id,type,scope,scope_key,evidence,volatility,status,source_timestamp)
+        VALUES($1,$2,$3,$4,$5,$6,$7::vector,$8::text[],$9,$10,$11,$12,$13::jsonb,$14::memory_volatility,'active',now())
+        RETURNING ${memoryResponseSelect('memories')}`,
+        [request.vault.id,prepared.encrypt(request.vault,body.data),isVaultEncryptionActive(request.vault)?'':body.subject,
+          subject?.encrypted ?? null,subject?.hmac ?? null,crypto.createHash('sha256').update(body.data).digest('hex'),JSON.stringify(embedding),
+          body.categories,body.parent_id ?? null,body.type,body.scope,body.scope_key ?? null,
+          JSON.stringify({summary:body.evidence ?? null,authored_via:'memory_api',actor}),body.volatility]);
+      const row=inserted.rows[0];
+      await client.query('INSERT INTO memory_embeddings(memory_id,embedding) VALUES($1,$2::vector)',[row.id,JSON.stringify(embedding)]);
+      await enqueueCurationWork(client,{vaultId:request.vault.id,workKey:'manual:'+crypto.randomUUID(),memoryIds:[String(row.id)]});
+      effects.push({kind:'quota',reservation},{kind:'memory-count',vaultId:request.vault.id,accountId:request.vault.account_id,delta:1,source:'api'});
+      return row;
+    });
+    publishCommittedWorkerEffects(effects);
+    await recordMemoryCreatedActivity(request,String(row.id));
+    return reply.code(201).send(await decryptMemoryRow(request.vault,row));
   });
 
   app.get('/v1/memories/graph', { preHandler: requireVaultReadAuth }, async (request, reply) => {
@@ -326,474 +297,108 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     return memoryGraphResponse(request.vault, parsedQuery.data, reply);
   });
 
-  app.get('/v1/memories/:id', { preHandler: requireVaultReadAuth }, async (request, reply) => {
-    const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const qs = readMemoryQuerySchema.parse(request.query);
-    const values: unknown[] = [request.vault.id, params.id];
-    const visibility = qs.include_pending
-      ? `(
-           status IS NULL
-           OR status <> 'candidate'
-           OR (
-             status = 'candidate'
-             AND archived_at IS NULL
-             AND COALESCE(source_timestamp, created_at) >= $3::timestamptz
-           )
-         )`
-      : `(status IS NULL OR status <> 'candidate')`;
-
-    if (qs.include_pending) {
-      values.push(pendingRecallCutoff().toISOString());
-    }
-
-    const result = await query<Record<string, unknown>>(
-      `SELECT ${memoryResponseSelect('memories')}
-       FROM memories
-       WHERE vault_id = $1
-         AND id = $2
-         AND ${visibility}
-       LIMIT 1`,
-      values
-    );
-
-    if (!result.rowCount) {
-      return reply.code(404).send({ error: 'Memory not found' });
-    }
-
-    return decryptMemoryRow(request.vault, result.rows[0]);
+  app.get('/v1/memories/:id',{preHandler:requireVaultReadAuth},async(request,reply)=>{
+    const {id}=z.object({id:z.string().uuid()}).parse(request.params);
+    readMemoryQuerySchema.parse(request.query);
+    const result=await query<MemoryResponseRow>(`SELECT ${memoryResponseSelect('memories')} FROM memories WHERE vault_id=$1 AND id=$2`,[request.vault.id,id]);
+    if(!result.rowCount)return reply.code(404).send({error:'Memory not found'});
+    return decryptMemoryRow(request.vault,result.rows[0]);
   });
 
-  app.delete('/v1/memories/:id', { preHandler: requireVaultWriteAuth }, async (request, reply) => {
-    const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const result = await query<{ id: string; archived_at: string | null; previous_archived_at: string | null }>(
-      `WITH target AS (
-         SELECT id, archived_at
-         FROM memories
-         WHERE vault_id = $1
-           AND id = $2
-           AND (status IS NULL OR status <> 'candidate')
-         LIMIT 1
-         FOR UPDATE
-       ), updated AS (
-         UPDATE memories
-         SET archived_at = COALESCE(memories.archived_at, now()),
-             updated_at = now()
-         FROM target
-         WHERE memories.id = target.id
-         RETURNING memories.id, memories.archived_at, target.archived_at AS previous_archived_at
-       )
-       SELECT id, archived_at, previous_archived_at
-       FROM updated`,
-      [request.vault.id, params.id]
-    );
-
-    if (!result.rowCount) {
-      return reply.code(404).send({ error: 'Memory not found' });
-    }
-
-    if (result.rows[0].previous_archived_at === null) {
-      recordMemoryCountDelta(request.vault.id, request.vault.account_id, -1, 'api');
-      await recordMemoryArchivedActivity(request, String(result.rows[0].id));
-    }
-    const { previous_archived_at: _previousArchivedAt, ...response } = result.rows[0];
-    return response;
+  app.delete('/v1/memories/:id',{preHandler:requireVaultWriteAuth},async(request,reply)=>{
+    const {id}=z.object({id:z.string().uuid()}).parse(request.params);
+    const result=await withTransaction(async client=>{
+      await lockMemoryWriteVault(client,request.vault.id);
+      const previous=(await client.query<{archived_at:string|null}>('SELECT archived_at FROM memories WHERE vault_id=$1 AND id=$2 FOR UPDATE',[request.vault.id,id])).rows[0];
+      if(!previous)return null;
+      const updated=await client.query<{id:string;archived_at:string}>(`UPDATE memories SET archived_at=COALESCE(archived_at,now()),updated_at=now()
+        WHERE vault_id=$1 AND id=$2 RETURNING id,archived_at`,[request.vault.id,id]);
+      return{row:updated.rows[0],changed:previous.archived_at===null};
+    });
+    if(!result)return reply.code(404).send({error:'Memory not found'});
+    if(result.changed){publishCommittedWorkerEffects([{kind:'memory-count',vaultId:request.vault.id,accountId:request.vault.account_id,delta:-1,source:'api'}]);
+      await recordMemoryArchivedActivity(request,id);}
+    return result.row;
   });
 
-  app.patch('/v1/memories/:id', { preHandler: requireVaultWriteAuth }, async (request, reply) => {
-    const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    if (containsAuthorityControlFields(request.body)) {
-      return reply.code(400).send({ error: 'Memory authority can only be changed through authority endpoints' });
-    }
-    const parsedBody = updateMemorySchema.safeParse(request.body);
-    if (!parsedBody.success) {
-      return reply.code(400).send({ error: 'Invalid memory payload' });
-    }
-    const body = parsedBody.data;
-
-    const existing = await query<{ id: string; scope: MemoryScope; scope_key: string | null }>(
-      `SELECT id, scope, scope_key
-       FROM memories
-       WHERE vault_id = $1
-         AND id = $2
-         AND (status IS NULL OR status <> 'candidate')
-       LIMIT 1`,
-      [request.vault.id, params.id]
-    );
-
-    if (!existing.rowCount) {
-      return reply.code(404).send({ error: 'Memory not found' });
-    }
-
-    const current = existing.rows[0];
-    const currentScope = parseMemoryScope(current.scope);
-    if (!currentScope) {
-      request.log.error({ memory_id: params.id, scope: current.scope }, 'memory has invalid persisted scope');
-      return reply.code(409).send({ error: 'Memory has an invalid persisted scope' });
-    }
-    const nextScope = body.scope ?? currentScope;
-    if (isScopeWidening(currentScope, nextScope)) {
-      memoryPolicyEventCounter.add(1, { event: 'scope_widening_attempt', source: 'api', outcome: body.scope_change_reason ? 'authorized' : 'rejected' });
-      request.log.warn({
-        vault_id: request.vault.id,
-        memory_id: params.id,
-        old_scope: currentScope,
-        requested_scope: nextScope,
-        authorized_reason_present: Boolean(body.scope_change_reason)
-      }, 'memory scope widening attempted');
-      if (!body.scope_change_reason) {
-        return reply.code(400).send({ error: 'scope_change_reason is required when widening memory scope' });
+  app.patch('/v1/memories/:id',{preHandler:requireVaultWriteAuth},async(request,reply)=>{
+    const {id}=z.object({id:z.string().uuid()}).parse(request.params);
+    const parsed=updateMemorySchema.safeParse(request.body);
+    if(!parsed.success)return reply.code(400).send({error:'Invalid memory payload'});
+    const body=parsed.data;
+    const snapshot=(await query<any>('SELECT * FROM memories WHERE vault_id=$1 AND id=$2',[request.vault.id,id])).rows[0];
+    if(!snapshot)return reply.code(404).send({error:'Memory not found'});
+    const proposedBinding=resolveMemoryScopeChange(snapshot,body);
+    if(proposedBinding.changedScope)await assertCompatibleScopeRelationships(query,request.vault.id,id,snapshot.parent_id,
+      proposedBinding.scope,proposedBinding.scopeKey);
+    if(body.archived===false && snapshot.archived_at!==null)await checkMemoryCreationCapacity(request.vault.id);
+    const prepared=await prepareVaultCrypto(request.vault);
+    // Validate the effective content both before paid work and against locked
+    // current state. Concurrent edits must not authorize a stale merged payload.
+    const resolveContent=(current:{data:string;subject:string;subject_encrypted:string|null})=>{
+      const fact=body.data ?? prepared.decrypt(request.vault,current.data);
+      const subjectText=body.subject ?? (current.subject_encrypted ? prepared.decrypt(request.vault,current.subject_encrypted):current.subject);
+      if(isSecretLikeMemoryContent(subjectText+'\n'+fact))throw Object.assign(new Error('Memory contains unsupported sensitive content'),{statusCode:400});
+      return{fact,subjectText};
+    };
+    resolveContent(snapshot);
+    const embedding=body.data!==undefined ? await getEmbedder().embed(body.data,{vaultId:request.vault.id,modelRole:'embedding',source:'api',inputType:'document'}):null;
+    const effects:WorkerEffect[]=[];
+    const result=await withTransaction(async client=>{
+      await lockMemoryWriteVault(client,request.vault.id);await prepared.assertCurrent(client);
+      const current=(await client.query<any>('SELECT * FROM memories WHERE vault_id=$1 AND id=$2 FOR UPDATE',[request.vault.id,id])).rows[0];
+      if(!current)return null;
+      const {fact,subjectText}=resolveContent(current);
+      const {scope,scopeKey,changedScope}=resolveMemoryScopeChange(current,body);
+      if(changedScope){
+        // Do not quietly disconnect a memory from its graph to change its scope.
+        await assertCompatibleScopeRelationships(client.query.bind(client),request.vault.id,id,current.parent_id,scope,scopeKey);
       }
-    }
-    if (body.scope !== undefined && body.scope !== 'global' && body.scope_key === undefined) {
-      return reply.code(400).send({ error: 'scope_key must be explicit when changing memory scope' });
-    }
-    const currentScopeKey = current.scope_key ?? null;
-    const nextScopeKey = body.scope === 'global'
-      ? null
-      : body.scope_key !== undefined ? body.scope_key : currentScopeKey;
-    if ((body.scope !== undefined || body.scope_key !== undefined) && (nextScope === 'global' ? nextScopeKey !== null : nextScopeKey === null)) {
-      return reply.code(400).send({ error: nextScope === 'global' ? 'Global memories must not have a scope_key' : 'Non-global memories require a scope_key' });
-    }
-    if (currentScopeKey !== nextScopeKey && !body.scope_change_reason) {
-      return reply.code(400).send({ error: 'scope_change_reason is required when changing memory scope binding' });
-    }
-    const scopeActor = platformActorForAudit(request.auth);
-    const suppliedStoredData = body.data
-      ? await encryptForVault(request.vault, body.data)
-      : null;
-    const suppliedStoredSubject = body.subject
-      ? isVaultEncryptionActive(request.vault) ? '' : body.subject
-      : null;
-    const suppliedEncryptedSubject = body.subject
-      ? await encryptSubjectForVault(request.vault, body.subject)
-      : null;
-    let embedding: string | undefined;
-    let hash: string | undefined;
-
-    if (body.data) {
-      const embedder = getEmbedder();
-      embedding = JSON.stringify(await embedder.embed(body.data, { vaultId: request.vault.id, modelRole: 'embedding', source: 'api', inputType: 'document' }));
-      hash = crypto.createHash('md5').update(body.data).digest('hex');
-    }
-
-    const result = await query<Record<string, unknown> & {
-      archived_at: string | null;
-      previous_archived_at: string | null;
-      previous_scope: MemoryScope;
-      previous_scope_key: string | null;
-      scope_change_id: string | null;
-      previous_authority_state: MemoryAuthorityState;
-      previous_authority_version: string | number;
-      invalidates_authority: boolean;
-      authority_event_id: string | null;
-    }>(
-      `WITH target AS (
-         SELECT id, archived_at, scope, type, authority_required, authority_state, authority_version,
-                scope_key,
-                (
-                  $11::text IS NOT NULL
-                  OR $4::text IS NOT NULL
-                  OR ($7::text[] IS NOT NULL AND $7::text[] IS DISTINCT FROM categories)
-                  OR ($9::text IS NOT NULL AND $9::text IS DISTINCT FROM type)
-                  OR ($10::text IS NOT NULL AND $10::text IS DISTINCT FROM scope)
-                  OR ($21::boolean AND $22::text IS DISTINCT FROM scope_key)
-                  OR $19::boolean
-                ) AS invalidates_authority
-         FROM memories
-         WHERE vault_id = $1
-           AND id = $2
-           AND scope = $23
-           AND scope_key IS NOT DISTINCT FROM $24::text
-           AND (status IS NULL OR status <> 'candidate')
-         LIMIT 1
-         FOR UPDATE
-       ), updated AS (
-         UPDATE memories
-         SET data = COALESCE($3, memories.data),
-             subject = COALESCE($4, memories.subject),
-             subject_encrypted = CASE WHEN $4::text IS NOT NULL THEN $5 ELSE memories.subject_encrypted END,
-             subject_hmac = CASE WHEN $4::text IS NOT NULL THEN $6 ELSE memories.subject_hmac END,
-             categories = COALESCE($7::text[], memories.categories),
-             confidence = COALESCE($8, memories.confidence),
-             type = COALESCE($9, memories.type),
-             scope = COALESCE($10::text, memories.scope),
-             scope_key = CASE WHEN $21::boolean THEN $22::text ELSE memories.scope_key END,
-             updated_at = now(),
-             hash = COALESCE($11, hash),
-             embedding = COALESCE($12::vector, embedding),
-             evidence = CASE
-               WHEN $19::boolean IS FALSE THEN memories.evidence
-               WHEN $13::text IS NULL
-                 AND (
-                   jsonb_typeof(memories.evidence) IS DISTINCT FROM 'object'
-                   OR (memories.evidence - 'summary') = '{}'::jsonb
-                 )
-                 THEN NULL
-               ELSE
-                 CASE
-                   WHEN jsonb_typeof(memories.evidence) = 'object' THEN memories.evidence
-                   ELSE '{}'::jsonb
-                 END || jsonb_build_object('summary', $13::text)
-             END,
-             authority_required = CASE WHEN target.invalidates_authority THEN true ELSE memories.authority_required END,
-             authority_state = CASE WHEN target.invalidates_authority THEN 'proposed' ELSE memories.authority_state END,
-             approved_by = CASE WHEN target.invalidates_authority THEN NULL ELSE memories.approved_by END,
-             approved_at = CASE WHEN target.invalidates_authority THEN NULL ELSE memories.approved_at END,
-             approval_source = CASE WHEN target.invalidates_authority THEN NULL ELSE memories.approval_source END,
-             revoked_by = CASE WHEN target.invalidates_authority THEN NULL ELSE memories.revoked_by END,
-             revoked_at = CASE WHEN target.invalidates_authority THEN NULL ELSE memories.revoked_at END,
-             authority_version = CASE WHEN target.invalidates_authority THEN memories.authority_version + 1 ELSE memories.authority_version END,
-             archived_at = CASE
-               WHEN $14::boolean IS FALSE THEN memories.archived_at
-               WHEN $15::boolean THEN COALESCE(memories.archived_at, now())
-               ELSE NULL
-             END
-         FROM target
-         WHERE memories.id = target.id
-           AND target.scope IN ('global', 'project', 'task', 'session')
-           AND (
-             $10::text IS NULL
-             OR $18::text IS NOT NULL
-             OR CASE COALESCE($10::text, target.scope)
-                  WHEN 'session' THEN 0
-                  WHEN 'task' THEN 1
-                  WHEN 'project' THEN 2
-                  WHEN 'global' THEN 3
-                END
-                <= CASE target.scope
-                     WHEN 'session' THEN 0
-                     WHEN 'task' THEN 1
-                     WHEN 'project' THEN 2
-                     WHEN 'global' THEN 3
-                   END
-           )
-         RETURNING ${memoryResponseSelect('memories')},
-                   target.archived_at AS previous_archived_at,
-                   target.scope AS previous_scope,
-                   target.scope_key AS previous_scope_key,
-                   target.authority_state AS previous_authority_state,
-                   target.authority_version AS previous_authority_version,
-                   target.invalidates_authority
-       ), scope_audit AS (
-         INSERT INTO memory_scope_change_log (
-           vault_id, memory_id, old_scope, new_scope, old_scope_key, new_scope_key, actor_type, actor_id, source, reason
-         )
-         SELECT $1, updated.id, updated.previous_scope, updated.scope, updated.previous_scope_key, updated.scope_key, $16, $17, 'api',
-                COALESCE($18, 'Scope narrowed through the memory API')
-         FROM updated
-         WHERE updated.scope IS DISTINCT FROM updated.previous_scope
-            OR updated.scope_key IS DISTINCT FROM updated.previous_scope_key
-         RETURNING id
-       ), authority_audit AS (
-         INSERT INTO memory_authority_events (
-           vault_id, memory_id, event_type, old_state, new_state, old_version, new_version,
-           actor_type, actor_id, source, reason
-         )
-         SELECT $1, updated.id, 'invalidate', updated.previous_authority_state, updated.authority_state,
-                updated.previous_authority_version, updated.authority_version,
-                $16, $17, 'api', $20
-         FROM updated
-         WHERE updated.invalidates_authority
-         RETURNING id
-       )
-       SELECT updated.*,
-              (SELECT id FROM scope_audit LIMIT 1) AS scope_change_id,
-              (SELECT id FROM authority_audit LIMIT 1) AS authority_event_id
-       FROM updated`,
-      [
-        request.vault.id,
-        params.id,
-        suppliedStoredData,
-        suppliedStoredSubject,
-        suppliedEncryptedSubject?.encrypted ?? null,
-        suppliedEncryptedSubject?.hmac ?? null,
-        body.categories ?? null,
-        body.confidence ?? null,
-        body.type ?? null,
-        body.scope ?? null,
-        hash,
-        embedding,
-        body.evidence ?? null,
-        body.archived !== undefined,
-        body.archived ?? false,
-        scopeActor.type,
-        scopeActor.id,
-        body.scope_change_reason ?? null,
-        body.evidence !== undefined,
-        'Memory prompt-bearing content, type, scope, or scope binding changed through the API; approval requires review.',
-        body.scope_key !== undefined || body.scope === 'global',
-        nextScopeKey,
-        currentScope,
-        currentScopeKey
-      ]
-    );
-
-    if (!result.rowCount) {
-      return reply.code(409).send({ error: 'Memory changed concurrently; retry with the latest scope' });
-    }
-
-    const memoryCountDelta = result.rows[0].previous_archived_at === null && result.rows[0].archived_at !== null
-      ? -1
-      : result.rows[0].previous_archived_at !== null && result.rows[0].archived_at === null
-        ? 1
-        : 0;
-    recordMemoryCountDelta(request.vault.id, request.vault.account_id, memoryCountDelta, 'api');
-    if (memoryCountDelta < 0) {
-      await recordMemoryArchivedActivity(request, String(result.rows[0].id));
-    }
-
-    if (embedding) {
-      await query(
-        `INSERT INTO memory_embeddings (memory_id, embedding, embedded_at)
-         VALUES ($1, $2::vector, now())
-         ON CONFLICT (memory_id)
-         DO UPDATE SET embedding = EXCLUDED.embedding, embedded_at = now()`,
-        [params.id, embedding]
-      );
-    }
-
-    const {
-      previous_archived_at: _previousArchivedAt,
-      previous_scope: _previousScope,
-      previous_scope_key: _previousScopeKey,
-      scope_change_id: _scopeChangeId,
-      previous_authority_state: _previousAuthorityState,
-      previous_authority_version: _previousAuthorityVersion,
-      invalidates_authority: _invalidatesAuthority,
-      authority_event_id: _authorityEventId,
-      ...responseRow
-    } = result.rows[0];
-    return decryptMemoryRow(request.vault, responseRow);
+      const restoring=body.archived===false && current.archived_at!==null;
+      if(restoring){
+        const reservation=await reserveMemoryCreationInTransaction(client,request.vault.id,'api');
+        effects.push({kind:'quota',reservation});
+      }
+      const encryptedSubject=body.subject!==undefined ? prepared.subject(request.vault,subjectText):null;
+      const fields:string[]=[],values:unknown[]=[request.vault.id,id];
+      const set=(field:string,value:unknown,cast='')=>{values.push(value);fields.push(`${field}=$${values.length}${cast}`);};
+      if(body.data!==undefined){set('data',prepared.encrypt(request.vault,fact));set('hash',crypto.createHash('sha256').update(fact).digest('hex'));set('embedding',JSON.stringify(embedding),'::vector');set('source_timestamp',new Date().toISOString(),'::timestamptz');}
+      if(body.subject!==undefined){set('subject',isVaultEncryptionActive(request.vault)?'':subjectText);set('subject_encrypted',encryptedSubject?.encrypted ?? null);set('subject_hmac',encryptedSubject?.hmac ?? null);}
+      if(body.type!==undefined)set('type',body.type);
+      if(body.categories!==undefined)set('categories',body.categories,'::text[]');
+      if(body.confidence!==undefined)set('confidence',body.confidence);
+      if(changedScope){set('scope',scope);set('scope_key',scopeKey);}
+      if(body.evidence!==undefined || body.data!==undefined || body.subject!==undefined){
+        const previous=current.evidence && typeof current.evidence==='object' ? current.evidence:{};
+        set('evidence',JSON.stringify({...previous,summary:body.evidence===undefined ? previous.summary ?? null:body.evidence,
+          authored_via:'memory_api',actor:platformActorForAudit(request.auth)}),'::jsonb');
+      }
+      if(body.archived!==undefined){set('archived_at',body.archived ? current.archived_at ?? new Date().toISOString():null,'::timestamptz');if(restoring)set('status','active');}
+      if(!fields.length)return{row:(await client.query<MemoryResponseRow>(
+        `SELECT ${memoryResponseSelect('memories')} FROM memories WHERE vault_id=$1 AND id=$2`,
+        [request.vault.id,id])).rows[0],delta:0};
+      const updated=(await client.query<MemoryResponseRow>(`UPDATE memories SET ${fields.join(',')},updated_at=now()
+        WHERE vault_id=$1 AND id=$2 RETURNING ${memoryResponseSelect('memories')}`,values)).rows[0];
+      if(embedding)await client.query(`INSERT INTO memory_embeddings(memory_id,embedding) VALUES($1,$2::vector)
+        ON CONFLICT(memory_id) DO UPDATE SET embedding=EXCLUDED.embedding,embedded_at=now()`,[id,JSON.stringify(embedding)]);
+      if(changedScope){
+        const actor=platformActorForAudit(request.auth);
+        await client.query(`INSERT INTO memory_scope_change_log
+          (vault_id,memory_id,old_scope,new_scope,old_scope_key,new_scope_key,actor_type,actor_id,source,reason)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,'api',$9)`,[request.vault.id,id,current.scope,scope,current.scope_key,scopeKey,actor.type,actor.id,body.scope_change_reason]);
+      }
+      // The database decides whether this was a substantive change.
+      const revision=(await client.query('SELECT revision::text FROM memories WHERE id=$1 AND vault_id=$2',[id,request.vault.id])).rows[0].revision;
+      if(revision!==String(current.revision))await enqueueCurationWork(client,{vaultId:request.vault.id,workKey:'manual:'+crypto.randomUUID(),memoryIds:[id]});
+      const delta=current.archived_at===null && updated.archived_at!==null ? -1:restoring ? 1:0;
+      effects.push({kind:'memory-count',vaultId:request.vault.id,accountId:request.vault.account_id,delta,source:'api'});
+      return{row:updated,delta};
+    });
+    if(!result)return reply.code(404).send({error:'Memory not found'});
+    publishCommittedWorkerEffects(effects);
+    if(result.delta<0)await recordMemoryArchivedActivity(request,id);
+    return decryptMemoryRow(request.vault,result.row);
   });
-
-  app.post('/admin/vaults/:vaultId/memories/:id/authority/approve', { preHandler: vaultWriteAuth }, async (request, reply) => {
-    const params = z.object({ vaultId: z.string().uuid(), id: z.string().uuid() }).safeParse(request.params);
-    if (!params.success) return reply.code(400).send({ error: 'Invalid authority transition path' });
-    const vault = await getAdminVaultContext(request, params.data.vaultId);
-    if (!vault) return reply.code(404).send({ error: 'Vault not found' });
-    return transitionMemoryAuthority(request, reply, vault, params.data.id, 'approved');
-  });
-
-  app.post('/admin/vaults/:vaultId/memories/:id/authority/revoke', { preHandler: vaultWriteAuth }, async (request, reply) => {
-    const params = z.object({ vaultId: z.string().uuid(), id: z.string().uuid() }).safeParse(request.params);
-    if (!params.success) return reply.code(400).send({ error: 'Invalid authority transition path' });
-    const vault = await getAdminVaultContext(request, params.data.vaultId);
-    if (!vault) return reply.code(404).send({ error: 'Vault not found' });
-    return transitionMemoryAuthority(request, reply, vault, params.data.id, 'revoked');
-  });
-}
-
-async function transitionMemoryAuthority(
-  request: FastifyRequest,
-  reply: FastifyReply,
-  vault: AdminVaultContext,
-  memoryId: string,
-  nextState: Extract<MemoryAuthorityState, 'approved' | 'revoked'>
-) {
-  const parsedBody = authorityTransitionSchema.safeParse(request.body);
-  if (!parsedBody.success) {
-    return reply.code(400).send({ error: 'Invalid authority transition payload' });
-  }
-
-  const currentResult = await query<{
-    id: string;
-    type: string | null;
-    authority_required: boolean;
-    authority_state: MemoryAuthorityState;
-    authority_version: string | number;
-  }>(
-    `SELECT id, type, authority_required, authority_state, authority_version
-     FROM memories
-     WHERE vault_id = $1
-       AND id = $2
-       AND ($3::boolean OR archived_at IS NULL)
-     LIMIT 1`,
-    [vault.id, memoryId, nextState === 'revoked']
-  );
-  if (!currentResult.rowCount) {
-    return reply.code(404).send({ error: 'Memory not found' });
-  }
-
-  const current = currentResult.rows[0];
-  if (!current.authority_required) {
-    return reply.code(400).send({ error: 'Authority transitions apply only to authority-controlled memories' });
-  }
-  if (Number(current.authority_version) !== parsedBody.data.expected_version) {
-    return reply.code(409).send({ error: 'Memory authority version conflict' });
-  }
-  if (current.authority_state === nextState) {
-    return reply.code(409).send({ error: `Memory is already ${nextState}` });
-  }
-
-  const actor = platformActorForAudit(request.auth);
-  const eventType = nextState === 'approved' ? 'approve' : 'revoke';
-  const result = await query<Record<string, unknown> & {
-    previous_authority_state: MemoryAuthorityState;
-    previous_authority_version: string | number;
-    authority_event_id: string;
-  }>(
-    `WITH target AS (
-       SELECT id, type, authority_required, authority_state, authority_version
-       FROM memories
-       WHERE vault_id = $1
-         AND id = $2
-         AND ($3::text = 'revoked' OR archived_at IS NULL)
-       LIMIT 1
-       FOR UPDATE
-     ), updated AS (
-       UPDATE memories
-       SET authority_state = $3,
-           approved_by = CASE WHEN $3 = 'approved' THEN $5 ELSE memories.approved_by END,
-           approved_at = CASE WHEN $3 = 'approved' THEN now() ELSE memories.approved_at END,
-           approval_source = CASE WHEN $3 = 'approved' THEN $6 ELSE memories.approval_source END,
-           revoked_by = CASE WHEN $3 = 'revoked' THEN $5 ELSE NULL END,
-           revoked_at = CASE WHEN $3 = 'revoked' THEN now() ELSE NULL END,
-           authority_version = memories.authority_version + 1,
-           updated_at = now()
-       FROM target
-       WHERE memories.id = target.id
-         AND target.authority_required
-         AND target.authority_version = $8
-         AND target.authority_state <> $3
-       RETURNING ${memoryResponseSelect('memories')},
-                 target.authority_state AS previous_authority_state,
-                 target.authority_version AS previous_authority_version
-     ), authority_audit AS (
-       INSERT INTO memory_authority_events (
-         vault_id, memory_id, event_type, old_state, new_state, old_version, new_version,
-         actor_type, actor_id, source, reason
-       )
-       SELECT $1, updated.id, $4, updated.previous_authority_state, updated.authority_state,
-              updated.previous_authority_version, updated.authority_version,
-              $7, $5, 'api', $9
-       FROM updated
-       RETURNING id
-     )
-     SELECT updated.*, (SELECT id FROM authority_audit LIMIT 1) AS authority_event_id
-     FROM updated`,
-    [
-      vault.id,
-      memoryId,
-      nextState,
-      eventType,
-      actor.id,
-      request.auth?.method ?? 'api_key',
-      actor.type,
-      parsedBody.data.expected_version,
-      parsedBody.data.reason
-    ]
-  );
-  if (!result.rowCount) {
-    return reply.code(409).send({ error: 'Memory authority changed concurrently' });
-  }
-
-  const {
-    previous_authority_state: _previousState,
-    previous_authority_version: _previousVersion,
-    authority_event_id: _authorityEventId,
-    ...responseRow
-  } = result.rows[0];
-  return decryptMemoryRow(vault, responseRow);
 }
 
 async function recordMemoryCreatedActivity(
@@ -936,7 +541,7 @@ async function fetchVisibleGraphSeed(vaultId: string, seedMemoryId: string): Pro
      WHERE vault_id = $1
        AND id = $2
        AND archived_at IS NULL
-       AND (status IS NULL OR status <> 'candidate')
+       AND status='active'
      LIMIT 1`,
     [vaultId, seedMemoryId]
   );
@@ -997,7 +602,7 @@ async function fetchGraphNeighborNodes(
      JOIN memories ON memories.id = ranked_edges.neighbor_id
      WHERE memories.vault_id = $1
        AND memories.archived_at IS NULL
-       AND (memories.status IS NULL OR memories.status <> 'candidate')
+       AND memories.status='active'
      ORDER BY ranked_edges.confidence DESC, memories.salience DESC, ranked_edges.edge_updated_at DESC, memories.updated_at DESC, memories.id
      LIMIT $6`,
     [vaultId, frontierIds, excludedIds, edgeTypes, nextDepth, limit, perFrontierNodeLimit]
@@ -1012,7 +617,7 @@ async function fetchGraphOverviewNodes(vaultId: string, limit: number): Promise<
      FROM memories
      WHERE vault_id = $1
        AND archived_at IS NULL
-       AND (status IS NULL OR status <> 'candidate')
+       AND status='active'
      ORDER BY salience DESC, updated_at DESC, created_at DESC, id
      LIMIT $2`,
     [vaultId, limit]
@@ -1141,26 +746,23 @@ function readBoolean(value: unknown): boolean | null {
 
 async function listMemories(
   vault: { id: string; encrypted_dek: string | null; vault_encryption_enabled: boolean },
-  qs: z.infer<typeof listQuerySchema>,
-  includePending = false
+  qs: z.infer<typeof listQuerySchema>
 ): Promise<{ items: Awaited<ReturnType<typeof decryptMemoryRow>>[]; total: number }> {
   if (isVaultEncryptionActive(vault) && qs.q) {
-    return listEncryptedSearchMemories(vault, qs, includePending);
+    return listEncryptedSearchMemories(vault, qs);
   }
 
-  const rows = await listMemoryRows(vault, qs, includePending);
+  const rows = await listMemoryRows(vault, qs);
   const items = await Promise.all(rows.items.map((row) => decryptMemoryRow(vault, row)));
   return { items, total: rows.total };
 }
 
 async function listMemoryRows(
   vault: { id: string; encrypted_dek: string | null; vault_encryption_enabled: boolean },
-  qs: z.infer<typeof listQuerySchema>,
-  includePending = false
+  qs: z.infer<typeof listQuerySchema>
 ): Promise<{ items: MemoryResponseRow[]; total: number }> {
   const values: unknown[] = [vault.id];
   const conditions = [`vault_id = $1`];
-  if (!includePending) conditions.push(`status <> 'candidate'`);
 
   if (qs.archived === 'false') {
     conditions.push('archived_at IS NULL');
@@ -1209,13 +811,13 @@ async function listMemoryRows(
              JOIN tree t ON m.parent_id = t.id
              WHERE m.vault_id = $1
                AND ${qs.archived === 'false'
-                 ? `m.archived_at IS NULL${includePending ? '' : ` AND m.status <> 'candidate'`}`
-                 : `m.archived_at IS NOT NULL${includePending ? '' : ` AND m.status <> 'candidate'`}`}
+                 ? `m.archived_at IS NULL`
+                 : `m.archived_at IS NOT NULL`}
                AND t.depth < 10
            )`;
     const finalArchivedClause = qs.archived === 'false'
-      ? `archived_at IS NULL${includePending ? '' : ` AND status <> 'candidate'`}`
-      : `archived_at IS NOT NULL${includePending ? '' : ` AND status <> 'candidate'`}`;
+      ? `archived_at IS NULL`
+      : `archived_at IS NOT NULL`;
     sql = `${treeSql}
            SELECT ${memoryResponseSelect('tree')}
            FROM tree
@@ -1252,8 +854,7 @@ async function listMemoryRows(
 
 async function listEncryptedSearchMemories(
   vault: { id: string; encrypted_dek: string | null; vault_encryption_enabled: boolean },
-  qs: z.infer<typeof listQuerySchema>,
-  includePending = false
+  qs: z.infer<typeof listQuerySchema>
 ): Promise<{ items: Awaited<ReturnType<typeof decryptMemoryRow>>[]; total: number }> {
   const pageSize = 200;
   const rows: MemoryResponseRow[] = [];
@@ -1261,7 +862,7 @@ async function listEncryptedSearchMemories(
   let total = 0;
 
   do {
-    const page = await listMemoryRows(vault, { ...qs, limit: pageSize, offset, q: undefined }, includePending);
+    const page = await listMemoryRows(vault, { ...qs, limit: pageSize, offset, q: undefined });
     rows.push(...page.items);
     total = page.total;
     if (page.items.length === 0) break;
@@ -1285,7 +886,7 @@ async function listMemorySubjects(
   qs: z.infer<typeof subjectListQuerySchema>
 ): Promise<{ items: MemorySubjectSummary[]; total: number }> {
   const values: unknown[] = [vault.id];
-  const conditions = [`vault_id = $1`, `status <> 'candidate'`];
+  const conditions = [`vault_id = $1`];
   if (qs.archived === 'false') {
     conditions.push('archived_at IS NULL');
   } else {

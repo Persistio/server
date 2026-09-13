@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('embedder');
 import OpenAI from 'openai';
 import { GoogleAuth } from 'google-auth-library';
 import pLimit from 'p-limit';
@@ -522,7 +524,7 @@ async function recordEmbeddingUsage(input: {
       input.telemetry.usageClient
     );
   } catch (error) {
-    console.warn(JSON.stringify({
+    operationalLog.warn(JSON.stringify({
       level: 40,
       msg: 'failed to record embedding usage',
       provider: input.provider,

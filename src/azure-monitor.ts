@@ -57,23 +57,15 @@ export function useAzureMonitor(options: AzureMonitorOpenTelemetryOptions = {}) 
   const metricReader = new PeriodicExportingMetricReader({
     exporter: new AzureMonitorMetricExporter({ connectionString })
   });
-  const instrumentationConfig: Record<string, { enabled: boolean }> = {
-    '@opentelemetry/instrumentation-azure-sdk': {
-      enabled: isEnabled(options.instrumentationOptions?.azureSdk)
-    },
-    '@opentelemetry/instrumentation-http': {
-      enabled: isEnabled(options.instrumentationOptions?.http)
-    },
-    '@opentelemetry/instrumentation-pg': {
-      enabled: isEnabled(options.instrumentationOptions?.postgreSql)
-    }
-  };
 
   sdk = new NodeSDK({
     serviceName: options.serviceName ?? 'persistio-server',
+    resourceDetectors: [memoryProducerDetector],
     traceExporter,
     metricReaders: [metricReader],
-    instrumentations: [getNodeAutoInstrumentations(instrumentationConfig)]
+    // Automatic HTTP/DB/SDK spans can export URLs, statements and raw provider
+    // exceptions. Only the explicit allowlisted platform spans are exported.
+    instrumentations: []
   });
 
   sdk.start();
@@ -93,24 +85,15 @@ export function useOtlpTelemetry(options: OtlpOpenTelemetryOptions = {}) {
       url: options.metricEndpoint ?? buildOtlpEndpoint(endpoint, 'v1/metrics')
     })
   });
-  const instrumentationConfig: Record<string, { enabled: boolean }> = {
-    '@opentelemetry/instrumentation-azure-sdk': {
-      enabled: isEnabled(options.instrumentationOptions?.azureSdk)
-    },
-    '@opentelemetry/instrumentation-http': {
-      enabled: isEnabled(options.instrumentationOptions?.http)
-    },
-    '@opentelemetry/instrumentation-pg': {
-      enabled: isEnabled(options.instrumentationOptions?.postgreSql)
-    }
-  };
 
   sdk = new NodeSDK({
     serviceName: options.serviceName ?? 'persistio-server',
-    resourceDetectors: [envDetector, processDetector, hostDetector, memoryProducerDetector],
+    resourceDetectors: [memoryProducerDetector],
     traceExporter,
     metricReaders: [metricReader],
-    instrumentations: [getNodeAutoInstrumentations(instrumentationConfig)]
+    // Automatic HTTP/DB/SDK spans can export URLs, statements and raw provider
+    // exceptions. Only the explicit allowlisted platform spans are exported.
+    instrumentations: []
   });
 
   sdk.start();

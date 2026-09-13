@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('prompt-loader');
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -55,24 +57,24 @@ export class PromptLoader {
     try {
       resolved = fs.realpathSync(promptPath);
     } catch {
-      console.warn(`[${this.label}] Could not resolve prompt file path, falling back to default`);
+      operationalLog.warn(`[${this.label}] Could not resolve prompt file path, falling back to default`);
       return this.fallback;
     }
 
     if (!resolved.startsWith(allowedDir + path.sep)) {
-      console.warn(`[${this.label}] Prompt file is outside allowed directory, ignoring`);
+      operationalLog.warn(`[${this.label}] Prompt file is outside allowed directory, ignoring`);
       return this.fallback;
     }
 
     try {
       const content = fs.readFileSync(resolved, 'utf8').trim();
       if (Buffer.byteLength(content, 'utf8') > 65536) {
-        console.warn(`[${this.label}] Prompt file exceeds 64KB limit, falling back to default`);
+        operationalLog.warn(`[${this.label}] Prompt file exceeds 64KB limit, falling back to default`);
         return this.fallback;
       }
       return content;
     } catch {
-      console.warn(`[${this.label}] Failed to read prompt file, falling back to default`);
+      operationalLog.warn(`[${this.label}] Failed to read prompt file, falling back to default`);
       return this.fallback;
     }
   }

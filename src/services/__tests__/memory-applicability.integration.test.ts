@@ -41,30 +41,27 @@ describeWithPostgres('memory applicability boundary (PostgreSQL)', () => {
       );
       const result = await pool.query(
         `SELECT m.id FROM memories m WHERE m.id = $1 AND m.vault_id = $2
-         AND ${memoryApplicabilityPredicateSql('m', '$3', '$4', '$5', '$6')}`,
-        [inserted.rows[0].id, vaultA, context.session_id, null, null, false]
+         AND ${memoryApplicabilityPredicateSql('m', '$3', '$4', '$5')}`,
+        [inserted.rows[0].id, vaultA, context.session_id, null, null]
       );
       expect(result.rows).toEqual(inserted.rows);
       await pool.query('DELETE FROM memories WHERE id = $1', [inserted.rows[0].id]);
     }
   });
 
-  it('requires bindings for active non-global writes and for later promotion', async () => {
+  it('requires bindings for every retained non-global status, with no pending escape hatch', async () => {
+    for (const status of ['active', 'superseded', 'contradicted']) {
     await expect(pool.query(
       `INSERT INTO memories (vault_id, data, subject, hash, scope, status)
-       VALUES ($1, 'unbound active', 'scope', $2, 'project', 'active')`,
-      [vaultA, crypto.randomUUID()]
-    )).rejects.toMatchObject({ code: 'P0001' });
-
-    const quarantined = await pool.query<{ id: string }>(
-      `INSERT INTO memories (vault_id, data, subject, hash, scope, status)
-       VALUES ($1, 'unbound review', 'scope', $2, 'project', 'needs_review') RETURNING id`,
-      [vaultA, crypto.randomUUID()]
-    );
+       VALUES ($1, 'unbound', 'scope', $2, 'project', $3)`,
+      [vaultA, crypto.randomUUID(), status]
+    )).rejects.toMatchObject({ code: '23514' });
+    }
     await expect(pool.query(
-      `UPDATE memories SET status = 'active' WHERE id = $1`,
-      [quarantined.rows[0].id]
-    )).rejects.toMatchObject({ code: 'P0001' });
+      `INSERT INTO memories (vault_id,data,subject,hash,scope,scope_key,status)
+       VALUES ($1,'pending','scope',$2,'project','bound','needs_review')`,
+      [vaultA,crypto.randomUUID()]
+    )).rejects.toMatchObject({ code: '23514' });
   });
 
   it('isolates entity aliases by the same exact scope binding', async () => {
@@ -100,7 +97,7 @@ describeWithPostgres('memory applicability boundary (PostgreSQL)', () => {
     )).rejects.toMatchObject({ code: '23514' });
   });
 
-  it('returns only exact-context, same-vault, eligible rows and gates global rules', async () => {
+  it('returns only exact-context, same-vault, eligible rows with no special rule policy', async () => {
     const rows = [
       ['project-a', vaultA, 'system_fact', 'project', 'project-a', 'low', 0.9, null],
       ['project-b', vaultA, 'system_fact', 'project', 'project-b', 'low', 0.9, null],
@@ -117,31 +114,30 @@ describeWithPostgres('memory applicability boundary (PostgreSQL)', () => {
       );
     }
 
-    const select = async (includeGlobalRules: boolean) => pool.query<{ data: string }>(
+    const select = async () => pool.query<{ data: string }>(
       `SELECT m.data FROM memories m
        WHERE m.vault_id = $1
          AND m.archived_at IS NULL
          AND m.status = 'active'
-         AND ${memoryApplicabilityPredicateSql('m', '$2', '$3', '$4', '$5')}
-         AND ${memoryEligibilityPredicateSql('m', '$6')}
+         AND ${memoryApplicabilityPredicateSql('m', '$2', '$3', '$4')}
+         AND ${memoryEligibilityPredicateSql('m', '$5')}
        ORDER BY m.data`,
-      [vaultA, null, 'project-a', null, includeGlobalRules, '2026-09-09T10:01:00Z']
+      [vaultA, null, 'project-a', null, '2026-09-09T10:01:00Z']
     );
 
-    expect((await select(false)).rows.map((row) => row.data)).toEqual(['global-fact', 'project-a']);
-    expect((await select(true)).rows.map((row) => row.data)).toEqual(['global-fact', 'global-rule', 'project-a']);
+    expect((await select()).rows.map((row) => row.data)).toEqual(['global-fact', 'global-rule', 'project-a']);
 
     await expect(pool.query(
       `INSERT INTO memories (
          vault_id, data, subject, hash, type, scope, scope_key, sensitivity, confidence, status, source_timestamp
        ) VALUES ($1, 'restricted', 'applicability', $2, 'system_fact', 'project', 'project-a', 'restricted', 0.9, 'active', $3)`,
       [vaultA, crypto.randomUUID(), null]
-    )).rejects.toThrow(/restricted memory cannot be activated/);
+    )).rejects.toThrow(/Invalid active memory/);
     await expect(pool.query(
       `INSERT INTO memories (
          vault_id, data, subject, hash, type, scope, scope_key, sensitivity, confidence, status, source_timestamp
        ) VALUES ($1, 'future', 'applicability', $2, 'system_fact', 'project', 'project-a', 'low', 0.9, 'active', $3)`,
       [vaultA, crypto.randomUUID(), new Date(Date.now() + 10 * 60_000).toISOString()]
-    )).rejects.toThrow(/future source timestamp/);
+    )).rejects.toThrow(/Invalid active memory/);
   });
 });

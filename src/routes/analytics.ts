@@ -262,7 +262,7 @@ function denyAnalyticsQuery(
   request.log.warn({
     ...details,
     error,
-    route: request.routeOptions.url ?? request.url,
+    route: request.routeOptions.url ?? '/unmatched',
     status_code: statusCode
   }, 'Customer analytics query denied');
   return reply.code(statusCode).send({ error });

@@ -1,4 +1,7 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('curation-capacity');
 import type { PoolClient, QueryResultRow } from 'pg';
+import { MIN_CURATOR_INPUT_TOKENS } from './curator-limits';
 
 import { query, withTransaction } from '../db/client';
 import {
@@ -54,7 +57,7 @@ export interface CuratorCapacityStatus {
     defer_reason: string | null;
   };
   recent_runs: Array<{
-    segment_id: string;
+    segment_id: string | null;
     triggered_at: string;
     actions: number;
     applied_actions: number;
@@ -65,7 +68,7 @@ export interface CuratorCapacityStatus {
 export interface ClaimedCurationJobRow {
   queue_id: string;
   vault_id: string;
-  segment_id: string;
+  segment_id: string | null;
   claim_token: string;
   vault_claim_token: string;
 }
@@ -97,7 +100,7 @@ interface StatusRow extends QueryResultRow {
 }
 
 interface RecentRunRow extends QueryResultRow {
-  segment_id: string;
+  segment_id: string | null;
   triggered_at: string;
   actions: string;
   applied_actions: string;
@@ -130,7 +133,7 @@ const unlimitedCuratorLimits: CuratorPlanLimits = {
   curator_candidates_per_run: 400,
   curator_candidates_per_call: 20,
   curator_active_memories_per_call: 80,
-  curator_input_tokens_per_call: 12000,
+  curator_input_tokens_per_call: MIN_CURATOR_INPUT_TOKENS,
   curator_output_tokens_per_call: 2000,
   curator_tokens_per_month: 25000000,
   curator_requests_per_month: 6000,
@@ -194,7 +197,7 @@ export async function getCuratorLimits(vaultId: string, client?: PoolClient): Pr
        JOIN plans AS p
          ON p.id = v.plan_id
        WHERE v.id = $1
-       LIMIT 1`,
+       LIMIT 1 FOR SHARE OF p`,
       [vaultId]
     )
     : await query<VaultLimitsRow>(
@@ -224,6 +227,9 @@ export function getCuratorPlanBlockReason(limits: CuratorPlanLimits): string | n
   if (limits.curator_jobs_per_run <= 0) return 'curator jobs per run limit exhausted';
   if (limits.curator_candidates_per_run <= 0 || limits.curator_candidates_per_call <= 0) return 'curator candidate limit exhausted';
   if (limits.curator_input_tokens_per_call <= 0) return 'curator input token limit exhausted';
+  if (!Number.isSafeInteger(limits.curator_input_tokens_per_call) || limits.curator_input_tokens_per_call < MIN_CURATOR_INPUT_TOKENS) {
+    return `curator input budget must be at least ${MIN_CURATOR_INPUT_TOKENS} whole tokens`;
+  }
   if (limits.curator_output_tokens_per_call <= 0) return 'curator output token limit exhausted';
   return null;
 }
@@ -254,7 +260,7 @@ export async function claimEligibleCurationJobs(limit: number, workerId: string)
          AND GREATEST(0, COALESCE((v.rate_limit_override->>'curator_jobs_per_run'), (p.limits->>'curator_jobs_per_run'), '0')::int) > 0
          AND COALESCE((v.rate_limit_override->>'curator_candidates_per_run'), (p.limits->>'curator_candidates_per_run'), '0')::int > 0
          AND COALESCE((v.rate_limit_override->>'curator_candidates_per_call'), (p.limits->>'curator_candidates_per_call'), '0')::int > 0
-         AND COALESCE((v.rate_limit_override->>'curator_input_tokens_per_call'), (p.limits->>'curator_input_tokens_per_call'), '0')::int > 0
+         AND COALESCE((v.rate_limit_override->>'curator_input_tokens_per_call'), (p.limits->>'curator_input_tokens_per_call'), '0')::int >= ${MIN_CURATOR_INPUT_TOKENS}
          AND COALESCE((v.rate_limit_override->>'curator_output_tokens_per_call'), (p.limits->>'curator_output_tokens_per_call'), '0')::int > 0
          AND (vcs.next_curator_run_at IS NULL OR vcs.next_curator_run_at <= now())
          AND (vcs.curator_claimed_until IS NULL OR vcs.curator_claimed_until <= now())
@@ -352,6 +358,8 @@ export async function recordCuratorUsageInTransaction(client: PoolClient, input:
   completionTokens: number;
   limits: CuratorPlanLimits;
   actionReceipt?: { queueId: string; actionKey: string };
+  /** Provider attempts, returned token usage and committed work are separate receipts. */
+  requestCount?: number;
 }): Promise<boolean> {
   const period = getCurrentUsagePeriod();
   const curatorRuns = input.countRun === false ? 0 : 1;
@@ -374,20 +382,20 @@ export async function recordCuratorUsageInTransaction(client: PoolClient, input:
          vault_id, period, curator_runs, curator_requests, curator_input_tokens,
          curator_output_tokens, curator_candidates_processed, updated_at
        )
-       VALUES ($1, $2, $3, 1, $4, $5, $6, now())
+       VALUES ($1, $2, $3, $7, $4, $5, $6, now())
        ON CONFLICT (vault_id) DO UPDATE
        SET period = EXCLUDED.period,
            ingest_events = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.ingest_events ELSE 0 END,
            memory_adds = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.memory_adds ELSE 0 END,
            searches = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.searches ELSE 0 END,
            curator_runs = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_runs + EXCLUDED.curator_runs ELSE EXCLUDED.curator_runs END,
-           curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests + 1 ELSE 1 END,
+           curator_requests = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_requests + EXCLUDED.curator_requests ELSE EXCLUDED.curator_requests END,
            curator_input_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_input_tokens + EXCLUDED.curator_input_tokens ELSE EXCLUDED.curator_input_tokens END,
            curator_output_tokens = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_output_tokens + EXCLUDED.curator_output_tokens ELSE EXCLUDED.curator_output_tokens END,
            curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed + EXCLUDED.curator_candidates_processed ELSE EXCLUDED.curator_candidates_processed END,
            curator_candidates_deferred = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred ELSE 0 END,
            updated_at = now()`,
-      [input.vaultId, period, curatorRuns, input.promptTokens, input.completionTokens, input.candidatesProcessed]
+      [input.vaultId, period, curatorRuns, input.promptTokens, input.completionTokens, input.candidatesProcessed,input.requestCount ?? 1]
   );
   if (curatorRuns > 0) {
     await client.query(
@@ -454,7 +462,7 @@ export async function recordCuratorRunCompletedActivity(input: {
     );
     return true;
   } catch (error) {
-    console.warn(JSON.stringify({
+    operationalLog.warn(JSON.stringify({
       err: error instanceof Error ? error.message : String(error),
       event_type: curatorRunCompletedEventType,
       msg: 'failed to write curator activity event outbox row',
@@ -555,15 +563,17 @@ export async function getCurationStatus(vaultId: string): Promise<CuratorCapacit
     ),
     query<RecentRunRow>(
       `SELECT
-         segment_id::text,
-         MAX(triggered_at)::text AS triggered_at,
-         COUNT(*)::text AS actions,
-         COUNT(*) FILTER (WHERE applied_at IS NOT NULL)::text AS applied_actions,
-         COUNT(*) FILTER (WHERE error IS NOT NULL)::text AS errors
-       FROM curation_action_log
-       WHERE vault_id = $1
-       GROUP BY segment_id
-       ORDER BY MAX(triggered_at) DESC
+         r.segment_id::text,
+         r.created_at::text AS triggered_at,
+         COUNT(a.id)::text AS actions,
+         COUNT(a.id) FILTER (WHERE a.applied_at IS NOT NULL)::text AS applied_actions,
+         (CASE WHEN r.validation_status IN ('invalid','application_failed') THEN 1
+           ELSE COUNT(a.id) FILTER (WHERE a.error IS NOT NULL) END)::text AS errors
+       FROM curation_review_runs r LEFT JOIN curation_action_log a
+         ON a.review_run_id=r.id AND a.vault_id=r.vault_id
+       WHERE r.vault_id = $1
+       GROUP BY r.id
+       ORDER BY r.created_at DESC,r.id
        LIMIT 10`,
       [vaultId]
     )

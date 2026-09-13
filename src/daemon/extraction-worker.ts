@@ -1,3 +1,5 @@
+import { createOperationalLogger } from '../operational-metadata';
+const operationalLog=createOperationalLogger('extraction-worker');
 import crypto from 'node:crypto';
 import { parentPort } from 'node:worker_threads';
 import { shutdownTelemetry } from '../azure-monitor';
@@ -7,7 +9,6 @@ import pLimit from 'p-limit';
 import { getConfig } from '../config';
 import { closePool, query } from '../db/client';
 import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram, extractionCandidatesCounter, extractionJobsCounter, extractionLagHistogram } from '../metrics';
-import { memoryPolicyEventCounter } from '../services/observability-effects';
 import { CircuitBreakerOpenError, isRateLimitError } from '../services/ai-resilience';
 import { drainDueContradictionActivations } from '../services/contradiction-activation';
 import { prepareVaultCrypto, initCryptoClient, type PreparedVaultCrypto } from '../services/crypto';
@@ -15,15 +16,10 @@ import { deduplicateMemoryInTransaction, getDedupEscalationRequest, type DedupIn
 import { publishCommittedWorkerEffects, type WorkerEffect } from '../services/worker-effects';
 import { filterMemoryCandidates } from '../services/deterministic-filter';
 import { getEmbedder } from '../services/embedder';
-import { formatConversationForExtraction } from '../services/extraction-formatting';
+import { admitExtractionCandidates, formatExtractionSources, resolveExtractionSources, sourceHasHumanIntent, type ExtractionSource } from '../services/extraction-contract';
+import { freezeExtractionContext, MAX_EXTRACTION_CONTEXT_BYTES } from '../services/extraction-context';
+import { enqueueCurationWork } from '../services/curation-work';
 import { buildPromptHeader } from '../services/extraction-prompt-header';
-import {
-  formatProvenanceForPrompt,
-  getProvenancePreGate,
-  inferExtractionProvenance,
-  requiresBehavioralReview,
-  UNTRUSTED_PROVENANCE_POLICY_CODE
-} from '../services/extraction-provenance';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 import { ExtractorService } from '../services/extractor';
 import { getRawChunkStorage } from '../services/raw-chunk-storage';
@@ -31,10 +27,7 @@ import type { ConflictResolution } from '../services/extractor';
 import { completePersistentJobIfReady, failPersistentJob, markPersistentJobRunning } from '../services/job-status';
 import { archiveStaleMemories } from '../services/staleness';
 import { AiBudgetDeferredError } from '../services/usage';
-import { isCuratorEnabled } from '../services/curation-capacity';
-import { deriveExtractionMemoryStatus } from '../services/memory-ingestion-policy';
 import { initCustomerMetrics, shutdownCustomerMetrics } from '../services/customer-metrics';
-import { enqueueCurationIfSegmentReady } from '../services/segment-curation-readiness';
 import {
   getVaultSubjectList,
   normaliseSubject,
@@ -52,6 +45,7 @@ import {
   isFutureSourceTimestamp,
   MISSING_SCOPE_BINDING_POLICY_CODE,
   scopeKeyForContext,
+  recallContextSchema,
   type RecallContext
 } from '../services/memory-applicability';
 import {
@@ -93,6 +87,7 @@ interface RawChunkRow {
   blob_key: string | null;
   created_at: string;
   provenance: unknown;
+  capture_context?: unknown;
 }
 
 interface SegmentRow {
@@ -192,7 +187,7 @@ async function shutdownWorker(deadlineValue?: unknown) {
         });
         complete = !workerLoopFailed;
       } catch {
-        console.warn('[persistio] Worker shutdown incomplete');
+        operationalLog.warn('[persistio] Worker shutdown incomplete');
       } finally {
         try { parentPort?.postMessage({ type: complete ? 'shutdown-complete' : 'shutdown-failed' }); }
         finally { parentPort?.close(); }
@@ -276,46 +271,28 @@ export async function processBatch(vaultId?: string) {
             decryptedContent: preparedCrypto.decrypt(job.vault, await readRawChunkContent(chunk))
           })));
 
-          const provenance = inferExtractionProvenance({
-            sessionId: job.sessionId,
-            triggerType: job.context.trigger_type,
-            chunks: decryptedChunks.map((chunk) => ({
-              role: chunk.role,
-              provenance: chunk.provenance,
-              content: chunk.decryptedContent
-            }))
-          });
-          const provenanceGate = getProvenancePreGate(provenance);
-          if (provenanceGate) {
-            span.setAttribute('extraction.candidates.extracted', 0);
-            span.setAttribute('extraction.candidates.accepted', 0);
-            span.setAttribute('extraction.candidates.dropped', 0);
-            span.setAttribute('extraction.provenance.pre_gate', true);
-            span.setAttribute('extraction.provenance.source_class', provenance.source_class);
-            extractionCandidatesCounter.add(1, {
-              status: 'dropped',
-              reason: 'provenance_pre_gate',
-              vault_id: job.vault.id,
-              session_id: job.sessionId
-            });
-            console.log(JSON.stringify({
-              level: 30,
-              msg: 'extraction provenance pre-gate noop',
-              vault_id: job.vault.id,
-              session_id: job.sessionId,
-              source_class: provenance.source_class,
-              actor_type: provenance.actor_type,
-              trigger_type: provenance.trigger_type,
-              artifact_type: provenance.artifact_type,
-              authorship: provenance.authorship,
-              cadence: provenance.cadence,
-              reason: provenanceGate.reason
-            }));
+          const contextChunks = await withWorkerLeaseTransaction(lease, client => freezeExtractionContext(client, {
+            queueId: job.queueId, vaultId: job.vault.id, chunkIds: job.chunkIds, context: job.context,
+            blobStore: getRawChunkStorage().store
+          }));
+          const contextSources: ExtractionSource[] = [];
+          let contextBytes = 0;
+          for (const chunk of contextChunks) {
+            assertNotLost();
+            const content = preparedCrypto.decrypt(job.vault, await readRawChunkContent(chunk));
+            const bytes = Buffer.byteLength(content, 'utf8');
+            if (contextBytes + bytes > MAX_EXTRACTION_CONTEXT_BYTES) continue;
+            contextBytes += bytes;
+            contextSources.push({ ...chunk, content, current: false });
+          }
+          const sources: ExtractionSource[] = [...contextSources, ...decryptedChunks
+            .filter(chunk => chunk.role === 'user' || chunk.role === 'assistant')
+            .map(chunk => ({ ...chunk, content: chunk.decryptedContent, current: true }))];
+          if (!sources.some(source => source.current)) {
             await completeExtractionJob(job, lease);
             return;
           }
-
-          const conversation = formatConversationForExtraction(decryptedChunks);
+          const conversation = formatExtractionSources(sources, job.context);
           const sessionContextCacheKey = `${job.vault.id}:${job.sessionId}`;
           assertNotLost();
           const sessionContext = sessionContextCache.get(sessionContextCacheKey)
@@ -326,24 +303,28 @@ export async function processBatch(vaultId?: string) {
             // Subject aliases are intentionally not injected before facts have a
             // model-assigned scope. Canonicalisation below loads only the exact
             // binding for each resulting fact.
-            buildPromptHeader(job.vault.purpose, sessionContext, []),
-            formatProvenanceForPrompt(provenance)
+            buildPromptHeader(job.vault.purpose, sessionContext, [])
           ].filter(Boolean).join('\n\n');
           assertNotLost();
           const facts = await extractor.extractFacts(
             conversation,
             promptHeader,
             job.vault.id,
-            decryptVaultPromptContext(job.vault, preparedCrypto)
+            decryptVaultPromptContext(job.vault, preparedCrypto),
+            { humanIntentAvailable: sources.some(sourceHasHumanIntent) }
           );
-          const filteredByScore = facts.filter((fact) => fact.score >= config.EXTRACTION_SCORE_THRESHOLD);
+          // Full-response parsing and referential integrity precede proposal admission.
+          // A context duplicate or unsupported human preference does not retry an
+          // otherwise valid capture. Corrupt references/bindings still fail it all.
+          const admission = admitExtractionCandidates(facts, sources, job.context);
+          const filteredByScore = admission.accepted.filter((fact) => fact.score >= config.EXTRACTION_SCORE_THRESHOLD);
           const afterSecretFilter = filteredByScore.filter((fact) => {
             const match = matchSecretPattern(fact.fact);
             if (!match) {
               return true;
             }
 
-            console.warn(JSON.stringify({
+            operationalLog.warn(JSON.stringify({
               level: 40,
               msg: 'secret pre-filter: discarding fact before sensitivity filter',
               subject: fact.subject,
@@ -358,7 +339,7 @@ export async function processBatch(vaultId?: string) {
             if (fact.sensitivity !== 'restricted') {
               return true;
             }
-            console.warn(JSON.stringify({
+            operationalLog.warn(JSON.stringify({
               level: 40,
               msg: 'sensitivity filter: discarding restricted memory before embed',
               subject: fact.subject
@@ -369,7 +350,7 @@ export async function processBatch(vaultId?: string) {
           const deterministicFilterResult = filterMemoryCandidates(nonRestrictedFacts);
           span.setAttribute('extraction.candidates.extracted', facts.length);
           span.setAttribute('extraction.candidates.accepted', deterministicFilterResult.accepted.length);
-          span.setAttribute('extraction.candidates.dropped', deterministicFilterResult.dropped.length);
+          span.setAttribute('extraction.candidates.dropped', facts.length - deterministicFilterResult.accepted.length);
 
           extractionCandidatesCounter.add(deterministicFilterResult.accepted.length, {
             status: 'accepted',
@@ -378,6 +359,9 @@ export async function processBatch(vaultId?: string) {
           });
 
           const droppedByReason = new Map<string, number>();
+          for (const [reason, count] of Object.entries(admission.excluded)) {
+            if (count > 0) droppedByReason.set(reason, count);
+          }
           for (const dropped of deterministicFilterResult.dropped) {
             droppedByReason.set(dropped.reason, (droppedByReason.get(dropped.reason) ?? 0) + 1);
           }
@@ -391,18 +375,27 @@ export async function processBatch(vaultId?: string) {
             });
           }
 
-          const factsToEmbed = deterministicFilterResult.accepted.map((candidate) => candidate.fact);
+          const factsToEmbed: NonRestrictedFact[] = deterministicFilterResult.accepted.map(({fact}) => fact);
 
-          console.log(JSON.stringify({
+          operationalLog.log(JSON.stringify({
             level: 30,
             msg: 'extraction pipeline attrition',
             raw_facts: facts.length,
+            after_source_filter: admission.accepted.length,
+            excluded_context_only: admission.excluded.context_only,
+            excluded_unsupported_human_intent: admission.excluded.unsupported_human_intent,
             after_score_filter: filteredByScore.length,
             after_secret_filter: afterSecretFilter.length,
             after_sensitivity_filter: nonRestrictedFacts.length,
             after_deterministic_filter: factsToEmbed.length,
             threshold: config.EXTRACTION_SCORE_THRESHOLD
           }));
+
+          if (factsToEmbed.length === 0) {
+            assertNotLost();
+            await completeExtractionJob(job, lease);
+            return;
+          }
 
           // Subject canonicalisation: resolve each fact's subject through tiers
           const resolvedFacts = new Array<NonRestrictedFact>(factsToEmbed.length);
@@ -423,7 +416,7 @@ export async function processBatch(vaultId?: string) {
                 fact.scope,
                 scopeKey
               ).catch((err) => {
-                console.warn(JSON.stringify({
+                operationalLog.warn(JSON.stringify({
                   level: 40,
                   msg: 'failed to load bound subject list',
                   vault_id: job.vault.id,
@@ -509,9 +502,6 @@ export async function processBatch(vaultId?: string) {
           );
 
           const memoryInputs: DedupInput[] = [];
-          const sourceTimestamp = getLatestChunkTimestamp(job.chunks);
-          const sourceTimestampIsFuture = sourceTimestamp !== null
-            && isFutureSourceTimestamp(sourceTimestamp);
 
           for (let i = 0; i < factsToEmbed.length; i++) {
             const fact = resolvedFacts[i];
@@ -520,46 +510,19 @@ export async function processBatch(vaultId?: string) {
             }
             const embedding = factEmbeddings[i];
             const scopeKey = scopeKeyForContext(fact.scope, job.context);
-            const policyRejections = [...(fact.policy_rejections ?? [])];
-            if (fact.scope !== 'global' && scopeKey === null) {
-              policyRejections.push({
-                code: MISSING_SCOPE_BINDING_POLICY_CODE,
-                field: 'scope_key',
-                reason: 'missing'
-              });
+            const supportingSources = resolveExtractionSources(fact, sources, job.context);
+            const sourceTimestamp = getLatestChunkTimestamp(supportingSources);
+            if (sourceTimestamp !== null && isFutureSourceTimestamp(sourceTimestamp)) {
+              throw new Error('Source timestamp exceeds accepted clock skew');
             }
-            if (sourceTimestampIsFuture) {
-              policyRejections.push({
-                code: FUTURE_SOURCE_TIMESTAMP_POLICY_CODE,
-                field: 'source_timestamp',
-                reason: 'future'
-              });
-            }
-            if (requiresBehavioralReview(provenance, fact.type)) {
-              policyRejections.push({
-                code: UNTRUSTED_PROVENANCE_POLICY_CODE,
-                field: 'provenance',
-                reason: provenance.trigger_type === 'backfill' || provenance.authorship === 'imported'
-                  ? 'imported'
-                  : 'ambiguous'
-              });
-            }
-            const status = deriveExtractionMemoryStatus(policyRejections);
-            if (fact.type === 'user_rule') {
-              memoryPolicyEventCounter.add(1, {
-                event: 'generated_rule_proposal',
-                source: 'extraction_worker',
-                scope: fact.scope,
-                outcome: status
-              });
-            }
+            const status = 'active' as const;
             memoryInputs.push({
               vaultId: job.vault.id,
               fact: fact.fact,
               score: fact.score,
               subject: fact.subject,
               embedding,
-              sourceChunks: job.chunkIds,
+              sourceChunks: supportingSources.map(source => source.id),
               salience: fact.salience,
               sensitivity: fact.sensitivity,
               type: fact.type,
@@ -568,12 +531,11 @@ export async function processBatch(vaultId?: string) {
               polarity: fact.polarity,
               status,
               volatility: fact.volatility,
-              evidence: fact.evidence,
+              evidence: JSON.stringify({ summary: fact.evidence, scope_basis: fact.scope_basis }),
               validFrom: fact.valid_from,
               validUntil: fact.valid_until,
               sourceSegmentId: job.segmentId,
-              sourceTimestamp,
-              policyRejections
+              sourceTimestamp
             });
           }
 
@@ -598,7 +560,7 @@ export async function processBatch(vaultId?: string) {
             validPrecomputedDecisionIds.add(request.id);
           }
 
-          console.log(JSON.stringify({
+          operationalLog.log(JSON.stringify({
             level: 30,
             msg: 'extraction escalation routing',
             candidates: memoryInputs.length,
@@ -636,6 +598,10 @@ export async function processBatch(vaultId?: string) {
                 }
               ));
             }
+            await enqueueCurationWork(client, {
+              vaultId: job.vault.id, segmentId: job.segmentId, workKey: 'extraction:' + job.queueId,
+              memoryIds: results.flatMap(result => result.action !== 'skipped' && result.memoryId ? [result.memoryId] : [])
+            });
             await finalizeExtractionJob(client, job, lease);
             return results;
           });
@@ -656,7 +622,7 @@ export async function processBatch(vaultId?: string) {
           if (error instanceof AiBudgetDeferredError) {
             aiBudgetWaitHistogram.record(error.waitMs, { role: error.role, queue: 'extraction', vault_id: queuedJob.vault_id });
             aiBudgetThrottledJobsCounter.add(1, { role: error.role, queue: 'extraction', vault_id: queuedJob.vault_id });
-            console.info(JSON.stringify({
+            operationalLog.info(JSON.stringify({
               level: 30,
               msg: 'deferring extraction job for ai budget',
               queue_id: queuedJob.queue_id,
@@ -668,7 +634,7 @@ export async function processBatch(vaultId?: string) {
             return;
           }
           if (error instanceof CircuitBreakerOpenError) {
-            console.warn(JSON.stringify({
+            operationalLog.warn(JSON.stringify({
               level: 40,
               msg: 'skipping extraction job while circuit breaker is open',
               queue_id: queuedJob.queue_id,
@@ -678,12 +644,12 @@ export async function processBatch(vaultId?: string) {
             return;
           }
           const lastError = error instanceof Error ? error.message : 'Unknown extraction error';
-          console.error(getSpanAttributes({ error, queueId: queuedJob.queue_id }), 'Extraction job failed');
+          operationalLog.error(getSpanAttributes({ error, queueId: queuedJob.queue_id }), 'Extraction job failed');
           if (!(error instanceof StaleWorkerLeaseError)) await failQueuedJob(queuedJob, lease, lastError);
         }
       } catch (error) {
         const lastError = error instanceof Error ? error.message : 'Unknown extraction error';
-        console.error(getSpanAttributes({ error, queueId: queuedJob.queue_id }), 'Extraction job failed');
+        operationalLog.error(getSpanAttributes({ error, queueId: queuedJob.queue_id }), 'Extraction job failed');
         if (!(error instanceof StaleWorkerLeaseError)) await failQueuedJob(queuedJob, lease, lastError);
       } finally {
         await heartbeat.stop();
@@ -700,7 +666,7 @@ export async function processBatch(vaultId?: string) {
 
       for (const result of results) {
         if (result.status === 'rejected') {
-          console.error(JSON.stringify({
+          operationalLog.error(JSON.stringify({
             level: 50,
             msg: 'unexpected batch job rejection',
             error: result.reason instanceof Error ? result.reason.message : String(result.reason)
@@ -738,14 +704,6 @@ async function finalizeExtractionJob(client: import('pg').PoolClient, job: Loade
     [job.chunkIds, job.vault.id]
   );
 
-  if (job.segmentId) {
-    const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(job.vault.id, client);
-    await enqueueCurationIfSegmentReady(client, {
-      vaultId: job.vault.id,
-      segmentId: job.segmentId,
-      enqueue
-    });
-  }
 
   await completePersistentJobIfReady(client, job.jobId);
 }
@@ -754,23 +712,15 @@ async function deadLetterQueuedJob(queuedJob: QueuedWorkRow, lease: WorkerLease,
   await withWorkerLeaseTransaction(lease, async (client) => {
     if (!await recordWorkerAction(client, lease, 'dead-letter')) return;
     await client.query(
-      `INSERT INTO extraction_dead_letter (vault_id, chunk_id, segment_id, retry_count, last_error, job_id)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [queuedJob.vault_id, queuedJob.chunk_id, queuedJob.segment_id, retryCount, lastError, queuedJob.job_id]
+      `INSERT INTO extraction_dead_letter (vault_id, chunk_id, segment_id, retry_count, last_error, job_id,source_queue_id,context_chunk_ids)
+       SELECT $1,$2,$3,$4,$5,$6,id,context_chunk_ids FROM extraction_queue WHERE id=$7`,
+      [queuedJob.vault_id, queuedJob.chunk_id, queuedJob.segment_id, retryCount, lastError, queuedJob.job_id,queuedJob.queue_id]
     );
     const deleted = await client.query(
       `DELETE FROM extraction_queue WHERE id = $1 AND claim_token = $2 AND claimed_by = $3`,
       [queuedJob.queue_id, lease.claimToken, lease.workerId]
     );
     if (deleted.rowCount !== 1) throw new StaleWorkerLeaseError(lease);
-    if (queuedJob.segment_id) {
-      const enqueue = config.CURATOR_AUTO_RUN && await isCuratorEnabled(queuedJob.vault_id, client);
-      await enqueueCurationIfSegmentReady(client, {
-        vaultId: queuedJob.vault_id,
-        segmentId: queuedJob.segment_id,
-        enqueue
-      });
-    }
     await failPersistentJob(client, queuedJob.job_id, lastError);
   });
 }
@@ -781,7 +731,7 @@ async function failQueuedJob(queuedJob: QueuedWorkRow, lease: WorkerLease, lastE
   const nextRetryCount = queuedJob.retry_count + 1;
 
   if (nextRetryCount >= config.MAX_EXTRACTION_RETRIES) {
-    console.warn(JSON.stringify({
+    operationalLog.warn(JSON.stringify({
       level: 40,
       msg: 'dead-lettering extraction job after retry limit',
       queue_id: queuedJob.queue_id,
@@ -873,7 +823,7 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   }
 
   const chunkResult = await query<RawChunkRow & VaultContextRow>(
-    `SELECT rc.id, rc.vault_id, rc.session_id, rc.role, rc.blob_store, rc.blob_key, rc.created_at, rc.provenance,
+    `SELECT rc.id, rc.vault_id, rc.session_id, rc.role, rc.blob_store, rc.blob_key, rc.created_at, rc.provenance, rc.capture_context,
             v.encrypted_dek, v.vault_encryption_enabled, v.purpose, v.plan_id,
             v.type, v.custom_extraction_prompt, v.custom_curation_prompt
      FROM raw_chunks rc
@@ -890,6 +840,7 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   }
 
   const chunk = chunkResult.rows[0];
+  const captureContext = recallContextSchema.parse(chunk.capture_context ?? {});
   return {
     queueId: queuedJob.queue_id,
     jobId: queuedJob.job_id,
@@ -909,8 +860,9 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
     chunks: [chunk],
     createdAt: chunk.created_at,
     context: {
+      ...captureContext,
       session_id: chunk.session_id,
-      trigger_type: getChunkTriggerType(chunk)
+      trigger_type: captureContext.trigger_type ?? getChunkTriggerType(chunk)
     }
   };
 }
@@ -949,7 +901,7 @@ async function readRawChunkContent(chunk: RawChunkRow): Promise<string> {
   return rawChunkStorage.get(chunk.blob_key);
 }
 
-function getLatestChunkTimestamp(chunks: RawChunkRow[]): string | null {
+function getLatestChunkTimestamp(chunks: Array<{ created_at: string }>): string | null {
   const latest = chunks.reduce<number | null>((currentLatest, chunk) => {
     const value = new Date(chunk.created_at).getTime();
     if (!Number.isFinite(value)) {
@@ -1032,7 +984,7 @@ async function withRateLimitRetries(queuedJob: QueuedWorkRow, fn: () => Promise<
 
       if (attempt >= MAX_EXTRACTION_RATE_LIMIT_RETRIES) {
         const lastError = error instanceof Error ? error.message : 'Extraction rate limit exceeded';
-        console.warn(JSON.stringify({
+        operationalLog.warn(JSON.stringify({
           level: 40,
           msg: 'dead-lettering extraction job after rate limit retries',
           queue_id: queuedJob.queue_id,
@@ -1052,7 +1004,7 @@ async function withRateLimitRetries(queuedJob: QueuedWorkRow, fn: () => Promise<
         EXTRACTION_RATE_LIMIT_BASE_DELAY_MS * (2 ** attempt)
       );
       attempt += 1;
-      console.warn(JSON.stringify({
+      operationalLog.warn(JSON.stringify({
         level: 40,
         msg: 'retrying extraction job after rate limit',
         queue_id: queuedJob.queue_id,
@@ -1106,7 +1058,7 @@ async function runLoop() {
       await trackWorkerTask(processBatch());
     } catch (error) {
       if (!isShuttingDown) {
-        console.error('Extraction loop iteration failed', error);
+        operationalLog.error('Extraction loop iteration failed', error);
       }
     }
 
@@ -1114,7 +1066,7 @@ async function runLoop() {
       try {
         await trackWorkerTask(drainDueContradictionActivations(extractor));
       } catch (error) {
-        console.error('Contradiction activation iteration failed', error);
+        operationalLog.error('Contradiction activation iteration failed', error);
       }
     }
 
@@ -1180,7 +1132,7 @@ if (parentPort) {
   // The failure handler is outside the promise shutdown waits for.
   void workerLoop.catch(async (error) => {
     workerLoopFailed = true;
-    try { console.error(getSpanAttributes({ error }), 'Extraction worker terminated'); }
+    try { operationalLog.error(getSpanAttributes({ error }), 'Extraction worker terminated'); }
     finally { try { await shutdownWorker(); } finally { process.exit(1); } }
   });
 }

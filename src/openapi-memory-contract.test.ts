@@ -60,7 +60,7 @@ describe('OpenAPI memory contract', () => {
     ]);
     expect(document.paths['/v1/memories/graph']?.get).toBeDefined();
     expect(queryParameters('/admin/vaults/{id}/memories')).toEqual([
-      'archived', 'category', 'filter', 'include_children', 'include_pending', 'limit', 'offset', 'q', 'sort', 'subject'
+      'archived', 'category', 'filter', 'include_children', 'limit', 'offset', 'q', 'sort', 'subject'
     ]);
   });
 });

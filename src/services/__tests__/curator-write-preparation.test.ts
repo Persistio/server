@@ -5,8 +5,8 @@ vi.mock('../embedder', () => ({ getEmbedder: () => ({ embed: mocks.embed }) }));
 import { prepareCuratorWrites } from '../curator-write-preparation';
 
 describe('bound curator write preparation', () => {
-  const actions = { nodes_to_create: [{ statement: 'same', subject: 'child' }, { statement: 'parent', subject: 'parent' }],
-    nodes_to_update: [{ statement: 'same', subject: 'child' }] } as never;
+  const actions = { consolidate: [{ memory: {statement: 'same', subject: 'child'} }, { memory: {statement: 'parent', subject: 'parent'} }],
+    update: [{ memory: {statement: 'same', subject: 'child'} }] } as never;
   beforeEach(() => { mocks.embed.mockReset().mockResolvedValueOnce([1, 0]).mockResolvedValueOnce([0, 1]).mockResolvedValueOnce([0.5, 0.5]); });
   it('binds action kind/index/text/subject independently of graph application order', async () => {
     const prepared = await prepareCuratorWrites(actions, 'vault', () => {});

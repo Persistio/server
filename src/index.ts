@@ -1,9 +1,12 @@
+import { createOperationalLogger } from './operational-metadata';
+import { operationalLoggerOptions } from './operational-metadata';
+import { registerPlatformErrorHandler } from './http-error-handler';
+const operationalLog=createOperationalLogger('index');
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 
 import Fastify from 'fastify';
-import type { FastifyReply } from 'fastify';
 
 import { shutdownAzureMonitor } from './azure-monitor';
 import { closeRuntimeHttp, createRuntimeShutdown, drainRuntimeOwner, stopRuntimeWorker } from './runtime-shutdown';
@@ -70,34 +73,6 @@ class InMemoryJobStore implements JobStore {
   }
 }
 
-interface QuotaExceededLike extends Error {
-  headers: Record<string, number | null>;
-  statusCode: number;
-}
-
-function isQuotaExceededError(error: unknown): error is QuotaExceededLike {
-  return error instanceof Error &&
-    error.name === 'QuotaExceededError' &&
-    typeof (error as { statusCode?: unknown }).statusCode === 'number' &&
-    typeof (error as { headers?: unknown }).headers === 'object' &&
-    (error as { headers?: unknown }).headers !== null;
-}
-
-function applyRateLimitHeaders(reply: FastifyReply, headers: Record<string, number | null>) {
-  if (headers.limit !== null) {
-    reply.header('X-RateLimit-Limit', headers.limit);
-  }
-  if (headers.remaining !== null) {
-    reply.header('X-RateLimit-Remaining', headers.remaining);
-  }
-  if (headers.resetAtEpochSeconds !== null) {
-    reply.header('X-RateLimit-Reset', headers.resetAtEpochSeconds);
-  }
-  if (headers.retryAfterSeconds !== null) {
-    reply.header('Retry-After', headers.retryAfterSeconds);
-  }
-}
-
 async function main() {
   const config = getConfig();
   const isAnalyticsApi = config.PERSISTIO_MODE === 'analytics-api';
@@ -116,18 +91,11 @@ async function main() {
     closeDbPool = db.closePool;
     const { runMigrations } = db;
     await runMigrations();
-    // Main process only, after schema readiness. Analytics has no platform DB.
-    const { registerDeliveryHealthMetrics } = await import('./services/delivery-health');
-    registerDeliveryHealthMetrics();
   }
 
   const app = Fastify({
-    logger: {
-      level: process.env.LOG_LEVEL ?? 'info',
-      mixin() {
-        return getSpanAttributes({});
-      }
-    }
+    disableRequestLogging:true,
+    logger: operationalLoggerOptions(()=>getSpanAttributes({}))
   });
   const eventPublisher = shouldStartWorker
     ? await createConfiguredEventPublisher(config, app.log)
@@ -141,7 +109,7 @@ async function main() {
   }, 'Event publisher configured');
 
   app.addHook('onResponse', async (request, reply) => {
-    const route = request.routeOptions.url ?? request.url;
+    const route = request.routeOptions.url ?? '/unmatched';
     httpRequestDurationHistogram.record(reply.elapsedTime, {
       method: request.method,
       route,
@@ -150,15 +118,7 @@ async function main() {
     recordCustomerApiRequestMetric(request, reply);
   });
 
-  app.setErrorHandler((error, _request, reply) => {
-    if (isQuotaExceededError(error)) {
-      applyRateLimitHeaders(reply, error.headers);
-      reply.code(error.statusCode).send({ error: error.message });
-      return;
-    }
-
-    reply.send(error);
-  });
+  registerPlatformErrorHandler(app);
 
   await registerPlatformOAuth(app, config);
 
@@ -327,6 +287,6 @@ async function main() {
 }
 
 void main().catch((error) => {
-  console.error(error);
+  operationalLog.error(error);
   process.exit(1);
 });
