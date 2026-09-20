@@ -20,11 +20,15 @@ export async function freezeExtractionContext(client: PoolClient, input: {
   if (!job.rows.length) throw new Error('Extraction job no longer exists');
   let ids = job.rows[0].context_chunk_ids;
   if (ids === null) {
+    // Keep indexed text equality, but reject non-string JSON bindings before
+    // LIMIT: ->> alone would coerce malformed values into another scope's ID.
     const previous = await client.query<AcceptedContextChunk>(
       `SELECT rc.id,rc.vault_id,rc.session_id,rc.role,rc.blob_store,rc.blob_key,rc.created_at,
               rc.provenance,rc.storage_bytes::text
        FROM raw_chunks rc
        WHERE rc.vault_id=$1 AND rc.session_id=$2 AND rc.role IN ('user','assistant')
+         AND COALESCE(jsonb_typeof(rc.capture_context->'project_id'),'null') IN ('null','string')
+         AND COALESCE(jsonb_typeof(rc.capture_context->'task_id'),'null') IN ('null','string')
          AND (rc.capture_context->>'project_id'=$4::text OR ($4::text IS NULL AND rc.capture_context->>'project_id' IS NULL))
          AND (rc.capture_context->>'task_id'=$5::text OR ($5::text IS NULL AND rc.capture_context->>'task_id' IS NULL))
          AND rc.acceptance_ordinal < (SELECT min(acceptance_ordinal) FROM raw_chunks WHERE vault_id=$1 AND id=ANY($3::uuid[]))
@@ -49,6 +53,8 @@ export async function freezeExtractionContext(client: PoolClient, input: {
      FROM raw_chunks WHERE vault_id=$1 AND session_id=$2 AND id=ANY($3::uuid[])
        AND role IN ('user','assistant') AND storage_bytes BETWEEN 0 AND $4 AND blob_key IS NOT NULL
        AND (blob_store IS NULL OR blob_store=$7)
+       AND COALESCE(jsonb_typeof(capture_context->'project_id'),'null') IN ('null','string')
+       AND COALESCE(jsonb_typeof(capture_context->'task_id'),'null') IN ('null','string')
        AND capture_context->>'project_id' IS NOT DISTINCT FROM $5::text
        AND capture_context->>'task_id' IS NOT DISTINCT FROM $6::text`,
     [input.vaultId,input.context.session_id,ids,MAX_EXTRACTION_CONTEXT_BYTES,input.context.project_id ?? null,input.context.task_id ?? null,input.blobStore]

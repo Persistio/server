@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Persistio API
-  version: 0.2.0
+  version: 0.2.1
   description: Self-hosted memory service for AI agents.
 servers:
   - url: http://localhost:4827
@@ -58,7 +58,7 @@ paths:
                     description: Process uptime in whole seconds.
               example:
                 status: ok
-                version: 0.2.0
+                version: 0.2.1
                 db: ok
                 db_latency_ms: 12
                 extraction_queue_depth: 2
@@ -89,7 +89,7 @@ paths:
                     type: integer
               example:
                 status: degraded
-                version: 0.2.0
+                version: 0.2.1
                 db: degraded
                 db_latency_ms: 2001
                 extraction_queue_depth: null
@@ -101,9 +101,11 @@ paths:
       description: |
         Appends raw conversation chunks for extraction. Each chunk must include
         the original conversation turn timestamp as an ISO 8601 datetime with
-        UTC `Z` or an explicit offset. The
-        live OpenClaw plugin supplies this automatically; custom clients and
-        backfill tools must provide it explicitly.
+        UTC `Z` or an explicit offset. Integrations and backfill tools must provide it explicitly.
+        Extraction proposals requiring an unavailable project/task/session binding
+        are excluded individually, never broadened to another scope. Independent
+        supported proposals can still persist; malformed output or invalid source
+        references fail the entire model response under the existing retry policy.
       security:
         - bearerAuth: []
       requestBody:
@@ -139,7 +141,8 @@ paths:
         Premium backfill/import endpoint. Accepts up to 2048 chunks, writes raw
         chunks with one multi-row insert, and queues extraction at bulk priority.
         Request bodies are accepted up to `BULK_INGEST_BODY_LIMIT_BYTES`
-        bytes, 25 MiB by default.
+        bytes, 25 MiB by default. Uses the same per-proposal unavailable-scope
+        exclusion and whole-response source-integrity rules as normal ingest.
       security:
         - bearerAuth: []
       requestBody:
@@ -183,7 +186,7 @@ paths:
   /v1/recall:
     post:
       summary: Return relevant memory or a complete server-prepared context bundle
-      description: All plans recall active baseline memories. Premium Curator improves those same memories independently. No client ACK or delivery ledger exists. Logs contain bounded request metadata, never returned memory content.
+      description: All plans recall active baseline memories. Behavioral types (user_rule, user_preference, task_pattern, workflow, constraint, decision) must be within their inclusive UTC applicability window at the request reference instant. Ordinary project, system_fact and domain_knowledge memories retain dated historical/future context. Invalid windows and null/unknown types are excluded. Premium Curator improves the same memories independently. No client ACK or delivery ledger exists. Logs contain bounded request metadata, never returned memory content.
       security:
         - bearerAuth: []
       parameters:
@@ -943,7 +946,7 @@ components:
       type: string
       minLength: 1
       maxLength: 512
-      pattern: '^(?=.*\S)[^\x00-\x1f\x7f-\x9f\uD800-\uDFFF]+$'
+      pattern: '^(?=[\s\S]*\S)[^\x00-\x1f\x7f-\x9f\uD800-\uDFFF]+$'
       description: Unicode code-point length and controls are checked before trimming; must remain non-empty after trimming.
     IngestTimestamp:
       type: string
@@ -967,7 +970,7 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-          pattern: '^(?=.*\S)[^\x00-\x1f\x7f-\x9f\uD800-\uDFFF]+$'
+          pattern: '^(?=[\s\S]*\S)[^\x00-\x1f\x7f-\x9f\uD800-\uDFFF]+$'
           description: Unicode code-point length and controls are checked before trimming; must remain non-empty after trimming.
         id:
           $ref: '#/components/schemas/ProvenanceIdentity'
@@ -985,7 +988,10 @@ components:
       properties:
         source_class:
           type: string
-          enum: [agent_cron, agent_hook, agent_slack, agent_subagent, agent_other, thread_conversation, direct_or_import, unknown]
+          minLength: 1
+          maxLength: 64
+          pattern: '\S'
+          description: Integration-defined observability label, at most 64 Unicode code points without trimming. Opaque to the server and never evidence of human authorship.
         actor_type:
           $ref: '#/components/schemas/ProvenanceActor'
         trigger_type:
@@ -1006,11 +1012,15 @@ components:
         provenance_basis:
           type: array
           maxItems: 8
+          description: Integration-defined informational evidence labels, each at most 64 Unicode code points without trimming. These values never establish human authorship.
           items:
             type: string
-            enum: [session_id_prefix, agent_trigger, integration_marker, thread_session_shape, session_id_shape, role_counts, plugin_capture, api_provenance, api_provenance_aggregate, transport_envelope, fallback]
+            minLength: 1
+            maxLength: 64
+            pattern: '\S'
         payload_author:
           type: object
+          description: Structured payload authorship asserted by the authenticated integration. Required as valid human evidence for user rules and preferences; role and content alone never establish human intent.
           additionalProperties: false
           required: [actor_type, authorship, is_user]
           properties:
@@ -1065,16 +1075,24 @@ components:
         content:
           type: string
           minLength: 1
-          description: Runtime-configured character and embedding-token limits apply (413 when exceeded).
+          description: Runtime-configured UTF-16 code-unit and embedding-token limits apply (413 when exceeded).
         timestamp:
           $ref: '#/components/schemas/IngestTimestamp'
         source_event:
           $ref: '#/components/schemas/SourceEvent'
         provenance:
-          $ref: '#/components/schemas/CaptureProvenance'
+          allOf:
+            - $ref: '#/components/schemas/CaptureProvenance'
+          description: Integration-neutral structured provenance. Integration-specific text wrappers are treated only as content.
     IngestContext:
       type: object
-      description: Identities are at most 512 characters before trimming, reject control characters, and must remain non-empty after trimming.
+      description: |
+        Identities are at most 512 Unicode code points before trimming, reject control
+        characters, and must remain non-empty after trimming. Extraction history and
+        persistent summaries match the exact vault, session, project and task boundary.
+        An absent project/task is unbound, not a wildcard; reusing a session identifier
+        does not make summaries from another project/task available. Agent and trigger
+        metadata do not partition extraction context.
       additionalProperties: false
       properties:
         project_id:
@@ -1158,10 +1176,14 @@ components:
           type: string
           enum: [active, superseded, contradicted]
         valid_from:
+          description: Inclusive UTC YYYY-MM-DD start, null unbounded. Current applicability for behavioral types; temporal classification for retained ordinary knowledge.
+          format: date
           type:
             - string
             - 'null'
         valid_until:
+          description: Inclusive UTC YYYY-MM-DD end, null unbounded. Out-of-window behavioral memories are excluded from recall; dated ordinary knowledge remains recallable. Invalid or inverted windows are excluded.
+          format: date
           type:
             - string
             - 'null'
@@ -1269,8 +1291,20 @@ components:
             source_chunks:
               type: array
               items: {type: string, format: uuid}
+            temporal:
+              type: string
+              enum: [historical, future, current_or_unbounded]
+              description: Classification at the same request reference UTC date used for eligibility. Behavioral records can only be current_or_unbounded. Exact date bounds are preserved.
             unresolved_conflict:
               type: boolean
+              description: Current revision-matched, eligible same-binding conflicting evidence exists. This is not a verdict or standing authority.
+            conflict_coverage:
+              type: string
+              enum: [all_companions_included, companions_omitted]
+              description: Present only for unresolved conflicts. Describes actual companion inclusion under the existing relevance, entitlement and output budgets.
+            uncertainty:
+              type: string
+              description: Server-owned uncertainty and companion-coverage explanation, present only for unresolved conflicts.
     RecallChunk:
       type: object
       properties:

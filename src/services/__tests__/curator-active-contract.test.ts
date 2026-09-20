@@ -55,10 +55,25 @@ describe('active memory improvement contract',()=>{
     const targets=[memory('one')],aliases=buildAliasMaps(targets,[]);
     const p=empty();p.keep=[{id:'M1',reason:'Useful'}];p.scope_changes=[{id:'M1',scope:'global',scope_key:null,source_refs:['S1'],reason:'Across all conversations'}];
     expect(()=>validateCuratorContract(p,targets,[],aliases)).toThrow();
-    const raw={id:'source1',role:'user',content:'Respond to me in UK English at all times',provenance:null,created_at:'2026-01-01T00:00:00Z',current:true,context:{session_id:'s1'}};
+    const human={actor_type:'human',authorship:'original',trigger_type:'direct',artifact_type:'message',cadence:'one_off',
+      payload_author:{actor_type:'human',authorship:'original',is_user:true}};
+    const raw={id:'source1',role:'user',content:'Respond to me in UK English at all times',provenance:human,created_at:'2026-01-01T00:00:00Z',current:true,context:{session_id:'s1'}};
     expect(validateCuratorContract(p,targets,[],aliases,[raw])).toEqual(p);
     expect(()=>validateCuratorContract(p,targets,[],aliases,[{...raw,id:'unrelated'}])).toThrow();
-    expect(()=>validateCuratorContract(p,targets,[],aliases,[{...raw,role:'assistant'}])).toThrow();
+    expect(()=>validateCuratorContract(p,targets,[],aliases,[{...raw,role:'assistant',provenance:{...human,actor_type:'assistant',authorship:'generated',
+      payload_author:{actor_type:'assistant',authorship:'generated',is_user:false}}}])).toThrow();
+  });
+  it('preserves Unicode source scope bindings at the ingest contract boundary',()=>{
+    for(const length of [512,513]){
+      const scope_key='😀'.repeat(length),targets=[memory('one')],aliases=buildAliasMaps(targets,[]);
+      const p=empty();p.keep=[{id:'M1',reason:'Useful'}];
+      p.scope_changes=[{id:'M1',scope:'project',scope_key,source_refs:['S1'],reason:'Explicit source binding'}];
+      const raw={id:'source1',role:'user',content:'Use UK English in this project',created_at:'2026-06-01T00:00:00Z',current:true,
+        context:{project_id:scope_key},provenance:{actor_type:'human',authorship:'original',trigger_type:'direct',artifact_type:'message',cadence:'one_off',
+          payload_author:{actor_type:'human',authorship:'original',is_user:true}}};
+      if(length===512)expect(validateCuratorContract(p,targets,[],aliases,[raw])).toEqual(p);
+      else expect(()=>validateCuratorContract(p,targets,[],aliases,[raw])).toThrow();
+    }
   });
   it('uses surviving aliases for graph links, not retired source aliases or ambiguous subjects',()=>{
     const targets=[memory('one'),memory('two'),memory('three')],aliases=buildAliasMaps(targets,[]);

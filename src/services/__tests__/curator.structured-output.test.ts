@@ -219,7 +219,8 @@ describe.each(providers)('Curator structured output through real SDK: $name', pr
       content: 'The service uses PostgreSQL.', context: { project_id: 'project-a' } };
     const provenance = { actor_type: 'agent', authorship: 'generated', trigger_type: 'delegated', artifact_type: 'message', cadence: 'one_off' };
     const rawSources: CuratorRawSource[] = [
-      { ...base, id: 'direct-human', provenance: null },
+      { ...base, id: 'direct-human', provenance: { actor_type:'human',authorship:'original',trigger_type:'direct',artifact_type:'message',cadence:'one_off',
+        payload_author:{actor_type:'human',authorship:'original',is_user:true} } },
       { ...base, id: 'agent-in-user', provenance },
       { ...base, id: 'routed-human', role: 'assistant', provenance: { ...provenance, authorship: 'transcribed',
         payload_author: { actor_type: 'human', authorship: 'original', is_user: true } } }

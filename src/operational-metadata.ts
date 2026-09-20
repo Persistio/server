@@ -4,7 +4,7 @@ import {ModelOutputContractError,isSafeModelOutputIssueCode,isSafeModelOutputIss
 const numericKeys=new Set(['status','status_code','duration_ms','response_bytes','result_count','count','total','idle','waiting',
   'prompt_tokens','completion_tokens','total_tokens','pairs_count','candidates_count','active_memories_count',
   'accepted','inserted','replayed','deferred','retry_count','retry_after_ms','wait_ms','batch_size',
-  'raw_facts','after_source_filter','excluded_context_only','excluded_unsupported_human_intent',
+  'raw_facts','after_source_filter','excluded_context_only','excluded_unsupported_human_intent','excluded_unsupported_scope',
   'after_score_filter','after_secret_filter','after_sensitivity_filter','after_deterministic_filter','threshold',
   'embedding.input_count','embedding.request_count','embedding.duration_ms','extraction.batch_limit','extraction.batch_size',
   'extraction.memories_created','extraction.candidates.extracted','extraction.candidates.accepted','extraction.candidates.dropped']);
@@ -19,7 +19,7 @@ const enumValues:Record<string,ReadonlySet<string>>={
   queue:new Set(['extraction','curation']),
   provider:new Set(['openai','vertex','ollama','tei']),
   status:new Set(['accepted','dropped','success','error','failed','dead']),
-  reason:new Set(['context_only','unsupported_human_intent','empty','duplicate','secret_like','low_salience','implementation_detail']),
+  reason:new Set(['unsupported_scope','context_only','unsupported_human_intent','empty','duplicate','secret_like','low_salience','implementation_detail']),
   dedup_action:new Set(['skipped','updated','inserted','conflict']),
   'embedding.provider':new Set(['openai','vertex','ollama','tei']),
   event:new Set(['scope_widening_attempt','invalid_source','invalid_scope','invalid_model_output']),

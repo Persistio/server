@@ -27,3 +27,11 @@ it('describes exactly the ready-to-use server bundle and JSON response without a
   const json=ajv.getSchema('#/components/schemas/RecallJsonResponse');
   expect(json({memories:[],related_memories:[],raw_chunks:[],evidence_chunks:[]})).toBe(true);
 });
+it('declares the additive JSON temporal state and preserves exact date bounds',()=>{
+  const memory=ajv.getSchema('#/components/schemas/RecallMemory');
+  for(const temporal of ['historical','future','current_or_unbounded']){
+    expect(memory({temporal,valid_from:'2024-02-29',valid_until:null})).toBe(true);
+  }
+  expect(memory({temporal:'unknown'})).toBe(false);
+  expect(doc.paths['/v1/recall'].post.description).toContain('Behavioral types');
+});

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { unicodeStringSchema } from './unicode-string';
 import { provenanceIdentitySchema } from './provenance-identity';
 import { isValidDateOnly } from './memory-validity';
 
@@ -13,36 +14,21 @@ const provenanceBasisLimit = z.unknown().superRefine((value, ctx) => {
 const provenanceActorSchema = z.enum(['human', 'assistant', 'agent', 'tool', 'system', 'import', 'unknown']);
 const provenanceAuthorshipSchema = z.enum(['original', 'generated', 'transcribed', 'imported', 'mixed', 'unknown']);
 
+const provenanceLabelSchema = unicodeStringSchema(64).pipe(z.string().min(1).regex(/\S/u));
+
 export const captureProvenanceSchema = z.object({
-    source_class: z.enum([
-      'agent_cron',
-      'agent_hook',
-      'agent_slack',
-      'agent_subagent',
-      'agent_other',
-      'thread_conversation',
-      'direct_or_import',
-      'unknown'
-    ]).optional(),
+    // Integration-defined observability label. It is intentionally opaque to the server
+    // and never participates in human-authorship admission.
+    source_class: provenanceLabelSchema.optional(),
     actor_type: provenanceActorSchema,
     trigger_type: z.enum(['direct', 'delegated', 'scheduled', 'event', 'backfill', 'api', 'unknown']),
     artifact_type: z.enum(['message', 'conversation', 'tool_result', 'status', 'observation', 'log', 'summary', 'document', 'unknown']),
     authorship: provenanceAuthorshipSchema,
     cadence: z.enum(['one_off', 'recurring', 'batch', 'unknown']),
     provenance_confidence: z.number().min(0).max(1).optional(),
-    provenance_basis: provenanceBasisLimit.pipe(z.array(z.enum([
-      'session_id_prefix',
-      'agent_trigger',
-      'integration_marker',
-      'thread_session_shape',
-      'session_id_shape',
-      'role_counts',
-      'plugin_capture',
-      'api_provenance',
-      'api_provenance_aggregate',
-      'transport_envelope',
-      'fallback'
-    ])).max(8)).optional(),
+    // Integration-defined evidence labels are informational only. Trust decisions use
+    // the validated payload_author structure below, never these strings.
+    provenance_basis: provenanceBasisLimit.pipe(z.array(provenanceLabelSchema).max(8)).optional(),
     payload_author: z.object({
       actor_type: provenanceActorSchema,
       authorship: provenanceAuthorshipSchema,

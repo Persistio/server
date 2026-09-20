@@ -31,6 +31,22 @@ function repositorySources(...roots: string[]): Array<{ path: string; source: st
 }
 
 describe('database migration guardrails', () => {
+  it('adds bounded contradiction progress without changing deployed scheduling or customer memories', () => {
+    const sql=migration('059_bounded_contradiction_progress.sql');
+    expect(sql).toContain('LOCK TABLE memory_contradiction_schedule IN ACCESS EXCLUSIVE MODE');
+    expect(sql).toContain('ADD COLUMN scan_reference_date DATE');
+    expect(sql).toContain('ADD COLUMN scan_similarity DOUBLE PRECISION');
+    expect(sql).toContain('ADD COLUMN scan_memory_id UUID');
+    expect(sql).toContain('(NEW.generation, NEW.revision) IS DISTINCT FROM (OLD.generation, OLD.revision)');
+    expect(sql).toContain('NEW.scan_memory_id := NULL');
+    expect(sql).not.toContain('UPDATE memories');
+    expect(sql).not.toContain('CREATE OR REPLACE FUNCTION schedule_memory_contradiction_activation');
+    const down=migration('down/059_bounded_contradiction_progress.sql');
+    expect(down).toContain('WHERE scan_memory_id IS NOT NULL');
+    expect(down.indexOf('RAISE EXCEPTION')).toBeLessThan(down.indexOf('DROP COLUMN'));
+    expect(down).not.toContain('DELETE FROM memory_contradiction_schedule');
+  });
+
   it('migrates legacy pro vaults before deleting the pro plan', () => {
     const sql = migration('038_unlimited_curator_frequency_and_remove_pro.sql');
 

@@ -1,0 +1,13 @@
+{
+  "schema_version": "persistio.public-prompts.v1",
+  "prompts": {
+    "extractor.txt": {
+      "sha256": "e5da75c10c544d94edcd5eb25162b454f01d51b7a40365ebbb030a83172b92cd",
+      "output_contract": "facts-object.v1"
+    },
+    "curator.txt": {
+      "sha256": "07df97be4f4a44f7c74f80be4f2021291171747c5188fe9d3048809fc99d9b79",
+      "output_contract": "curation-plan.v2"
+    }
+  }
+}

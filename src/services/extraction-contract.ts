@@ -2,7 +2,6 @@ import { z } from 'zod';
 import { isValidDateOnly } from './memory-validity';
 import { scopeKeyForContext, type RecallContext } from './memory-applicability';
 import { captureProvenanceSchema } from './ingest-provenance-schema';
-import { parseInterSessionEnvelope } from './transport-provenance';
 import { ModelOutputContractError } from './model-output-error';
 
 const date = z.string().refine(isValidDateOnly).nullable();
@@ -37,7 +36,7 @@ export const extractionResponseSchema = z.object({ facts: extractedFactsSchema }
 export const nonHumanExtractionResponseSchema = z.object({
   facts: z.array(factFields.extend({ type: nonHumanMemoryTypeSchema }).refine(orderedWindow, 'Inverted validity window')).max(100)
 }).strict();
-export const EXTRACTION_SOURCE_INSTRUCTIONS = `Source authorship: transport_role describes delivery, not who expressed the content. Only supplied sources marked human_intent_source=true are eligible to establish a user's preference or rule. This flag does not establish what the person meant: the cited human content must actually express or adopt that particular preference/rule. An unrelated human statement, a topic header, or an agent claiming that a user wants something is not supporting human intent. Do not describe agent-authored text as something the user said. Supported factual contributions from assistants/agents remain eligible knowledge.
+export const EXTRACTION_SOURCE_INSTRUCTIONS = `Source authorship: transport_role describes delivery, not who expressed the content. Only supplied current sources marked human_intent_source=true are eligible to establish a user's preference or rule. The same cited source must be both current and human-authored. This flag does not establish what the person meant: the cited human content must actually express or adopt that particular preference/rule. An unrelated human statement, a topic header, or an agent claiming that a user wants something is not supporting human intent. Do not describe agent-authored text as something the user said. Supported factual contributions from assistants/agents remain eligible knowledge.
 
 Apply future usefulness before assigning a type. Distinguish a substantive fact, decision, commitment, event or continuing preference from an instruction to perform the next step of the current interaction. A live execution command or process-control message alone is neither a reusable policy nor evidence that the action happened. Do not retain it by converting it to reported speech or labelling it decision, constraint or system_fact. A substantive cancellation decision, dated event or commitment can still be useful durable knowledge; judge the information, not command words. If no supported future-useful information remains, return {"facts":[]}.`;
 export const EXTRACTION_CONTEXT_INSTRUCTIONS = `Read supplied sources as a conversation, in source order. A current short answer, confirmation or correction can supply new durable information whose entity or question is established by an earlier context source. Resolve that relationship before applying the future-use gate: do not discard an answer merely because it is not a standalone sentence. Cite both the current answer and the context needed to understand it. Context-only means no new information from a current source, not a ban on using earlier questions. Do not invent a referent when absent or ambiguous, turn acknowledgements into new facts, infer answers from topic summaries, or treat another author's assertion as a human preference without explicit human adoption. Preserve all source scope limits and negation; conversational context is not permission to broaden applicability.`;
@@ -71,42 +70,42 @@ export interface ExtractionSource {
 }
 
 export function sourceHasHumanIntent(source: ExtractionSource): boolean {
-  const envelope = parseInterSessionEnvelope(source.content);
-  if (envelope && envelope.is_user !== true) return false;
-  if (source.provenance !== null && source.provenance !== undefined) {
-    const parsed = captureProvenanceSchema.safeParse(source.provenance);
-    if (!parsed.success) return false;
-    const p = parsed.data;
-    if (p.payload_author) return p.payload_author.is_user === true
-      && p.payload_author.actor_type === 'human'
-      && ['original','imported','transcribed'].includes(p.payload_author.authorship)
-      && !(p.authorship === 'generated' && p.actor_type !== 'human');
-    return p.actor_type === 'human' && ['original','imported','transcribed'].includes(p.authorship);
-  }
-  return envelope ? envelope.is_user === true : source.role === 'user';
+  const parsed = captureProvenanceSchema.safeParse(source.provenance);
+  if (!parsed.success) return false;
+  const p = parsed.data;
+  const author = p.payload_author;
+  if (!author) return false;
+  return author.is_user === true
+    && author.actor_type === 'human'
+    && ['original','imported','transcribed'].includes(author.authorship)
+    && p.authorship !== 'generated';
 }
 
 type SourceBackedFact = Pick<ValidatedExtractedFact, 'scope' | 'source_refs'> & { type: string | null };
-export type ExtractionExclusionReason = 'context_only' | 'unsupported_human_intent';
+export type ExtractionExclusionReason = 'unsupported_scope' | 'context_only' | 'unsupported_human_intent';
 
 // Referential integrity is not admission. An ineligible proposal must never hide
-// an unknown reference or an invalid binding, even if it would otherwise be dropped.
+// an unknown reference or tool evidence, even if its scope binding is unavailable.
+// Malformed and duplicate references are rejected by the complete response parser.
 function resolveSourceIntegrity(
   fact: SourceBackedFact,
-  sources: readonly ExtractionSource[], context: RecallContext
+  sources: readonly ExtractionSource[]
 ): ExtractionSource[] {
-  if (fact.scope !== 'global' && scopeKeyForContext(fact.scope, context) === null) {
-    throw new Error('Extraction scope has no binding');
-  }
   const selected = fact.source_refs.map(alias => sources[Number(alias.slice(1)) - 1]);
   if (selected.some(source => !source)) throw new Error('Extraction cites unknown source evidence');
   if (selected.some(source => source.role === 'tool')) throw new Error('Tool output cannot support semantic extraction');
   return selected;
 }
 
-function exclusionReason(fact: SourceBackedFact, selected: readonly ExtractionSource[]): ExtractionExclusionReason | null {
+function exclusionReason(
+  fact: SourceBackedFact, selected: readonly ExtractionSource[], context: RecallContext
+): ExtractionExclusionReason | null {
+  // Count each proposal once: scope, then recency, then human intent. A missing
+  // or invalid exact binding excludes the proposal; never fall back to broader scope.
+  if (fact.scope !== 'global' && scopeKeyForContext(fact.scope, context) === null) return 'unsupported_scope';
   if (!selected.some(source => source.current)) return 'context_only';
-  if ((fact.type === 'user_preference' || fact.type === 'user_rule') && !selected.some(sourceHasHumanIntent)) {
+  if ((fact.type === 'user_preference' || fact.type === 'user_rule')
+    && !selected.some(source => source.current && sourceHasHumanIntent(source))) {
     return 'unsupported_human_intent';
   }
   return null;
@@ -117,11 +116,11 @@ function exclusionReason(fact: SourceBackedFact, selected: readonly ExtractionSo
 export function admitExtractionCandidates<T extends SourceBackedFact>(
   facts: readonly T[], sources: readonly ExtractionSource[], context: RecallContext
 ): { accepted: T[]; excluded: Record<ExtractionExclusionReason, number> } {
-  const resolved = facts.map(fact => resolveSourceIntegrity(fact, sources, context));
+  const resolved = facts.map(fact => resolveSourceIntegrity(fact, sources));
   const accepted: T[] = [];
-  const excluded = { context_only: 0, unsupported_human_intent: 0 };
+  const excluded: Record<ExtractionExclusionReason, number> = { unsupported_scope: 0, context_only: 0, unsupported_human_intent: 0 };
   facts.forEach((fact, index) => {
-    const reason = exclusionReason(fact, resolved[index]);
+    const reason = exclusionReason(fact, resolved[index], context);
     if (reason) excluded[reason]++;
     else accepted.push(fact);
   });
@@ -132,8 +131,9 @@ export function admitExtractionCandidates<T extends SourceBackedFact>(
 export function resolveExtractionSources(
   fact: SourceBackedFact, sources: readonly ExtractionSource[], context: RecallContext
 ): ExtractionSource[] {
-  const selected = resolveSourceIntegrity(fact, sources, context);
-  const reason = exclusionReason(fact, selected);
+  const selected = resolveSourceIntegrity(fact, sources);
+  const reason = exclusionReason(fact, selected, context);
+  if (reason === 'unsupported_scope') throw new Error('Extraction scope has no binding');
   if (reason === 'context_only') throw new Error('Extraction must cite supplied current evidence');
   if (reason === 'unsupported_human_intent') throw new Error('Human preference lacks human source evidence');
   return selected;

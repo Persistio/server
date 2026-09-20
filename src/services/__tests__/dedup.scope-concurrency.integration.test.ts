@@ -1,3 +1,4 @@
+import {fixtureSource,cleanFixtureSources,fixtureAssessment,fixtureExtractor} from '../../__tests__/arbitration-fixtures';
 import crypto from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -24,9 +25,9 @@ describe.skipIf(!databaseUrl)('baseline deduplication invariants and concurrency
   beforeEach(async () => {
     vaultId = crypto.randomUUID(); sourceA = crypto.randomUUID(); sourceB = crypto.randomUUID();
     await pool.query("INSERT INTO vaults(id,name,api_key_hash,plan_id) VALUES($1,'dedup-restoration',$2,'unlimited')", [vaultId, crypto.randomUUID()]);
-    await pool.query("INSERT INTO raw_chunks(id,vault_id,session_id,role) SELECT id,$1,'s1','user' FROM unnest($2::uuid[]) AS id", [vaultId, [sourceA,sourceB]]);
+    await fixtureSource(pool,vaultId,undefined,sourceA);await fixtureSource(pool,vaultId,undefined,sourceB);
   });
-  afterEach(async () => { await pool.query('DELETE FROM vaults WHERE id=$1', [vaultId]); });
+  afterEach(async () => { await cleanFixtureSources();await pool.query('DELETE FROM vaults WHERE id=$1', [vaultId]); });
   afterAll(async () => { await pool.end(); await db?.closePool(); });
 
   function input(extra: Partial<DedupInput> = {}): DedupInput {
@@ -39,7 +40,7 @@ describe.skipIf(!databaseUrl)('baseline deduplication invariants and concurrency
   async function preparedDecision(value: DedupInput, decision: DedupOptions['precomputedConflictDecision'] = 'supersede_old') {
     const request = await dedup.getDedupEscalationRequest(value, 'test');
     expect(request).not.toBeNull();
-    return { precomputedConflictDecision:decision, precomputedConflictInput:request!.inputFingerprint,
+    return { precomputedConflictDecision:await fixtureAssessment(request!,vaultId,decision as any), precomputedConflictInput:request!.inputFingerprint,
       precomputedConflictMemoryId:request!.existingMemoryId, precomputedConflictMemoryRevision:request!.existingMemoryRevision };
   }
 
@@ -80,12 +81,12 @@ describe.skipIf(!databaseUrl)('baseline deduplication invariants and concurrency
     const first = await dedup.deduplicateMemory(input());
     await dedup.deduplicateMemory(input({sensitivity:'high'}));
     expect(await read(first.memoryId!)).toMatchObject({revision:'2',sensitivity:'high',status:'active'});
-    await dedup.deduplicateMemory(input({sourceChunks:[sourceB],sourceTimestamp:'2025-02-01T00:00:00Z'}));
+    await dedup.deduplicateMemory(input({sourceChunks:[sourceB],sourceTimestamp:'2025-02-01T00:00:00Z'}),fixtureExtractor(()=> 'merge') as never);
     const updated = await read(first.memoryId!);
     expect(updated.source_chunks.sort()).toEqual([sourceA,sourceB].sort());
     expect(updated.sensitivity).toBe('high');
     expect(updated.source_timestamp.toISOString()).toBe('2025-02-01T00:00:00.000Z');
-    await dedup.deduplicateMemory(input());
+    await dedup.deduplicateMemory(input({sourceChunks:[sourceA,sourceB]}));
     expect((await read(first.memoryId!)).revision).toBe(updated.revision);
   });
   it('keeps identical facts distinct across every scope binding and dated state', async () => {
@@ -126,7 +127,7 @@ describe.skipIf(!databaseUrl)('baseline deduplication invariants and concurrency
     expect((await read(first.memoryId!)).status).toBe('active');
     expect((await read(next.memoryId!)).status).toBe('active');
     expect((await pool.query('SELECT decision,revision_a::text,revision_b::text FROM contradiction_scan_log WHERE vault_id=$1',[vaultId])).rows)
-      .toEqual([{decision:'keep_both',revision_a:'1',revision_b:'1'}]);
+      .toEqual([{decision:'incomplete',revision_a:'1',revision_b:'1'}]);
   });
   it('preserves old text and source lineage for a revision-bound equivalent observation', async () => {
     const first=await dedup.deduplicateMemory(input());

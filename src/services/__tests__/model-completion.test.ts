@@ -2,7 +2,7 @@ import OpenAI from 'openai';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { extractedFactSchema } from '../extraction-contract';
-import { curatorResultSchema } from '../curator-contract';
+import { curatorResultSchema, nonBehavioralCuratorResultSchema } from '../curator-contract';
 import { completeModelRequest, modelRequestBody, modelResponseFormat, serializeModelRequest } from '../model-completion';
 
 type Input = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
@@ -29,7 +29,8 @@ function fixture(response: unknown, baseURL = nativeURL, status = 200) {
 describe('generation-only schema projection', () => {
   it.each([
     ['extraction', z.object({ facts: z.array(extractedFactSchema).max(100) }).strict()],
-    ['curation', curatorResultSchema]
+    ['curation', curatorResultSchema],
+    ['nonbehavioral-curation', nonBehavioralCuratorResultSchema]
   ] as const)('projects the complete %s contract without provider-unsupported bounds or refs', (name, validator) => {
     const format = modelResponseFormat(validator, name);
     expect(format.type).toBe('json_schema');
@@ -54,7 +55,8 @@ describe('generation-only schema projection', () => {
     expect(schema.type).toBe('object');
     const text = JSON.stringify(schema);
     expect(text).toContain('"null"');
-    expect(text).toContain('user_preference');
+    if (name === 'nonbehavioral-curation') expect(text).not.toContain('user_preference');
+    else expect(text).toContain('user_preference');
     expect(text).toContain('"pattern"');
     if (name === 'extraction') {
       expect((schema.properties as any).facts.items.properties.type.enum).toHaveLength(9);
@@ -253,5 +255,15 @@ describe('structured model transport boundary', () => {
     await expect(completeModelRequest(client, request(), nativeURL)).rejects.toMatchObject({ status });
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(fetch.mock.calls[0][1]!.body))).toHaveProperty('output_config.format.type', 'json_schema');
+  });
+});
+
+
+describe('arbitration transport retry override',()=>{
+  it.each([nativeURL,'https://api.openai.com/v1/'])('disables inherited retries at the actual %s SDK boundary',async baseURL=>{
+    const {client,fetch}=fixture({error:{message:'ambiguous service failure'}},baseURL,503);
+    client.maxRetries=4;
+    await expect(completeModelRequest(client,request(),baseURL,{maxRetries:0})).rejects.toThrow();
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });

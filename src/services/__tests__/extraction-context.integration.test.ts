@@ -14,17 +14,17 @@ describe.skipIf(!url)('bounded eligible frozen extraction context',()=>{
     await pool.query('DELETE FROM vaults WHERE id=$1',[vault]);
   });
   afterAll(async()=>{await pool.end();await db?.closePool();});
-  async function source(opts:{role?:string;key?:string|null;bytes?:number;store?:string|null;session?:string;project?:string|null;task?:string|null}={}){
+  async function source(opts:{role?:string;key?:string|null;bytes?:number;store?:string|null;session?:string;project?:string|null;task?:string|null;captureContext?:Record<string,unknown>}={}){
     const id=crypto.randomUUID();
     await pool.query(`INSERT INTO raw_chunks(id,vault_id,session_id,role,blob_key,blob_store,storage_bytes,capture_context)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,[id,vault,opts.session??'s1',opts.role??'user',opts.key===undefined?id:opts.key,
-      opts.store===undefined?'local':opts.store,opts.bytes??1,JSON.stringify({project_id:opts.project??null,task_id:opts.task??null})]);
+      opts.store===undefined?'local':opts.store,opts.bytes??1,JSON.stringify(opts.captureContext??{project_id:opts.project??null,task_id:opts.task??null})]);
     return id;
   }
-  async function job(){
-    const current=await source();
+  async function job(bindings:{project_id?:string;task_id?:string}={}){
+    const current=await source({captureContext:bindings});
     const queue=(await pool.query('INSERT INTO extraction_queue(vault_id,chunk_id) VALUES($1,$2) RETURNING id',[vault,current])).rows[0].id;
-    const input={queueId:queue,vaultId:vault,chunkIds:[current],context:{session_id:'s1'},blobStore:'local'};
+    const input={queueId:queue,vaultId:vault,chunkIds:[current],context:{session_id:'s1',...bindings},blobStore:'local'};
     const freeze=()=>db.withTransaction(client=>freezeExtractionContext(client,input));
     return{current,queue,freeze};
   }
@@ -44,6 +44,58 @@ describe.skipIf(!url)('bounded eligible frozen extraction context',()=>{
     await source({session:'s2'});await source({project:'p2'});await source({task:'t2'});
     const older=await source({bytes:16384});const newer=await source({bytes:16384});
     const f=await job();expect((await f.freeze()).map(r=>r.id)).toEqual([older,newer]);
+  });
+  const malformedBindings=[
+    {kind:'number',value:123,text:'123'},
+    {kind:'boolean',value:true,text:'true'},
+    {kind:'object',value:{key:'value'},text:'{"key": "value"}'},
+    {kind:'array',value:['value'],text:'["value"]'},
+  ];
+  describe.each(['project_id','task_id'] as const)('%s JSON types',field=>{
+    it.each(malformedBindings)('rejects $kind before the cap and on frozen-ID retrieval',async({value,text})=>{
+      const good=await source({captureContext:{[field]:text}});
+      const malformed:string[]=[];
+      // A coerced matching prefix must neither enter context nor crowd out the
+      // older canonical string. Exercise more rows than the history LIMIT.
+      for(let i=0;i<10;i++)malformed.push(await source({captureContext:{[field]:value}}));
+      const f=await job({[field]:text});
+      expect((await f.freeze()).map(r=>r.id)).toEqual([good]);
+      expect((await pool.query('SELECT context_chunk_ids FROM extraction_queue WHERE id=$1',[f.queue])).rows[0].context_chunk_ids).toEqual([good]);
+      // Simulate IDs frozen before validation was introduced. Retrieval must
+      // recheck types, without expanding or rewriting the frozen snapshot.
+      const frozen=[...malformed,good];
+      await pool.query('UPDATE extraction_queue SET context_chunk_ids=$2::uuid[] WHERE id=$1',[f.queue,frozen]);
+      expect((await f.freeze()).map(r=>r.id)).toEqual([good]);
+      expect((await pool.query('SELECT context_chunk_ids FROM extraction_queue WHERE id=$1',[f.queue])).rows[0].context_chunk_ids).toEqual(frozen);
+    });
+  });
+  it('treats missing and JSON null as unbound without leaking malformed or bound history',async()=>{
+    const good:string[]=[];
+    for(const captureContext of [{},{project_id:null},{task_id:null},{project_id:null,task_id:null}]){
+      good.push(await source({captureContext}));
+    }
+    const excluded:string[]=[];
+    for(const field of ['project_id','task_id']){
+      for(const {value} of malformedBindings)excluded.push(await source({captureContext:{[field]:value}}));
+      excluded.push(await source({captureContext:{[field]:'123'}}));
+    }
+    const f=await job();expect((await f.freeze()).map(r=>r.id)).toEqual(good);
+    await pool.query('UPDATE extraction_queue SET context_chunk_ids=$2::uuid[] WHERE id=$1',[f.queue,[...good,...excluded]]);
+    expect((await f.freeze()).map(r=>r.id)).toEqual(good);
+  });
+  it('compares string bindings exactly in selection and frozen-ID retrieval',async()=>{
+    const good=await source({project:'p1',task:'t1'});
+    const excluded:string[]=[];
+    for(const captureContext of [
+      {project_id:' p1',task_id:'t1'},{project_id:'p1',task_id:'t1 '},
+      {project_id:'P1',task_id:'t1'},{project_id:'p1',task_id:'T1'},
+      {project_id:null,task_id:'t1'},{project_id:'p1',task_id:null},
+      {task_id:'t1'},{project_id:'p1'},
+    ])excluded.push(await source({captureContext}));
+    const f=await job({project_id:'p1',task_id:'t1'});
+    expect((await f.freeze()).map(r=>r.id)).toEqual([good]);
+    await pool.query('UPDATE extraction_queue SET context_chunk_ids=$2::uuid[] WHERE id=$1',[f.queue,[good,...excluded]]);
+    expect((await f.freeze()).map(r=>r.id)).toEqual([good]);
   });
   it('keeps frozen-empty distinct from unfrozen and preserves null-store extraction fallback',async()=>{
     const f=await job();expect(await f.freeze()).toEqual([]);await source();expect(await f.freeze()).toEqual([]);

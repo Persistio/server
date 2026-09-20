@@ -81,9 +81,11 @@ describe.skipIf(!databaseUrl)('restored standalone HTTP API (PostgreSQL)',()=>{
     await pool.query('UPDATE memory_embeddings SET embedding=$2::vector WHERE memory_id=$1',[rule.id,JSON.stringify(state.vector)]);
     await pool.query("UPDATE memories SET valid_until='2020-01-01' WHERE id=$1",[rule.id]);
     const historical=await recall({min_similarity:0.5,context:{session_id:'s2'}});
-    expect(historical.json().memories.some((m:any)=>m.id===rule.id)).toBe(true);
+    expect(historical.json().memories.some((m:any)=>m.id===rule.id)).toBe(false);
+    expect(historical.json().memories.some((m:any)=>m.id===preference.id)).toBe(true);
     const bundle=await recall({min_similarity:0.5,max_bundle_bytes:4096,context:{session_id:'s2'}},'?format=bundle_v3');
-    expect(bundle.json().bundle).toContain('historical');
+    expect(bundle.json().bundle).not.toContain('An unrelated rule');
+    expect(bundle.json().bundle).toContain('Use UK English');
   });
   it('expands only same-binding graph neighbours of relevant seeds under one budget',async()=>{
     const seed=await add('Relevant vault knowledge',{scope:'global',scope_key:null});
@@ -110,6 +112,89 @@ describe.skipIf(!databaseUrl)('restored standalone HTTP API (PostgreSQL)',()=>{
     const res=await recall({top_k:1},'?format=bundle_v3');expect(res.json().bundle).toContain('Unresolved conflicting evidence');
     await pool.query("UPDATE memories SET data='Resolved revised fact' WHERE id=$1",[b.id]);
     expect((await recall({top_k:1},'?format=bundle_v3')).json().bundle).not.toContain('Unresolved conflicting evidence');
+  });
+  it('reports whether all current companions were included in JSON and after bundle fitting',async()=>{
+    const a=await add('First supported alternative'),b=await add('Second supported alternative');
+    await pool.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+      SELECT $1,a.id,b.id,'keep_both',1,a.revision,b.revision FROM memories a,memories b WHERE a.id=$2 AND b.id=$3`,[state.vault.id,a.id,b.id]);
+    const one=(await recall({top_k:1})).json().memories;
+    expect(one).toHaveLength(1);expect(one[0].conflict_coverage).toBe('companions_omitted');
+    expect(one[0].uncertainty).toContain('not all included');
+    const all=(await recall({top_k:2})).json().memories;
+    expect(all).toHaveLength(2);expect(all.every((m:any)=>m.conflict_coverage==='all_companions_included')).toBe(true);
+    const full=(await recall({top_k:2,max_bundle_bytes:4096},'?format=bundle_v3')).json().bundle;
+    expect(full).toContain('all_companions_included');
+    const partial=(await recall({top_k:2,max_bundle_bytes:Buffer.byteLength(full)-1},'?format=bundle_v3')).json().bundle;
+    expect(partial.split('\n').filter((line:string)=>line.startsWith('{'))).toHaveLength(1);
+    expect(partial).toContain('companions_omitted');expect(partial).toContain('not all included');
+    expect(all[0]).not.toHaveProperty('conflict_companion_ids');
+  });
+  it('does not apply cross-binding or explicitly resolved logs as current uncertainty',async()=>{
+    const a=await add('Session alternative'),b=await add('Vault-wide unrelated assertion',{scope:'global',scope_key:null});
+    const log=async(decision:string)=>pool.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+      SELECT $1,a.id,b.id,$4,1,a.revision,b.revision FROM memories a,memories b WHERE a.id=$2 AND b.id=$3`,[state.vault.id,a.id,b.id,decision]);
+    await log('keep_both');
+    expect((await recall({top_k:2})).json().memories.every((m:any)=>!m.unresolved_conflict)).toBe(true);
+    await pool.query("UPDATE memories SET scope='session',scope_key='s1' WHERE id=$1",[b.id]);
+    await log('keep_both');await log('supersede_old');
+    expect((await recall({top_k:2})).json().memories.every((m:any)=>!m.unresolved_conflict)).toBe(true);
+  });
+  it('does not buy companion inclusion with free graph access or below-threshold relevance',async()=>{
+    const a=await add('Relevant supported alternative'),b=await add('Distant supported alternative');
+    await pool.query('UPDATE memory_embeddings SET embedding=$2::vector WHERE memory_id=$1',[b.id,JSON.stringify([0,1,...state.vector.slice(2)])]);
+    await pool.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+      SELECT $1,a.id,b.id,'keep_both',1,a.revision,b.revision FROM memories a,memories b WHERE a.id=$2 AND b.id=$3`,[state.vault.id,a.id,b.id]);
+    await pool.query("INSERT INTO memory_edges(vault_id,from_memory_id,to_memory_id,type,confidence) VALUES($1,$2,$3,'supports',0.9)",[state.vault.id,a.id,b.id]);
+    for(const include_related of [false,true]){
+      await pool.query('UPDATE vaults SET rate_limit_override=$2::jsonb WHERE id=$1',[state.vault.id,JSON.stringify({curator_enabled:include_related?false:true})]);
+      const value=(await recall({top_k:2,min_similarity:0.5,include_related})).json();
+      expect(value.memories.map((m:any)=>m.id)).toEqual([a.id]);expect(value.related_memories).toEqual([]);
+      expect(value.memories[0].conflict_coverage).toBe('companions_omitted');
+    }
+    await pool.query('UPDATE vaults SET rate_limit_override=$2::jsonb WHERE id=$1',[state.vault.id,JSON.stringify({curator_enabled:true})]);
+    const entitled=(await recall({top_k:2,min_similarity:0.5})).json();
+    expect(entitled.related_memories.map((m:any)=>m.id)).toEqual([b.id]);
+    expect(entitled.memories[0].conflict_coverage).toBe('all_companions_included');
+  });
+  it.each(['retired','deleted','expired','restricted','stale'])('suppresses inapplicable uncertainty (%s)',async change=>{
+    const a=await add('Relevant supported alternative'),b=await add('Unavailable alternative');
+    const log=()=>pool.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+      SELECT $1,a.id,b.id,'keep_both',1,a.revision,b.revision FROM memories a,memories b WHERE a.id=$2 AND b.id=$3`,[state.vault.id,a.id,b.id]);
+    await log();
+    if(change==='retired')await pool.query("UPDATE memories SET status='superseded' WHERE id=$1",[b.id]);
+    if(change==='deleted')await pool.query('DELETE FROM memories WHERE id=$1',[b.id]);
+    if(change==='expired')await pool.query("UPDATE memories SET type='workflow',valid_until='2020-01-01' WHERE id=$1",[b.id]);
+    if(change==='restricted'){
+      await expect(pool.query("UPDATE memories SET sensitivity='restricted' WHERE id=$1",[b.id])).rejects.toThrow('Invalid active memory');
+      await pool.query("UPDATE memories SET sensitivity='restricted',status='superseded',archived_at=now() WHERE id=$1",[b.id]);
+    }
+    if(change==='stale')await pool.query("UPDATE memories SET data='New supported revision' WHERE id=$1",[b.id]);
+    if(!['stale','deleted'].includes(change))await log();
+    expect((await recall({top_k:1})).json().memories[0].unresolved_conflict).toBe(false);
+    expect((await recall({top_k:1},'?format=bundle_v3')).json().bundle).not.toContain('Unresolved conflicting evidence');
+  });
+  it('uses the final snapshot for uncertainty and counts only records fitted into the bundle',async()=>{
+    const a=await add('First supported alternative'),b=await add('Second supported alternative');
+    await pool.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
+      SELECT $1,a.id,b.id,'keep_both',1,a.revision,b.revision FROM memories a,memories b WHERE a.id=$2 AND b.id=$3`,[state.vault.id,a.id,b.id]);
+    const full=(await recall({top_k:2,max_bundle_bytes:4096},'?format=bundle_v3')).json().bundle;
+    const execute=db.query,counters:string[][]=[];
+    vi.spyOn(db,'query').mockImplementation((async(sql:string,args:any[])=>{
+      if(sql.includes('UPDATE memories m SET last_recalled'))counters.push(args[1]);
+      return execute(sql,args);
+    }) as any);
+    const partial=(await recall({top_k:2,max_bundle_bytes:Buffer.byteLength(full)-1},'?format=bundle_v3')).json().bundle;
+    expect(counters).toHaveLength(1);expect(counters[0]).toHaveLength(1);
+    const records=partial.split('\n').filter((line:string)=>line.startsWith('{')).map((line:string)=>JSON.parse(line));
+    expect(records).toHaveLength(1);expect(records[0].conflict_coverage).toBe('companions_omitted');
+    expect([a,b].find(m=>m.id===counters[0][0])!.data).toBe(records[0].memory);
+    vi.restoreAllMocks();let raced=false;
+    vi.spyOn(db,'query').mockImplementation((async(sql:string,args:any[])=>{
+      if(!raced && sql.includes('WITH selected AS')){raced=true;await pool.query("UPDATE memories SET data='Concurrent correction' WHERE id=$1",[b.id]);}
+      return execute(sql,args);
+    }) as any);
+    const result=(await recall({top_k:2})).json();expect(raced).toBe(true);
+    expect(result.memories.map((m:any)=>m.id)).toEqual([a.id]);expect(result.memories[0].unresolved_conflict).toBe(false);
   });
   it('edits atomically with embedding and new revision membership, and rejects approval fields',async()=>{
     const m=await add();const patch=await app.inject({method:'PATCH',url:'/v1/memories/'+m.id,payload:{data:'Useful correction'}});

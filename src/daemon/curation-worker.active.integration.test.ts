@@ -99,6 +99,37 @@ describe.skipIf(!databaseUrl)('active-memory curation worker (PostgreSQL)',()=>{
     expect((await pool.query('SELECT status FROM memories WHERE id=$1',[f.ids[0]])).rows[0].status).toBe('active');
     expect((await pool.query('SELECT id FROM curation_queue WHERE id=$1',[f.queue])).rowCount).toBe(0);
   });
+  it('excludes non-current behavior from targets and related context while retaining ordinary dated knowledge',async()=>{
+    const f=await fixture(8);
+    const dates=[['user_rule',null,'2020-01-01'],['workflow','2099-01-01',null],
+      ['system_fact',null,'2020-01-01'],['project','2099-01-01',null],
+      ['constraint',null,'2020-01-01'],['decision','2099-01-01',null],
+      ['domain_knowledge',null,'2020-01-01'],['system_fact','2099-01-01',null]];
+    for(let i=0;i<dates.length;i++)await pool.query(
+      'UPDATE memories SET type=$2,valid_from=$3::date,valid_until=$4::date WHERE id=$1',[f.ids[i],...dates[i]]);
+    await pool.query('UPDATE curation_queue_items i SET revision=m.revision FROM memories m WHERE m.id=i.memory_id AND i.queue_id=$1',[f.queue]);
+    await pool.query('DELETE FROM curation_queue_items WHERE queue_id=$1 AND memory_id=ANY($2::uuid[])',[f.queue,f.ids.slice(4)]);
+    const before=await semanticState(f.vault);
+    let observedTargets:any[]=[],observedContext:any[]=[];
+    const call=model((targets,context)=>{
+      observedTargets=targets;observedContext=context;
+      return{...empty(),keep:targets.map(t=>({id:t.id,reason:'Already useful'}))};
+    });
+    await worker.processBatch();expect(call).toHaveBeenCalledOnce();
+    expect(observedTargets.map(t=>t.statement).sort()).toEqual(['Durable fact 2','Durable fact 3']);
+    expect(observedContext.map(t=>t.statement).sort()).toEqual(['Durable fact 6','Durable fact 7']);
+    expect(await semanticState(f.vault)).toEqual(before);
+  });
+  it('makes no provider call and does not archive memories when every target is non-current behavior',async()=>{
+    const f=await fixture(2);
+    await pool.query("UPDATE memories SET type='user_rule',valid_until='2020-01-01' WHERE id=$1",[f.ids[0]]);
+    await pool.query("UPDATE memories SET type='decision',valid_from='2099-01-01' WHERE id=$1",[f.ids[1]]);
+    await pool.query('UPDATE curation_queue_items i SET revision=m.revision FROM memories m WHERE m.id=i.memory_id AND i.queue_id=$1',[f.queue]);
+    const before=await semanticState(f.vault);
+    const call=model(()=>empty());
+    await worker.processBatch();expect(call).not.toHaveBeenCalled();
+    expect(await semanticState(f.vault)).toEqual(before);
+  });
   it('consolidates atomically with replacement embedding, lineage and rewired graph',async()=>{
     const f=await fixture(3);
     // The third memory is reviewed context, not consumed improvement work.

@@ -39,6 +39,32 @@ describe('whole-record curator preparation', () => {
     }
   });
 
+  it('filters target/context aliases and raw evidence before budgeting, retaining ordinary dated facts',()=>{
+    const now=new Date('2026-09-18T00:30:00Z');
+    const types=['user_rule','user_preference','task_pattern','workflow','constraint','decision'] as const;
+    const excluded=types.flatMap(type=>[
+      memory(type+'-past',{type,valid_until:'2026-09-17'}),
+      memory(type+'-future',{type,valid_from:'2026-09-19'})]);
+    excluded.push(memory('bad-type',{type:null}),memory('bad-date',{valid_from:'2026-02-30'}),
+      memory('inverted',{valid_from:'2027-01-01',valid_until:'2020-01-01'}));
+    const retained=types.map(type=>memory(type+'-today',{type,valid_from:'2026-09-18',valid_until:'2026-09-18'}));
+    for(const type of ['project','system_fact','domain_knowledge'] as const){
+      retained.push(memory(type+'-past',{type,valid_until:'2020-01-01'}),memory(type+'-future',{type,valid_from:'2099-01-01'}));
+    }
+    const targets=[...excluded,...retained].map(m=>({...m,source_chunks:[m.id]}));
+    const context=targets.map(m=>({...m,id:'ctx-'+m.id}));
+    const rawSources=excluded.map(m=>({id:m.id,role:'user',content:'EXCLUDED SOURCE '+m.id,current:true,
+      created_at:'2026-09-18T00:00:00Z',provenance:null,context:{session_id:'session'}}));
+    const batch=new CuratorService().prepare(targets,context,null,{now,rawSources,maxInputTokens:24000});
+    expect(batch.candidates.map(m=>m.id)).toEqual(retained.map(m=>m.id));
+    expect(batch.activeMemories.map(m=>m.id)).toEqual(retained.map(m=>'ctx-'+m.id));
+    expect(batch.rawSources).toEqual([]);expect(batch.deferredCandidateIds).toEqual([]);
+    for(const m of excluded){
+      expect(batch.aliasMaps.idToAlias.has(m.id)).toBe(false);
+      expect(batch.aliasMaps.idToAlias.has('ctx-'+m.id)).toBe(false);
+    }
+  });
+
   it('budgets the actual escaped prefix on both messages, without duplicating it', () => {
     getConfig().LLM_SYSTEM_PROMPT_PREFIX = 'Prefix "with\\escaping" '.repeat(20);
     const batch = new CuratorService().prepare([memory('c')], [], null, { maxInputTokens: 12000 });

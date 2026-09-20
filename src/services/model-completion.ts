@@ -118,11 +118,12 @@ function normalizedNativeResponse(raw: unknown): ModelCompletion {
   } }], ...(usage ? { usage } : {}), native_response: raw };
 }
 
-export async function completeModelRequest(client: OpenAI, input: ChatInput, baseURL: string): Promise<ModelCompletion> {
-  if (!usesNativeMessages(input, baseURL)) return client.chat.completions.create(input);
+export async function completeModelRequest(client: OpenAI, input: ChatInput, baseURL: string, options?: {maxRetries:0}): Promise<ModelCompletion> {
+  if (!usesNativeMessages(input, baseURL)) return options ? client.chat.completions.create(input, options) : client.chat.completions.create(input);
   const body = modelRequestBody(input, baseURL);
   const response = await client.post<ChatInput | NativeRequest, unknown>('/messages', {
     body,
+    ...options,
     headers: { 'x-api-key': client.apiKey, 'anthropic-version': '2023-06-01', authorization: null }
   });
   return normalizedNativeResponse(response);

@@ -1,0 +1,11 @@
+**
+!package.json
+!tsconfig.json
+!Dockerfile
+!src/**/*.ts
+!src/**/*.sql
+!build-context/**/package.json
+!build-context/package-lock.json
+!prompts/extractor.txt
+!prompts/curator.txt
+!prompts/manifest.json

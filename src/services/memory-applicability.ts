@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { unicodeStringSchema } from './unicode-string';
+import { isMemoryTemporallyRecallable, memoryTemporalRecallPredicateSql, type TemporalRecallMemory } from './memory-temporal-recall';
 
 import type { MemoryScope } from './memory-scope';
 
@@ -10,10 +12,10 @@ export function isFutureSourceTimestamp(timestamp: string, now = new Date()): bo
   return new Date(timestamp).getTime() > now.getTime() + MAX_SOURCE_CLOCK_SKEW_MS;
 }
 
-export const contextIdentitySchema = z.string().max(512).refine(
+export const contextIdentitySchema = unicodeStringSchema(512).refine(
   (value) => !/\p{Cc}/u.test(value),
   'Context identities must not contain control characters'
-).transform((value) => value.trim()).pipe(z.string().min(1));
+).transform((value) => value.trim()).refine(value => value.length > 0, 'Context identities must remain non-empty after trimming');
 
 export const recallContextSchema = z.object({
   session_id: contextIdentitySchema.optional(),
@@ -39,8 +41,7 @@ export function scopeKeyForContext(scope: MemoryScope, context: RecallContext): 
   return parsed.success && parsed.data === key ? parsed.data : null;
 }
 
-export interface ApplicableMemory {
-  type: string | null;
+export interface ApplicableMemory extends TemporalRecallMemory {
   scope: MemoryScope;
   scope_key: string | null;
   sensitivity: string;
@@ -53,6 +54,7 @@ export function isMemoryApplicable(
   context: RecallContext,
   now = new Date()
 ): boolean {
+  if (!isMemoryTemporallyRecallable(memory, now)) return false;
   if (memory.sensitivity === 'restricted' || !(memory.confidence > 0 && memory.confidence <= 1)) {
     return false;
   }
@@ -84,7 +86,8 @@ export function memoryApplicabilityPredicateSql(
 }
 
 export function memoryEligibilityPredicateSql(memoryAlias: string, recallTimeParameter: string): string {
-  return `${memoryAlias}.sensitivity <> 'restricted'
+  return `${memoryTemporalRecallPredicateSql(memoryAlias, recallTimeParameter)}
+    AND ${memoryAlias}.sensitivity <> 'restricted'
     AND ${memoryAlias}.confidence > 0
     AND ${memoryAlias}.confidence <= 1
     AND (${memoryAlias}.source_timestamp IS NULL OR ${memoryAlias}.source_timestamp <= ${recallTimeParameter}::timestamptz + interval '5 minutes')`;

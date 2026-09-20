@@ -101,6 +101,71 @@ describe('server-owned recall composition',()=>{
     const value=(await request({},'?format=bundle_v3')).json();
     expect(value.bundle).toContain(dates.valid_from?'future':'historical');
   });
+  it.each(['user_rule','user_preference','task_pattern','workflow','constraint','decision'].flatMap(type=>
+    [{type,valid_from:null,valid_until:'2020-12-31'},{type,valid_from:'2099-01-01',valid_until:null}]))(
+    'excludes behavioral dates %j from JSON, supporting evidence and counters',async change=>{
+      state.semantic=[row({...change,source_chunks:[crypto.randomUUID()]})];
+      const json=await request({include_evidence:true});
+      expect(json.json().memories).toEqual([]);
+      expect(json.json().evidence_chunks).toEqual([]);
+      expect(state.query.mock.calls.some(([sql])=>sql===RECALL_COUNTER_UPDATE_SQL)).toBe(false);
+    });
+  it.each(['user_rule','user_preference','task_pattern','workflow','constraint','decision'].flatMap(type=>
+    [{type,valid_from:null,valid_until:'2020-12-31'},{type,valid_from:'2099-01-01',valid_until:null}]))(
+    'never renders out-of-window behavior as historical/future JSON records %j',async change=>{
+      state.semantic=[row(change)];
+      expect((await request({},'?format=bundle_v3')).json().bundle).toBe('');
+      expect(state.query.mock.calls.some(([sql])=>sql===RECALL_COUNTER_UPDATE_SQL)).toBe(false);
+    });
+  it.each([{type:'user_rule',valid_until:'2020-01-01'}, {type:'constraint',valid_from:'2099-01-01'},
+    {type:null},{type:'unknown'},{valid_from:'2026-02-30'},{valid_from:'0000-01-01'},
+    {valid_from:'2099-01-01',valid_until:'2020-01-01'}])('rechecks final type/validity %j before decryption/counters',async change=>{
+    state.semantic=[row()];state.final=rows=>rows.map(m=>({...m,...change}));
+    expect((await request()).json().memories).toEqual([]);
+    expect((await request({},'?format=bundle_v3')).json().bundle).toBe('');
+    expect(state.query.mock.calls.some(([sql])=>sql===RECALL_COUNTER_UPDATE_SQL)).toBe(false);
+  });
+  it('excludes behavior before budgeting, deduplicates candidates and never seeds graph from excluded rows',async()=>{
+    const expired=row({type:'user_rule',valid_until:'2020-01-01',similarity:1}),fact=row();
+    state.semantic=[expired,fact,fact];
+    state.graph=[row({type:'workflow',valid_from:'2099-01-01',source:'graph'})];
+    const response=(await request({top_k:2})).json();
+    expect(response.memories.map((m:any)=>m.id)).toEqual([fact.id]);
+    expect(response.related_memories).toEqual([]);
+    const graph=state.query.mock.calls.find(([sql])=>sql.includes("'graph' AS source"))!;
+    expect(graph[1][5]).toEqual([fact.id]);
+    for(const alias of ['m','origin']){
+      expect(graph[0]).toContain(alias+'.valid_from');expect(graph[0]).toContain(alias+'.valid_until');
+    }
+    const final=state.query.mock.calls.find(([sql])=>sql.includes('WITH selected AS'))![0];
+    for(const alias of ['m','origin','other']) expect(final).toContain(alias+'.valid_until');
+  });
+  it('keeps one reference date across embedding and final snapshot delays at UTC midnight',async()=>{
+    vi.useFakeTimers({toFake:['Date']});
+    try{
+      vi.setSystemTime(new Date('2024-02-29T23:59:59.999Z'));
+      state.semantic=[row({type:'user_rule',valid_until:'2024-02-29'})];
+      state.embed.mockImplementation(async()=>{vi.setSystemTime(new Date('2024-03-01T00:00:00Z'));return [1,0];});
+      const body=(await request({},'?format=bundle_v3')).json();
+      expect(body.bundle).toContain('current_or_unbounded');
+      for(const [sql,args] of state.query.mock.calls){
+        if(sql.includes("'semantic' AS source") || sql.includes('WITH selected AS')) expect(args[4]).toBe('2024-02-29T23:59:59.999Z');
+      }
+    }finally{vi.useRealTimers();}
+  });
+  it('captures the request clock before quota locks can wait across UTC midnight',async()=>{
+    vi.useFakeTimers({toFake:['Date']});
+    try{
+      vi.setSystemTime(new Date('2024-02-29T23:59:59.999Z'));
+      state.semantic=[row({type:'user_preference',valid_until:'2024-02-29'})];
+      state.quota.mockImplementationOnce(async()=>{vi.setSystemTime(new Date('2024-03-01T00:00:00.001Z'));return {};});
+      const body=(await request({},'?format=bundle_v3')).json();
+      expect(body.bundle).toContain('current_or_unbounded');
+      for(const [sql,args] of state.query.mock.calls){
+        if(sql.includes("'semantic' AS source") || sql.includes('WITH selected AS')) expect(args[4]).toBe('2024-02-29T23:59:59.999Z');
+      }
+    }finally{vi.useRealTimers();}
+  });
   it('never inserts an unrelated vault-wide rule ahead of relevant facts',async()=>{
     const rule=row({scope:'global',scope_key:null,type:'user_rule',similarity:0.1,salience:1});
     const fact=row();state.semantic=[rule,fact];

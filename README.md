@@ -2,6 +2,20 @@
 
 Self-hosted, API-first memory service for AI agents. Persistio stores raw conversation chunks, extracts durable memories asynchronously, and exposes semantic recall with vault-scoped API key auth.
 
+## Public prompts and release acceptance
+
+`prompts/extractor.txt` and `prompts/curator.txt` are canonical public
+defaults, with SHA-256 identities in `prompts/manifest.json`. The image
+uses `/prompts` plus legacy `/app/prompts`. The source release builds
+this Dockerfile and accepts its compiled loaders and facts-object /
+curation-plan.v2 contracts before export. The manifest-only
+`build-context/` retains the reviewed locked server dependency graph.
+Explicit mounts and custom-vault prompts remain supported, subject to
+mandatory contracts and PROMPTS_DIR realpath confinement. Source-only
+runtimes must set PROMPTS_DIR to the checkout's absolute prompts path.
+Image rollback does not roll back vault overrides. Never commit private
+prompts or credentials.
+
 ## Prerequisites
 
 - Docker and Docker Compose

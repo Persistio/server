@@ -1,3 +1,4 @@
+import { unresolvedPairSql } from '../services/contradiction-pairs';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { getConfig } from '../config';
@@ -8,9 +9,10 @@ import { getEmbedder } from '../services/embedder';
 import { getRawChunkStorage } from '../services/raw-chunk-storage';
 import { applyRateLimitHeaders, consumeApiQuota } from '../services/usage';
 import { getCuratorLimits } from '../services/curation-capacity';
-import { prepareRecallBundle, recallBundleBudgetSchema, type BundleMemory } from '../services/recall-bundle';
+import { prepareRecallBundle, recallBundleBudgetSchema, recallConflictCoverage, type BundleMemory } from '../services/recall-bundle';
 import { isMemoryApplicable, memoryApplicabilityPredicateSql,
   memoryEligibilityPredicateSql, recallContextSchema, type RecallContext } from '../services/memory-applicability';
+import { memoryTemporalState } from '../services/memory-temporal-recall';
 import { provenanceIdentitySchema } from '../services/provenance-identity';
 import { recallDurationHistogram } from '../metrics';
 
@@ -60,7 +62,8 @@ function currentEligible(row: RecallMemory,context: RecallContext,now: Date): bo
   return row.status === 'active' && row.archived_at === null && isMemoryApplicable(row,context,now);
 }
 function publicMemory(row: RecallMemory) {
-  const { subject_encrypted: _encrypted,archived_at: _archived,...memory } = row;
+  const { subject_encrypted: _encrypted,archived_at: _archived,
+    conflict_companion_ids: _companions,conflict_companions_omitted: _omitted,...memory } = row;
   return memory;
 }
 
@@ -75,12 +78,14 @@ export async function registerRecallRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Source retrieval requires session context and JSON format' });
     }
     const started = performance.now();
+    // Capture before quota locks/provider work: one request cannot change UTC day
+    // while waiting on any downstream operation.
+    const now = new Date();
     const quota = await consumeApiQuota(request.vault.id,'searches','api');
     applyRateLimitHeaders(reply,quota);
     const config = getConfig();
     const topK = Math.min(100,body.top_k ?? config.DEFAULT_RECALL_TOP_K);
     const minSimilarity = body.min_similarity ?? config.MIN_RECALL_SIMILARITY;
-    const now = new Date();
     const args = parameters(request.vault.id,body.context,now);
     const preparedCrypto = await prepareVaultCrypto(request.vault);
     const embedding = await getEmbedder().embed(body.query,{
@@ -93,8 +98,11 @@ export async function registerRecallRoutes(app: FastifyInstance) {
        AND 1-(me.embedding <=> $6::vector)>=$7
        ORDER BY me.embedding <=> $6::vector,m.id LIMIT $8`,
       [...args,JSON.stringify(embedding),minSimilarity,recallCandidateLimit(topK)])).rows;
-    semantic.sort(compareSemantic(body.mode,now));
-    const direct = semantic.slice(0,topK);
+    // Defence before budgeting and graph seeding as well as at the final snapshot.
+    const uniqueEligible = (rows: RecallMemory[]) => [...new Map(rows.filter(row => currentEligible(row,body.context,now)).map(row => [row.id,row])).values()];
+    const candidates = uniqueEligible(semantic);
+    candidates.sort(compareSemantic(body.mode,now));
+    const direct = candidates.slice(0,topK);
     const remaining = topK-direct.length;
     const graphEnabled = body.include_related && remaining>0 && direct.length>0
       && (await getCuratorLimits(request.vault.id)).curator_enabled;
@@ -107,18 +115,14 @@ export async function registerRecallRoutes(app: FastifyInstance) {
          AND origin.scope=m.scope AND origin.scope_key IS NOT DISTINCT FROM m.scope_key
          AND e.from_memory_id=ANY($6::uuid[]) AND NOT(m.id=ANY($6::uuid[]))
        ORDER BY m.salience DESC,m.id LIMIT $7`,[...args,direct.map(row => row.id),Math.min(20,remaining)])).rows : [];
-    const selected = [...direct,...graph];
+    const selected = uniqueEligible([...direct,...graph]).slice(0,topK);
 
     // Final row-version/binding/state check, after retrieval. This is the response
     // snapshot boundary, not a promise about what a model later does with context.
     const fresh = selected.length ? (await query<RecallMemory>(
       `WITH selected AS (SELECT * FROM jsonb_to_recordset($6::jsonb) AS x(id uuid,revision bigint,source text,similarity float))
-       SELECT ${columns},selected.source,selected.similarity,
-         EXISTS(SELECT 1 FROM contradiction_scan_log l JOIN memories other ON other.vault_id=l.vault_id AND other.id<>m.id
-           AND ((l.memory_id_a=other.id AND l.revision_a=other.revision) OR (l.memory_id_b=other.id AND l.revision_b=other.revision))
-           WHERE l.vault_id=m.vault_id AND l.decision='keep_both'
-             AND ((l.memory_id_a=m.id AND l.revision_a=m.revision) OR (l.memory_id_b=m.id AND l.revision_b=m.revision))
-             AND other.status='active' AND other.archived_at IS NULL) AS unresolved_conflict
+       , final AS MATERIALIZED (
+       SELECT ${columns},m.vault_id,selected.source,selected.similarity
        FROM selected
        JOIN memories m ON m.id=selected.id AND m.revision=selected.revision
        JOIN vaults v ON v.id=m.vault_id JOIN plans p ON p.id=v.plan_id
@@ -130,19 +134,34 @@ export async function registerRecallRoutes(app: FastifyInstance) {
            AND EXISTS(SELECT 1 FROM memory_edges e JOIN selected seed ON seed.id=e.from_memory_id AND seed.source<>'graph'
              JOIN memories origin ON origin.id=seed.id AND origin.vault_id=m.vault_id AND origin.revision=seed.revision
              WHERE e.vault_id=m.vault_id AND e.to_memory_id=m.id AND ${eligible('origin')} AND ${applicable('origin')}
-               AND origin.scope=m.scope AND origin.scope_key IS NOT DISTINCT FROM m.scope_key)
-         ))`,
+               AND origin.scope=m.scope AND origin.scope_key IS NOT DISTINCT FROM m.scope_key
+               AND EXISTS(SELECT 1 FROM memory_embeddings seed_embedding WHERE seed_embedding.memory_id=origin.id
+                 AND 1-(seed_embedding.embedding <=> $9::vector)>=$10))
+         ))
+         AND (selected.source<>'semantic' OR EXISTS(SELECT 1 FROM memory_embeddings me
+           WHERE me.memory_id=m.id AND 1-(me.embedding <=> $9::vector)>=$10))
+       )
+       SELECT ${columns},m.source,m.similarity,
+         ARRAY(SELECT other.id FROM final other WHERE other.id<>m.id
+           AND other.scope=m.scope AND other.scope_key IS NOT DISTINCT FROM m.scope_key
+           AND (${unresolvedPairSql('m','other')})) AS conflict_companion_ids,
+         EXISTS(SELECT 1 FROM memories other WHERE other.vault_id=m.vault_id AND other.id<>m.id
+           AND other.scope=m.scope AND other.scope_key IS NOT DISTINCT FROM m.scope_key
+           AND ${eligible('other')} AND ${applicable('other')}
+           AND NOT EXISTS(SELECT 1 FROM final included WHERE included.id=other.id)
+           AND (${unresolvedPairSql('m','other')})) AS conflict_companions_omitted
+       FROM final m`,
       [...args,JSON.stringify(selected.map(row => ({ id: row.id,revision: row.revision,source: row.source,similarity: row.similarity }))),
-        request.vault.encrypted_dek,request.vault.vault_encryption_enabled])).rows : [];
+        request.vault.encrypted_dek,request.vault.vault_encryption_enabled,JSON.stringify(embedding),minSimilarity])).rows : [];
     const byId = new Map(fresh.map(row => [row.id,row]));
     const ordered = selected.flatMap(row => {
       const current = byId.get(row.id);
-      return current && currentEligible(current,body.context,new Date()) ? [current] : [];
+      return current && currentEligible(current,body.context,now) ? [current] : [];
     });
     const decoded = ordered.map(row => ({
-      ...row,data: preparedCrypto.decrypt(request.vault,row.data),
+      ...row,temporal: memoryTemporalState(row,now),data: preparedCrypto.decrypt(request.vault,row.data),
       subject: row.subject_encrypted ? preparedCrypto.decrypt(request.vault,row.subject_encrypted) : row.subject,
-      unresolved_conflict: row.unresolved_conflict===true
+      unresolved_conflict: row.conflict_companions_omitted===true || !!row.conflict_companion_ids?.length || row.unresolved_conflict===true
     }));
     let evidence: unknown[] = [];
     let raw: unknown[] = [];
@@ -173,10 +192,12 @@ export async function registerRecallRoutes(app: FastifyInstance) {
         else if (body.include_raw) raw.push(item);
       }
     }
-    const assembled=bundle ? prepareRecallBundle(decoded,body.max_bundle_bytes,new Date()):null;
+    const assembled=bundle ? prepareRecallBundle(decoded,body.max_bundle_bytes,now):null;
+    const returnedIds=new Set(decoded.map(row=>row.id));
+    const jsonMemory=(row:RecallMemory)=>({...publicMemory(row),...recallConflictCoverage(row,returnedIds)});
     const response = assembled ? assembled.response : {
-      memories: decoded.filter(row => row.source!=='graph').map(publicMemory),
-      related_memories: decoded.filter(row => row.source==='graph').map(publicMemory),
+      memories: decoded.filter(row => row.source!=='graph').map(jsonMemory),
+      related_memories: decoded.filter(row => row.source==='graph').map(jsonMemory),
       evidence_chunks: evidence,raw_chunks: raw
     };
     // Internal memory usage counters are neither delivery events nor model-use

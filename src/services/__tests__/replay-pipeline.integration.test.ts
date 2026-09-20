@@ -37,9 +37,10 @@ vi.mock('../embedder', () => ({
   estimateEmbeddingTokens: (text: string) => Math.ceil(text.length / 3),
   getEmbedder: () => ({ embedBatch: async (texts: string[]) => texts.map(() => [1, ...Array(state.dimensions - 1).fill(0)]) })
 }));
-vi.mock('../extractor', () => ({ ExtractorService: class {
+vi.mock('../extractor', async original => ({ ...await original<typeof import('../extractor')>(), ExtractorService: class {
   extractSessionContext = state.context;
   extractFacts = state.extract;
+  extractSessionAliases = async () => [];
   arbitrateSubject = async () => 'use_existing';
 } }));
 vi.mock('../contradiction-activation', async original => ({ ...await original<typeof import('../contradiction-activation')>(), drainDueContradictionActivations: async () => 0 }));
@@ -62,7 +63,7 @@ describe.skipIf(!databaseUrl)('prepared replay through actual ingestion and extr
     ({processBatch}=await import('../../daemon/extraction-worker'));
   });
   beforeEach(async()=>{
-    vaultId=crypto.randomUUID();state.blobs.clear();state.extract.mockReset();state.context.mockClear();
+    vaultId=crypto.randomUUID();state.blobs.clear();state.extract.mockReset();state.context.mockReset().mockResolvedValue(null);
     await pool.query("INSERT INTO vaults(id,name,api_key_hash,plan_id) VALUES ($1,'replay-restoration',$2,'unlimited')",[vaultId,crypto.randomUUID()]);
     state.vault={id:vaultId,name:'test',plan_id:'unlimited',purpose:null,settings:{},status:'active',encrypted_dek:null,vault_encryption_enabled:false};
   });
@@ -85,12 +86,55 @@ describe.skipIf(!databaseUrl)('prepared replay through actual ingestion and extr
     expect(response.statusCode,response.body).toBe(202);return response.json();
   }
   const current=(conversation:string)=>JSON.parse(conversation).sources.find((s:any)=>s.current);
+  it('keeps replayed captures and persisted summaries inside exact project/task bindings', async () => {
+    state.extract.mockResolvedValue([]);
+    state.context.mockImplementation(async (...args: unknown[]) => {
+      const context = JSON.parse(args[0] as string).available_scope_bindings;
+      return `Project=${context.project_id ?? 'unbound'} Task=${context.task_id ?? 'unbound'}` as never;
+    });
+    for (const [index, context] of [{project_id:'A'}, {project_id:'B'}, {project_id:'A',task_id:'T'}, {}].entries()) {
+      const payload = {session_id:'shared-replay-session',context:{...context,trigger_type:'backfill'},chunks:[{
+        role:'user',content:`Synthetic durable context ${index}`,timestamp:'2026-06-01T00:00:00Z',provenance:human,
+        source_event:{namespace:'summary-regression',id:`source-${index}`,ordinal:0}
+      }]};
+      const accepted = await app.inject({method:'POST',url:'/v1/ingest/bulk',payload});
+      expect(accepted.statusCode,accepted.body).toBe(202);
+      await processBatch(vaultId);
+      const replay = await app.inject({method:'POST',url:'/v1/ingest',payload});
+      expect(replay.statusCode,replay.body).toBe(202);expect(replay.json()).toMatchObject({inserted:0,replayed:1});
+      await processBatch(vaultId);
+    }
+    expect(state.context).toHaveBeenCalledTimes(4);expect(state.extract).toHaveBeenCalledTimes(4);
+    for (const [conversation,header] of state.extract.mock.calls) {
+      const context=JSON.parse(conversation).available_scope_bindings;
+      expect(header).toContain(`Project=${context.project_id ?? 'unbound'} Task=${context.task_id ?? 'unbound'}`);
+      expect(JSON.parse(conversation).sources).toHaveLength(1);
+    }
+    expect((await pool.query('SELECT context_boundary FROM session_contexts WHERE vault_id=$1',[vaultId])).rowCount).toBe(4);
+  });
+  it('preserves maximum Unicode labels and identities through replay, SQL and scoped extraction',async()=>{
+    const session_id='😀'.repeat(512),label='😀'.repeat(64),timestamp='2026-06-01T00:00:00Z';
+    const [prepared]=prepare([{segment_id:'unicode',session_id,created_at:timestamp,chunks:[{
+      id:session_id,message_id:session_id,role:'user',content:'I prefer concise technical explanations.',
+      provenance:{...human,source_class:label,provenance_basis:[label]}}]}],{datasetSha256:'a'.repeat(64),importJobId:session_id});
+    const response=await app.inject({method:'POST',url:'/v1/ingest/bulk',payload:{session_id,chunks:prepared.chunks}});
+    expect(response.statusCode,response.body).toBe(202);
+    state.extract.mockImplementation(async(conversation:string)=>{
+      const source=current(conversation);expect(source.human_intent_source).toBe(true);
+      return [fact(source.ref,'user_preference')];
+    });
+    await processBatch(vaultId);
+    expect((await pool.query('SELECT scope_key,type FROM memories WHERE vault_id=$1',[vaultId])).rows)
+      .toEqual([{scope_key:session_id,type:'user_preference'}]);
+    expect((await pool.query('SELECT provenance FROM raw_chunks WHERE vault_id=$1',[vaultId])).rows[0].provenance.source_class).toBe(label);
+    expect((await pool.query('SELECT 1 FROM extraction_queue WHERE vault_id=$1',[vaultId])).rowCount).toBe(0);
+  });
   it('preserves transported-tail authorship regardless of arrival order, without treating it as human intent',async()=>{
     const timestamp='2026-06-01T00:00:00Z';
-    const source=(segment_id:string,id:string,content:string,session_id='transport')=>({segment_id,session_id,created_at:timestamp,
-      chunks:[{id,role:'user',content,created_at:timestamp,event_id:'shared-event'}]});
+    const source=(segment_id:string,id:string,content:string,session_id='transport',provenance?:unknown)=>({segment_id,session_id,created_at:timestamp,
+      chunks:[{id,role:'user',content,created_at:timestamp,event_id:'shared-event',...(provenance?{provenance}:{})}]});
     const plan=prepare([
-      source('header','h','[Inter-session message] sourceSession=agent:main:subagent:sender sourceChannel=internal sourceTool=sessions_send isUser=false\nGenerated payload'),
+      source('header','h','Generated payload','transport',agent),
       source('tail','t','Cancel this task; do not turn this into a standing rule.'),
       source('ordinary','o','The runtime is Node.js 22.','ordinary')
     ],{datasetSha256:'a'.repeat(64),importJobId:'job'});

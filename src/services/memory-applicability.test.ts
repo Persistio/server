@@ -10,6 +10,7 @@ import {
 
 const base = {
   type: 'system_fact',
+  valid_from: null, valid_until: null,
   scope: 'project' as const,
   scope_key: 'project-a',
   sensitivity: 'low',

@@ -1,3 +1,4 @@
+import { isMemoryTemporallyRecallable } from './memory-temporal-recall';
 import { parseModelJson } from './model-json';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('curator');
@@ -114,7 +115,7 @@ export interface PreparedCuratorBatch {
   rawSources: CuratorRawSource[];
 }
 
-type CuratorOptions = { rawSources?: CuratorRawSource[]; maxInputTokens?: number; maxOutputTokens?: number; vaultPromptContext?: VaultPromptContext | null };
+type CuratorOptions = { now?: Date; rawSources?: CuratorRawSource[]; maxInputTokens?: number; maxOutputTokens?: number; vaultPromptContext?: VaultPromptContext | null };
 
 export function buildAliasMaps(targets: CuratorMemory[], context: CuratorMemory[]): CuratorAliasMaps {
   const aliasToId = new Map<string,string>();
@@ -216,6 +217,14 @@ export class CuratorService {
     rawConversation: string | null,
     options: CuratorOptions = {}
   ): PreparedCuratorBatch {
+    const now = options.now ?? new Date();
+    // Optional dates in this in-process contract mean unbounded. Invalid supplied
+    // dates/types still fail closed through the shared model-context predicate.
+    const eligible = (memory: CuratorMemory) => isMemoryTemporallyRecallable({
+      type:memory.type,valid_from:memory.valid_from ?? null,valid_until:memory.valid_until ?? null
+    },now);
+    candidates = candidates.filter(eligible);
+    activeMemories = activeMemories.filter(eligible);
     const resolvedPrompt = resolveVaultPrompt({
       role: 'curation',
       defaultPrompt: this.promptLoader.getPrompt(),

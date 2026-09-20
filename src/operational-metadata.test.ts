@@ -14,8 +14,8 @@ const vault='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 afterEach(()=>{vi.restoreAllMocks();trace.disable();metrics.disable();context.disable();});
 describe('actual operational exports contain metadata only',()=>{
   it('retains fixed proposal exclusion counts and reasons through repeated filtering without content',()=>{
-    const expected={event:'extraction pipeline attrition',vault_id:vault,raw_facts:3,
-      after_source_filter:1,excluded_context_only:1,excluded_unsupported_human_intent:1,
+    const expected={event:'extraction pipeline attrition',vault_id:vault,raw_facts:5,
+      after_source_filter:1,excluded_context_only:1,excluded_unsupported_human_intent:1,excluded_unsupported_scope:2,
       after_score_filter:1,after_secret_filter:1,after_sensitivity_filter:1,after_deterministic_filter:1,threshold:5};
     const input={...expected,msg:expected.event,subject:privateText,fact:privateText,
       source_refs:[privateText],excluded_candidates:[privateText],reason:privateText};
@@ -24,7 +24,7 @@ describe('actual operational exports contain metadata only',()=>{
     const lines:string[]=[];vi.spyOn(console,'log').mockImplementation(value=>lines.push(String(value)));
     createOperationalLogger('extraction-worker').log(input);
     expect(JSON.parse(lines[0])).toMatchObject(expected);expect(lines.join('')).not.toContain(privateText);
-    for(const reason of ['context_only','unsupported_human_intent']){
+    for(const reason of ['unsupported_scope','context_only','unsupported_human_intent']){
       const labels={status:'dropped',reason,count:1};
       expect(operationalMetadata(operationalMetadata(labels))).toEqual(labels);
     }
@@ -117,9 +117,10 @@ describe('actual operational exports contain metadata only',()=>{
     const provider=new MeterProvider({readers:[reader]});metrics.setGlobalMeterProvider(provider);
     try{
       meter.createCounter('restoration.safe.count').add(1,{vault_id:vault,status:'accepted',session_id:privateText,memory_id:privateText,query:privateText});
+      meter.createCounter('restoration.scope.dropped').add(2,{vault_id:vault,status:'dropped',reason:'unsupported_scope',session_id:privateText});
       meter.createHistogram('restoration.safe.duration').record(10,{route:'/v1/recall',status_code:'200',subject:privateText});
       await provider.forceFlush();const output=JSON.stringify(exporter.getMetrics());
-      expect(output).toContain('restoration.safe.count');expect(output).toContain(vault);expect(output).not.toContain(privateText);
+      expect(output).toContain('restoration.safe.count');expect(output).toContain('unsupported_scope');expect(output).toContain(vault);expect(output).not.toContain(privateText);
     }finally{await provider.shutdown();}
   });
   it('runs an action exactly once despite tracer/context/export failures',async()=>{

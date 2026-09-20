@@ -1,3 +1,4 @@
+import {fixtureSource,cleanFixtureSources,fixtureExtractor,fixtureAssessment} from '../../__tests__/arbitration-fixtures';
 import crypto from 'node:crypto';
 import { Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -19,6 +20,7 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     dedup = await import('../dedup'); crypt = await import('../crypto');
   });
   afterEach(async () => {
+    await cleanFixtureSources();
     vi.restoreAllMocks(); events.metric.mockReset();
     await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])', [vaults]); vaults.length = 0;
   });
@@ -27,7 +29,7 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     const vaultId = crypto.randomUUID(), account = accountless ? null : crypto.randomUUID(); vaults.push(vaultId);
     await pool.query("INSERT INTO vaults(id,name,api_key_hash,account_id,plan_id) VALUES ($1,'dedup-effects',$2,$3,'unlimited')", [vaultId, crypto.randomUUID(), account]);
     const input: DedupInput = { vaultId, fact: 'Durable storage uses PostgreSQL.', subject: 'storage', score: 9, salience: 0.9,
-      embedding: vector, sourceChunks: [], sensitivity: 'low', type: 'domain_knowledge', scope: 'global', scopeKey: null,
+      embedding: vector, sourceChunks: [await fixtureSource(pool,vaultId)], sensitivity: 'low', type: 'domain_knowledge', scope: 'global', scopeKey: null,
       polarity: 'neutral', status: 'active', volatility: 'low', validFrom: null, validUntil: null };
     return { input, account };
   }
@@ -57,6 +59,23 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
       expect.objectContaining({ operation: 'memory_count', memory_count_delta: 1, workspace_id: account, source: 'extraction_worker' })
     ]);
   });
+  it.each(['user_rule','workflow','decision','system_fact','project','domain_knowledge'] as const)(
+    'preserves dated %s storage and admits only eligible arbitration through PostgreSQL',async type=>{
+      const {input}=await fixture(true);input.type=type;
+      const provider=fixtureExtractor(async()=>'keep_both' as const);
+      for(const bounds of [{validFrom:null,validUntil:'2020-01-01'},{validFrom:'2099-01-01',validUntil:null}]){
+        Object.assign(input,bounds);
+        input.fact='Durable dated baseline '+JSON.stringify(bounds);
+        const first=await dedup.deduplicateMemory(input);
+        expect(first.action).toBe('inserted');
+        expect((await dedup.deduplicateMemory(input)).action).toBe('skipped');
+        input.fact='Related dated knowledge '+JSON.stringify(bounds);
+        expect((await dedup.deduplicateMemory(input,provider as never)).action).toBe('inserted');
+      }
+      expect(provider.arbitrateConflict).toHaveBeenCalledTimes(['system_fact','project','domain_knowledge'].includes(type)?2:0);
+      const stored=await pool.query('SELECT status,valid_from::text,valid_until::text FROM memories WHERE vault_id=$1',[input.vaultId]);
+      expect(stored.rows).toHaveLength(4);expect(stored.rows.every(m=>m.status==='active')).toBe(true);
+    });
   it('does not create another addition on an exact merge, and accountless vaults still charge SQL', async () => {
     const { input } = await fixture(true);
     await dedup.deduplicateMemory(input); await dedup.deduplicateMemory(input);
@@ -86,13 +105,13 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     const { input } = await fixture(); input.type = 'user_preference';
     await dedup.deduplicateMemory(input);
     input.fact = 'Incoming preference.'; input.embedding = [0.85, Math.sqrt(1-0.85**2), ...vector.slice(2)];
-    const provider = { arbitrateConflict: vi.fn(async () => {
+    const provider = fixtureExtractor(async () => {
       const probe = await pool.connect();
       try { await probe.query('BEGIN'); await probe.query('SELECT * FROM memories WHERE vault_id=$1 FOR UPDATE NOWAIT', [input.vaultId]); }
       finally { await probe.query('ROLLBACK'); probe.release(); }
       input.fact = 'Changed after preflight';
       return 'discard_new';
-    }) };
+    });
     await dedup.deduplicateMemory(input, provider as never);
     expect(provider.arbitrateConflict).toHaveBeenCalledOnce();
     expect((await pool.query('SELECT status FROM memories WHERE vault_id=$1', [input.vaultId])).rows).toEqual([{ status: 'active' }, { status: 'active' }]);
@@ -112,7 +131,7 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
       for (const [index, candidate] of [first, second].entries()) {
         const request = requests[index]!;
         await dedup.deduplicateMemoryInTransaction(candidate, client, prepared, [], {
-          precomputedConflictDecision: 'merge', precomputedConflictMemoryId: request.existingMemoryId,
+          precomputedConflictDecision: await fixtureAssessment(request,input.vaultId,'merge'), precomputedConflictMemoryId: request.existingMemoryId,
           precomputedConflictMemoryRevision: request.existingMemoryRevision, precomputedConflictInput: request.inputFingerprint
         });
       }

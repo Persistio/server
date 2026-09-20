@@ -700,26 +700,39 @@ export async function canCreateMemory(vaultId: string): Promise<boolean> {
   return capacity.limit === undefined || capacity.activeMemories < capacity.limit;
 }
 
+/** Prepare DB-backed limits outside write locks; charge only when a send slot is available. */
+export async function prepareAiBudgetAdmission(vaultId:string,role:AiBudgetRole,estimatedTokens:number):Promise<{
+  fitsCapacity:boolean;reserve:()=>()=>void;
+}>{
+  const limits=await getVaultLimits(vaultId),requestLimit=limits.ai_requests_per_minute,
+    tokenLimit=limits.ai_tokens_per_minute,weight=getAiRoleWeight(limits,role),tokenCost=Math.max(1,estimatedTokens)*weight;
+  let used=false;
+  return {fitsCapacity:(requestLimit===undefined || weight<=requestLimit) && (tokenLimit===undefined || tokenCost<=tokenLimit),
+    reserve(){
+      if(used)throw new Error('AI budget admission already consumed');
+      const waitMs=Math.max(
+        requestLimit!==undefined?getTokenBucketWaitMs(aiRequestBuckets,`${vaultId}:${role}:requests`,requestLimit,weight):0,
+        tokenLimit!==undefined?getTokenBucketWaitMs(aiTokenBuckets,`${vaultId}:${role}:tokens`,tokenLimit,tokenCost):0);
+      if(waitMs>0)throw new AiBudgetDeferredError(role,new Date(Date.now()+waitMs),waitMs);
+      used=true;
+      if(requestLimit!==undefined)consumeTokenBucket(aiRequestBuckets,`${vaultId}:${role}:requests`,requestLimit,weight);
+      if(tokenLimit!==undefined)consumeTokenBucket(aiTokenBuckets,`${vaultId}:${role}:tokens`,tokenLimit,tokenCost);
+      let refunded=false;
+      // Only a known pre-dispatch reservation failure can invoke this refund.
+      // Add back this reservation, never restore a snapshot over another caller.
+      return()=>{
+        if(refunded)return;refunded=true;
+        const restore=(buckets:Map<string,BucketState>,key:string,limit:number|undefined,cost:number)=>{
+          const prior=buckets.get(key);if(limit===undefined || !prior)return;
+          const state=refillBucket(prior,limit,Date.now());state.tokens=Math.min(limit,state.tokens+cost);buckets.set(key,state);
+        };
+        restore(aiRequestBuckets,`${vaultId}:${role}:requests`,requestLimit,weight);
+        restore(aiTokenBuckets,`${vaultId}:${role}:tokens`,tokenLimit,tokenCost);
+      };
+    }};
+}
 export async function acquireAiBudget(vaultId: string, role: AiBudgetRole, estimatedTokens: number): Promise<void> {
-  const limits = await getVaultLimits(vaultId);
-  const requestLimit = limits.ai_requests_per_minute;
-  const tokenLimit = limits.ai_tokens_per_minute;
-  const weight = getAiRoleWeight(limits, role);
-  const waitMs = Math.max(
-    requestLimit !== undefined
-      ? getTokenBucketWaitMs(aiRequestBuckets, `${vaultId}:${role}:requests`, requestLimit, weight)
-      : 0,
-    tokenLimit !== undefined
-      ? getTokenBucketWaitMs(aiTokenBuckets, `${vaultId}:${role}:tokens`, tokenLimit, Math.max(1, estimatedTokens) * weight)
-      : 0
-  );
-
-  if (waitMs > 0) {
-    throw new AiBudgetDeferredError(role, new Date(Date.now() + waitMs), waitMs);
-  }
-
-  if (requestLimit !== undefined) consumeTokenBucket(aiRequestBuckets, `${vaultId}:${role}:requests`, requestLimit, weight);
-  if (tokenLimit !== undefined) consumeTokenBucket(aiTokenBuckets, `${vaultId}:${role}:tokens`, tokenLimit, Math.max(1, estimatedTokens) * weight);
+  (await prepareAiBudgetAdmission(vaultId,role,estimatedTokens)).reserve();
 }
 
 export async function settleAiUsage(vaultId: string, role: AiBudgetRole, estimatedTokens: number, actualTokens: number) {

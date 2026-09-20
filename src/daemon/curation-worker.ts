@@ -1,3 +1,4 @@
+import { memoryTemporalRecallPredicateSql } from '../services/memory-temporal-recall';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('curation-worker');
 import crypto from 'node:crypto';
@@ -32,6 +33,7 @@ import {
 } from '../services/curator';
 import { discardObsoleteCurationTargets } from '../services/curation-work';
 import { lockMemoryWriteVault } from '../services/dedup';
+import { normaliseSubject, resolveCanonical } from '../services/entity-resolver';
 import { getRawChunkStorage } from '../services/raw-chunk-storage';
 import { validateCuratorContract, type CuratorRawSource } from '../services/curator-contract';
 import { compileCuratorGraph, type CompiledCuratorGraph, type CuratorNodeRef } from '../services/curator-graph';
@@ -109,6 +111,7 @@ interface MemoryRow {
 }
 
 interface LoadedCurationJob {
+  recallNow: Date;
   queueId: string;
   segmentId: string | null;
   vault: VaultRow;
@@ -291,7 +294,8 @@ export async function processBatch() {
             maxInputTokens: limits.curator_input_tokens_per_call > 0 ? limits.curator_input_tokens_per_call : undefined,
             maxOutputTokens: limits.curator_output_tokens_per_call > 0 ? limits.curator_output_tokens_per_call : undefined,
             vaultPromptContext: await decryptVaultPromptContext(job.vault),
-            rawSources: job.rawSources
+            rawSources: job.rawSources,
+            now: job.recallNow
           }
         );
         job.rawSources = prepared.rawSources;
@@ -582,6 +586,8 @@ async function decryptVaultPromptContext(vault: VaultRow): Promise<VaultPromptCo
 }
 
 async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candidateLimit: number): Promise<LoadedCurationJob> {
+  const recallNow = new Date();
+  const timestamp = recallNow.toISOString();
   // Target and related-memory revisions come from one read snapshot. No provider
   // call occurs under a mutation lock; a later short apply transaction rechecks it.
   const loaded = await withTransaction(async client => {
@@ -589,10 +595,11 @@ async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candida
     const vault = (await client.query<VaultRow>(`SELECT id,account_id::text,encrypted_dek,vault_encryption_enabled,plan_id,
       type,custom_extraction_prompt,custom_curation_prompt FROM vaults WHERE id=$1`,[row.vault_id])).rows[0];
     if (!vault) throw new Error('Curation vault missing');
-    const targets = (await client.query<MemoryRow>(`SELECT m.*,m.revision::text AS row_version
+    const targets = (await client.query<MemoryRow>(`SELECT m.*,m.valid_from::text,m.valid_until::text,m.revision::text AS row_version
       FROM curation_queue_items i JOIN memories m ON m.id=i.memory_id AND m.vault_id=i.vault_id AND m.revision=i.revision
       WHERE i.queue_id=$1 AND i.vault_id=$2 AND m.status='active' AND m.archived_at IS NULL
-      ORDER BY m.confidence DESC,m.salience DESC,m.created_at,m.id LIMIT $3`,[row.queue_id,row.vault_id,candidateLimit+1])).rows;
+        AND ${memoryTemporalRecallPredicateSql('m','$4')}
+      ORDER BY m.confidence DESC,m.salience DESC,m.created_at,m.id LIMIT $3`,[row.queue_id,row.vault_id,candidateLimit+1,timestamp])).rows;
     const selected = targets.slice(0,candidateLimit);
     const ids = selected.map(m => m.id);
     const related = (await client.query<MemoryRow>(`WITH targets AS (SELECT m.*,e.embedding AS vector FROM memories m
@@ -605,6 +612,7 @@ async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candida
           SELECT a.* FROM memories a LEFT JOIN memory_embeddings e ON e.memory_id=a.id
           WHERE a.vault_id=$1 AND a.status='active' AND a.archived_at IS NULL AND NOT(a.id=ANY($2::uuid[]))
             AND a.scope=t.scope AND a.scope_key IS NOT DISTINCT FROM t.scope_key
+            AND ${memoryTemporalRecallPredicateSql('a','$5')}
             AND (a.id=t.parent_id OR a.parent_id=t.id
               OR (a.subject_hmac IS NOT NULL AND a.subject_hmac=t.subject_hmac)
               OR (a.subject_hmac IS NULL AND t.subject_hmac IS NULL AND a.subject=t.subject)
@@ -614,8 +622,8 @@ async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candida
         ) m
       ), ranked AS (SELECT id,max(rank) AS rank,array_agg(DISTINCT target_id) AS relevant_candidate_ids
         FROM matches GROUP BY id ORDER BY max(rank) DESC,id LIMIT $3)
-      SELECT m.*,m.revision::text AS row_version,r.relevant_candidate_ids FROM ranked r JOIN memories m ON m.id=r.id
-      ORDER BY r.rank DESC,m.id`,[row.vault_id,ids,Math.max(0,limits.curator_active_memories_per_call),RELEVANT_ACTIVE_MEMORY_MIN_SIMILARITY])).rows;
+      SELECT m.*,m.valid_from::text,m.valid_until::text,m.revision::text AS row_version,r.relevant_candidate_ids FROM ranked r JOIN memories m ON m.id=r.id
+      ORDER BY r.rank DESC,m.id`,[row.vault_id,ids,Math.max(0,limits.curator_active_memories_per_call),RELEVANT_ACTIVE_MEMORY_MIN_SIMILARITY,timestamp])).rows;
     const sourceIds = [...new Set([...selected,...related].flatMap(m => m.source_chunks ?? []))];
     const sourceStore = sourceIds.length ? getRawChunkStorage().store : null;
     const sourceRows = (await client.query<{id:string;role:string;created_at:string;provenance:unknown;session_id:string;project_id:string|null;task_id:string|null;blob_key:string;blob_store:string;storage_bytes:string}>(`
@@ -642,7 +650,7 @@ async function loadJob(row: CurationQueueRow, limits: CuratorPlanLimits, candida
   }
   const candidates = await Promise.all(loaded.selected.map(m => decryptMemory(loaded.vault,m)));
   const activeMemories = await Promise.all(loaded.related.map(m => decryptMemory(loaded.vault,m)));
-  return {queueId:row.queue_id,segmentId:row.segment_id,vault:loaded.vault,conversation:null,rawSources,candidates,activeMemories,
+  return {recallNow,queueId:row.queue_id,segmentId:row.segment_id,vault:loaded.vault,conversation:null,rawSources,candidates,activeMemories,
     candidateIds:new Set(candidates.map(m=>m.id)),limits,hasMoreCandidates:loaded.hasMore,deferredCandidates:loaded.hasMore?1:0};
 }
 
@@ -812,7 +820,7 @@ async function applyActions(
     }
     const sourceIds = [...new Set([...reviewed.values()].flatMap(m => m.source_chunks ?? []))];
     if (sourceIds.length) {
-      const sourceRows = await client.query('SELECT id FROM raw_chunks WHERE vault_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR KEY SHARE',[job.vault.id,sourceIds]);
+      const sourceRows = await client.query('SELECT id FROM raw_chunks WHERE vault_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR SHARE',[job.vault.id,sourceIds]);
       if (sourceRows.rows.length!==sourceIds.length) throw new Error('Curation source lineage is unavailable');
     }
     const audit = await client.query(`UPDATE curation_review_runs SET before_state=$2::jsonb
@@ -875,7 +883,7 @@ async function applyActions(
         [job.vault.id,id,change.scope,change.scope_key]);
       await client.query(`INSERT INTO memory_scope_change_log
         (vault_id,memory_id,old_scope,new_scope,old_scope_key,new_scope_key,actor_type,actor_id,source,reason)
-        VALUES($1,$2,$3,$4,$5,$6,'worker',NULL,'curator',$7)`,
+        VALUES($1,$2,$3,$4,$5,$6,'worker',NULL,'curation_worker',$7)`,
         [job.vault.id,id,previous.scope,change.scope,previous.scope_key,change.scope_key,change.reason]);
     }
 
@@ -923,13 +931,15 @@ async function applyActions(
       WHERE e.vault_id=$1 AND (a.id=ANY($2::uuid[]) OR b.id=ANY($2::uuid[]))
         AND a.status='active' AND b.status='active' AND a.archived_at IS NULL AND b.archived_at IS NULL
         AND (a.scope<>b.scope OR a.scope_key IS DISTINCT FROM b.scope_key OR a.id=b.id)
-      UNION ALL SELECT 1 FROM memories a JOIN memories b ON b.id=a.parent_id
+      UNION ALL SELECT 1 FROM memories a LEFT JOIN memories b ON b.id=a.parent_id
       WHERE a.vault_id=$1 AND (a.id=ANY($2::uuid[]) OR b.id=ANY($2::uuid[]))
-        AND a.status='active' AND a.archived_at IS NULL
-        AND (a.scope<>b.scope OR a.scope_key IS DISTINCT FROM b.scope_key)
+        AND a.status='active' AND a.archived_at IS NULL AND a.parent_id IS NOT NULL
+        AND (b.id IS NULL OR b.vault_id<>a.vault_id OR b.status<>'active' OR b.archived_at IS NOT NULL
+          OR a.scope<>b.scope OR a.scope_key IS DISTINCT FROM b.scope_key)
       LIMIT 1`,[job.vault.id,finalIds]);
     if (invalid.rows.length) throw new Error('Curation final graph violates applicability');
     await validateFinalHierarchy(client,job.vault.id,finalIds);
+    await validateFinalSurvivors(client,job.vault,preparedCrypto,[...ids,...createdIds.values()]);
     const after = await client.query('SELECT * FROM memories WHERE vault_id=$1 AND id=ANY($2::uuid[]) ORDER BY id',[job.vault.id,[...ids,...createdIds.values()]]);
     await client.query(`UPDATE curation_review_runs SET validation_status='applied',after_state=$2::jsonb,applied_at=now()
       WHERE id=$1 AND validation_status='valid'`,[reviewRunId,serializePreparedCurationAuditPayload(job.vault,after.rows,preparedCrypto)]);
@@ -942,6 +952,56 @@ async function applyActions(
   });
   if (applied) publishCommittedWorkerEffects([{kind:'memory-count',vaultId:job.vault.id,accountId:job.vault.account_id,delta,source:'curation_worker'}]);
   return applied;
+}
+
+/** Check only the actual final state: temporary collisions during swaps or before
+ * retirement are valid. Unreviewed matches are evidence to reject, never survivors
+ * to select or mutate. The vault write lock also conflicts with the crypto SHARE
+ * lock held by extraction's alias-writing stages, keeping canonical reads stable. */
+async function validateFinalSurvivors(
+  client: PoolClient, vault: VaultRow, preparedCrypto: PreparedVaultCrypto, ids: string[]
+): Promise<void> {
+  // Hashes, vectors and subject HMACs cannot exclude a logical duplicate. Bound
+  // the complete metadata-matching set across all surviving reviewed/created rows;
+  // the extra row is only an overflow sentinel, never a truncated absence proof.
+  const rows = (await client.query<Pick<MemoryRow,
+    'id'|'data'|'subject'|'subject_encrypted'|'scope'|'scope_key'|'type'|'polarity'|'valid_from'|'valid_until'>>(`
+    SELECT m.id,m.data,m.subject,m.subject_encrypted,m.scope,m.scope_key,m.type,m.polarity,
+      m.valid_from::text,m.valid_until::text
+    FROM memories m
+    WHERE m.vault_id=$1 AND m.status='active' AND m.archived_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM memories s
+        WHERE s.vault_id=$1 AND s.id=ANY($2::uuid[]) AND s.status='active' AND s.archived_at IS NULL
+          AND m.scope=s.scope AND m.scope_key IS NOT DISTINCT FROM s.scope_key
+          AND m.type IS NOT DISTINCT FROM s.type AND m.polarity=s.polarity
+          AND m.valid_from IS NOT DISTINCT FROM s.valid_from AND m.valid_until IS NOT DISTINCT FROM s.valid_until
+      )
+    ORDER BY m.id LIMIT 501 FOR SHARE OF m`,[vault.id,ids])).rows;
+  // This is structural application failure after paid preparation, not temporary
+  // capacity: use the existing bounded retry/dead-letter path, never endless paid deferral.
+  if (rows.length>500) throw new Error('Curation duplicate validation exceeds bounded capacity');
+  const reviewedIds = new Set(ids);
+  const canonicals = new Map<string,string>();
+  const identities = new Map<string,boolean>();
+  for (const row of rows) {
+    if (isVaultEncryptionActive(vault) && !row.subject_encrypted) throw new Error('Curation survivor subject is unavailable');
+    const subject = normaliseSubject(row.subject_encrypted ? preparedCrypto.decrypt(vault,row.subject_encrypted) : row.subject);
+    const bindingSubject = JSON.stringify([row.scope,row.scope_key,subject]);
+    let canonical = canonicals.get(bindingSubject);
+    if (canonical === undefined) {
+      canonical = normaliseSubject(await resolveCanonical(vault.id,subject,row.scope,row.scope_key,client) ?? subject);
+      canonicals.set(bindingSubject,canonical);
+    }
+    const identity = JSON.stringify([row.scope,row.scope_key,row.type,row.polarity,row.valid_from,row.valid_until,
+      canonical,preparedCrypto.decrypt(vault,row.data)]);
+    const isReviewed = reviewedIds.has(row.id);
+    const previousReviewed = identities.get(identity);
+    if (previousReviewed !== undefined && (previousReviewed || isReviewed)) {
+      throw new Error('Curation final survivors contain a logical duplicate');
+    }
+    identities.set(identity,isReviewed);
+  }
 }
 
 async function validateFinalHierarchy(client:PoolClient,vaultId:string,ids:string[]):Promise<void> {

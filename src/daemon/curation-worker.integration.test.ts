@@ -61,7 +61,7 @@ describe.skipIf(!databaseUrl)('actual curation worker lifecycle (PostgreSQL)', (
         const id = crypto.randomUUID(); ids.push(id);
         await pool.query(`INSERT INTO memories (id,vault_id,data,subject,hash,scope,scope_key,status,source_segment_id,
           type,confidence,salience,embedding) VALUES ($1,$2,$3,$4,$5,'project','project',$6,$7,'system_fact',0.9,0.8,$8::vector)`,
-        [id, vault, long ? `Fact ${i}. `.repeat(150) : `Fact ${status} ${i}.`, `topic-${i}`, crypto.randomUUID(), 'active',
+        [id, vault, long ? `Fact ${status} ${i}. `.repeat(150) : `Fact ${status} ${i}.`, `topic-${i}`, crypto.randomUUID(), 'active',
           status === 'target' ? segment : null, long ? null : JSON.stringify(state.vector)]);
       }
     }

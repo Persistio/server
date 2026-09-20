@@ -117,7 +117,7 @@ describe('getVaultSubjectList', () => {
         rowCount: 3
       } as never);
 
-    const subjects = await getVaultSubjectList('vault-1', 5, 5, 'project', 'project-1');
+    const subjects = await getVaultSubjectList('vault-1', 5, 5, 'project', 'project-1', new Date('2026-09-18T00:30:00Z'));
 
     expect(mockQuery).toHaveBeenNthCalledWith(
       1,
@@ -127,10 +127,18 @@ describe('getVaultSubjectList', () => {
     expect(mockQuery).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining('m.subject <>'),
-      ['vault-1', 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'project', 'project-1']
+      ['vault-1', 5, '2026-09-18T00:30:00.000Z', 'project', 'project-1']
     );
     expect(String(mockQuery.mock.calls[1][0])).toContain('m.valid_from IS NULL');
     expect(String(mockQuery.mock.calls[1][0])).toContain('m.valid_until IS NULL');
+    for (const [sql,params] of mockQuery.mock.calls.slice(1,3)) {
+      expect(String(sql)).toContain("AT TIME ZONE 'UTC'");
+      expect(String(sql)).not.toContain("now()");
+      expect(String(sql)).toContain("m.type IN ('project','system_fact','domain_knowledge')");
+      expect(String(sql)).toContain("'user_rule','user_preference','task_pattern','workflow','constraint','decision'");
+      expect(String(sql).indexOf('m.type IN')).toBeLessThan(String(sql).indexOf('GROUP BY'));
+      expect(params).toContain(mockQuery.mock.calls[1][1]![2]);
+    }
     expect(mockQuery).toHaveBeenNthCalledWith(
       4,
       expect.stringContaining('alias = ANY'),
@@ -204,10 +212,18 @@ describe('getVaultSubjectList', () => {
     expect(mockQuery).toHaveBeenNthCalledWith(
       3,
       expect.stringContaining('JOIN known_subjects'),
-      ['vault-1', ['hmac:fantastic-system', 'hmac:persistio'], ['fantastic-system', 'persistio'], 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'task', 'task-1']
+      ['vault-1', ['hmac:fantastic-system', 'hmac:persistio'], ['fantastic-system', 'persistio'], 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/), 'task', 'task-1']
     );
     expect(String(mockQuery.mock.calls[2][0])).toContain('m.valid_from IS NULL');
     expect(String(mockQuery.mock.calls[2][0])).toContain('m.valid_until IS NULL');
+    for (const [sql,params] of mockQuery.mock.calls.slice(2,4)) {
+      expect(String(sql)).toContain("AT TIME ZONE 'UTC'");
+      expect(String(sql)).not.toContain("now()");
+      expect(String(sql)).toContain("m.type IN ('project','system_fact','domain_knowledge')");
+      expect(String(sql)).toContain("'user_rule','user_preference','task_pattern','workflow','constraint','decision'");
+      expect(String(sql).indexOf('m.type IN')).toBeLessThan(String(sql).indexOf('GROUP BY'));
+      expect(params).toContain(mockQuery.mock.calls[2][1]![4]);
+    }
     expect(mockQuery).toHaveBeenNthCalledWith(
       5,
       expect.stringContaining('alias = ANY'),
@@ -260,7 +276,7 @@ describe('getVaultSubjectList', () => {
     expect(mockQuery).toHaveBeenNthCalledWith(
       3,
       expect.stringContaining('JOIN known_subjects'),
-      ['vault-1', ['hmac:fantastic-system', 'hmac:old fantastic name'], ['fantastic-system', 'fantastic-system'], 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'global', null]
+      ['vault-1', ['hmac:fantastic-system', 'hmac:old fantastic name'], ['fantastic-system', 'fantastic-system'], 5, expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/), 'global', null]
     );
     expect(subjects).toEqual([
       { canonical: 'fantastic-system', aliases: ['old fantastic name'], embedding: [1, 0, 0] }

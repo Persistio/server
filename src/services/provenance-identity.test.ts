@@ -26,3 +26,28 @@ describe('bounded provenance identity validation', () => {
     expect(visited).toBe(false);
   });
 });
+
+describe('shared Unicode string resource bound', () => {
+  it('bounds label and context work before downstream regex or trimming', async () => {
+    const { captureProvenanceSchema } = await import('./ingest-provenance-schema');
+    const { contextIdentitySchema } = await import('./memory-applicability');
+    const huge = '😀'.repeat(1024 * 1024);
+    const iterator = String.prototype[Symbol.iterator];
+    const trim = String.prototype.trim;
+    const test = RegExp.prototype.test;
+    let visited = false;
+    String.prototype[Symbol.iterator] = function () { if (this.length > 1024) visited = true; return iterator.call(this); };
+    String.prototype.trim = function () { if (this.length > 1024) visited = true; return trim.call(this); };
+    RegExp.prototype.test = function (value) { if (value.length > 1024) visited = true; return test.call(this,value); };
+    try {
+      const base = { actor_type:'agent',trigger_type:'api',artifact_type:'message',authorship:'generated',cadence:'one_off' };
+      expect(contextIdentitySchema.safeParse(huge).success).toBe(false);
+      expect(captureProvenanceSchema.safeParse({...base,source_class:huge}).success).toBe(false);
+      expect(captureProvenanceSchema.safeParse({...base,provenance_basis:[huge]}).success).toBe(false);
+      expect(captureProvenanceSchema.safeParse({...base,provenance_basis:Array(9).fill(huge)}).success).toBe(false);
+    } finally {
+      String.prototype[Symbol.iterator] = iterator;String.prototype.trim = trim;RegExp.prototype.test = test;
+    }
+    expect(visited).toBe(false);
+  });
+});

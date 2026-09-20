@@ -5,7 +5,7 @@ import { Client } from 'pg';
 import { getConfig } from '../config';
 import { AiBudgetDeferredError } from './usage';
 import { CircuitBreakerOpenError } from './ai-resilience';
-import { scanForContradictions } from './contradiction-scanner';
+import { scanForContradictions, type ContradictionScanCursor } from './contradiction-scanner';
 import type { ExtractorService } from './extractor';
 
 const MAX_VAULTS_PER_TICK = 20;
@@ -16,6 +16,11 @@ interface ScheduledMemory {
   memory_id: string;
   generation: string;
   failures: number;
+  revision: string;
+  reference_now: Date;
+  scan_reference_date: string | null;
+  scan_similarity: number | null;
+  scan_memory_id: string | null;
 }
 
 /** Only the periodic extraction loop calls this. Manual jobs cannot reset its budget. */
@@ -65,23 +70,47 @@ export async function drainDueContradictionActivations(extractor: ExtractorServi
         // One memory per selected vault gives independent vaults a turn even
         // when a single tenant has a large backlog. Partial scans stay durable.
         const due = await client.query<ScheduledMemory>(
-          `SELECT memory_id, generation, failures FROM memory_contradiction_schedule
+          `SELECT memory_id, generation, failures, revision::text,
+             statement_timestamp() AS reference_now, scan_reference_date::text, scan_similarity, scan_memory_id
+           FROM memory_contradiction_schedule
            WHERE vault_id = $1 AND available_at <= now()
            ORDER BY available_at, memory_id LIMIT 1`, [vaultId]
         );
         const memory = due.rows[0];
         if (memory) {
           try {
+            // Use one database instant for temporal eligibility and cursor date.
+            // SQL UTC casts below never depend on the connection's TimeZone.
+            const cursor = memory.scan_memory_id && memory.scan_reference_date && memory.scan_similarity !== null
+              ? { revision: memory.revision, referenceDate: memory.scan_reference_date,
+                  similarity: memory.scan_similarity, memoryId: memory.scan_memory_id }
+              : undefined;
             const result = await scanForContradictions(vaultId, [memory.memory_id], extractor, {
-              client, budget, maxArbitrations: 1
+              client, budget, maxArbitrations: 1, now: memory.reference_now,
+              cursors: cursor ? { [memory.memory_id]: cursor } : undefined
             });
-            if (result.completedMemoryIds.includes(memory.memory_id)) {
+            const activation = result.reactivations?.[memory.memory_id];
+            if (activation && activation.revision === memory.revision) {
+              // Exhaustion of today's shortlist is not lifetime completion.
+              // Clear all progress so applicability reopens the whole candidate
+              // stream, including pairs excluded by SQL before valid_from.
               await client.query(
-                'DELETE FROM memory_contradiction_schedule WHERE memory_id = $1 AND generation = $2',
-                [memory.memory_id, memory.generation]
+                `UPDATE memory_contradiction_schedule
+                 SET available_at = $5::date::timestamp AT TIME ZONE 'UTC', failures = 0,
+                     scan_reference_date = NULL, scan_similarity = NULL, scan_memory_id = NULL
+                 WHERE memory_id = $1 AND generation = $2 AND revision = $3::bigint
+                   AND (statement_timestamp() AT TIME ZONE 'UTC')::date = $4::date
+                   AND $5::date > $4::date`,
+                [memory.memory_id, memory.generation, memory.revision, activation.referenceDate, activation.validFrom]
+              );
+            } else if (result.completedMemoryIds.includes(memory.memory_id)) {
+              await client.query(
+                `DELETE FROM memory_contradiction_schedule WHERE memory_id = $1 AND generation = $2
+                 AND revision = $3::bigint AND (statement_timestamp() AT TIME ZONE 'UTC')::date = $4::date`,
+                [memory.memory_id, memory.generation, memory.revision, memory.reference_now.toISOString().slice(0,10)]
               );
             } else {
-              await deferMemory(client, memory, RETRY_BASE_MS, false);
+              await deferMemory(client, memory, RETRY_BASE_MS, false, result.cursors?.[memory.memory_id]);
             }
           } catch (error) {
             // Every failure remains retryable. Provider outages and malformed
@@ -107,13 +136,21 @@ export async function drainDueContradictionActivations(extractor: ExtractorServi
   }
 }
 
-async function deferMemory(client: Client, memory: ScheduledMemory, delayMs: number, failed: boolean): Promise<void> {
+async function deferMemory(client: Client, memory: ScheduledMemory, delayMs: number, failed: boolean,
+  cursor?: ContradictionScanCursor): Promise<void> {
   await client.query(
     `UPDATE memory_contradiction_schedule
      SET available_at = now() + ($3::bigint * interval '1 millisecond'),
-         failures = CASE WHEN $4 THEN LEAST(failures + 1, 10) ELSE 0 END
-     WHERE memory_id = $1 AND generation = $2`,
-    [memory.memory_id, memory.generation, delayMs, failed]
+         failures = CASE WHEN $4 THEN LEAST(failures + 1, 10) ELSE 0 END,
+         scan_reference_date = CASE WHEN $4 THEN scan_reference_date ELSE $6::date END,
+         scan_similarity = CASE WHEN $4 THEN scan_similarity ELSE $7::double precision END,
+         scan_memory_id = CASE WHEN $4 THEN scan_memory_id ELSE $8::uuid END
+     WHERE memory_id = $1 AND generation = $2 AND revision = $5::bigint
+       AND ($4 OR $6::date IS NULL OR (statement_timestamp() AT TIME ZONE 'UTC')::date = $6::date)`,
+    [memory.memory_id, memory.generation, delayMs, failed, memory.revision,
+      cursor && cursor.revision === memory.revision ? cursor.referenceDate : null,
+      cursor && cursor.revision === memory.revision ? cursor.similarity : null,
+      cursor && cursor.revision === memory.revision ? cursor.memoryId : null]
   );
 }
 

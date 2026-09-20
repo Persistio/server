@@ -32,7 +32,7 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       STORAGE_EMBEDDING_DIMENSIONS: ${STORAGE_EMBEDDING_DIMENSIONS:-1024}
-    # The published image contains basic public prompts in /prompts.
+    # The published image contains canonical public prompts in /prompts.
     # To use refined local prompts, mount them at runtime instead of baking them into the image:
     # environment:
     #   PROMPTS_DIR: /prompts
@@ -40,7 +40,7 @@ services:
     #   CURATOR_PROMPT_FILE: /prompts/curator.txt
     volumes:
       - raw_chunks:/data/raw-chunks
-    # To mount refined prompts as well, add:
+    # To mount custom prompts as well, add:
     #   - ./prompts/extractor.txt:/prompts/extractor.txt:ro
     #   - ./prompts/curator.txt:/prompts/curator.txt:ro
     ports:

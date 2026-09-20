@@ -5,7 +5,8 @@ const gcsMock = vi.hoisted(() => {
   return {
     objects,
     bucketNames: [] as string[],
-    save: vi.fn(async (key: string, content: string) => {
+    save: vi.fn(async (key: string, content: string, options:any) => {
+      if(objects.has(key) && options.preconditionOpts?.ifGenerationMatch===0)throw new Error('Object already exists');
       objects.set(key, content);
     }),
     download: vi.fn(async (key: string) => [Buffer.from(objects.get(key) ?? '', 'utf8')]),
@@ -32,7 +33,7 @@ vi.mock('@google-cloud/storage', () => ({
       gcsMock.bucketNames.push(name);
       return {
         file: (key: string) => ({
-          save: (content: string) => gcsMock.save(key, content),
+          save: (content: string,options:any) => gcsMock.save(key, content,options),
           download: () => gcsMock.download(key),
           delete: () => gcsMock.delete(key)
         })
@@ -48,6 +49,7 @@ describe('GCS raw chunk storage', () => {
     const storage = getRawChunkStorage();
 
     const ref = await storage.put('vaults/v1/sessions/s1/chunks/c1.txt', 'hello world');
+    await expect(storage.put(ref.blobKey,'overwrite')).rejects.toThrow('already exists');
     const content = await storage.get(ref.blobKey);
     await storage.delete(ref.blobKey);
 
@@ -57,7 +59,7 @@ describe('GCS raw chunk storage', () => {
     });
     expect(content).toBe('hello world');
     expect(gcsMock.bucketNames).toContain('persistio-raw-chunks');
-    expect(gcsMock.save).toHaveBeenCalledWith('vaults/v1/sessions/s1/chunks/c1.txt', 'hello world');
+    expect(gcsMock.save).toHaveBeenCalledWith('vaults/v1/sessions/s1/chunks/c1.txt', 'hello world',expect.objectContaining({preconditionOpts:{ifGenerationMatch:0}}));
     expect(gcsMock.delete).toHaveBeenCalledWith('vaults/v1/sessions/s1/chunks/c1.txt');
     expect(gcsMock.objects.has(ref.blobKey)).toBe(false);
   });

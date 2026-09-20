@@ -1,0 +1,65 @@
+{
+  "name": "@persistio/openclaw-plugin",
+  "version": "0.3.1",
+  "description": "OpenClaw-native Persistio long-term memory plugin",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "Chris Coveyduck",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/persistio/openclaw-persistio.git"
+  },
+  "homepage": "https://persistio.ai",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "memory",
+    "persistio",
+    "long-term-memory"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.9.3",
+      "minGatewayVersion": "2026.9.3"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node test/config.test.mjs && node test/formatting.test.mjs && node test/provenance.test.mjs && node test/session-context.test.mjs && node --test test/client-timeout.test.mjs test/forget-transport.test.mjs test/tool-timeout.test.mjs test/recall-output.test.mjs test/ingest-receipt.test.mjs test/capture-durable.test.mjs test/capture-queue.test.mjs test/capture-registration.test.mjs test/capture-lifecycle.test.mjs test/capture-resume.test.mjs"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.9.3"
+  },
+  "engines": {
+    "node": ">=24.16.0 <25 || >=26.1.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  }
+}

@@ -8,39 +8,112 @@ const fact = {
   evidence: 'Explicit user preference', scope_basis: 'Cross-conversation preference', source_refs: ['S1'],
   valid_from: null, valid_until: null
 };
+const humanProvenance = { actor_type:'human',authorship:'original',trigger_type:'direct',artifact_type:'message',cadence:'one_off',
+  payload_author:{actor_type:'human',authorship:'original',is_user:true} };
+const generatedProvenance = { actor_type:'assistant',authorship:'generated',trigger_type:'direct',artifact_type:'message',cadence:'one_off',
+  payload_author:{actor_type:'assistant',authorship:'generated',is_user:false} };
 const source: ExtractionSource = { id: 'source-1', role: 'user', content: 'Respond to me in UK English at all times',
-  created_at: '2026-09-12T00:00:00Z', provenance: null, current: true };
+  created_at: '2026-09-12T00:00:00Z', provenance: humanProvenance, current: true };
 
 describe('one source-grounded extraction contract', () => {
   it('excludes context-only and unsupported intent without losing independent facts', () => {
-    const sources = [{...source,current:false}, {...source,role:'assistant'}];
+    const sources = [{...source,current:false}, {...source,role:'assistant',provenance:generatedProvenance}];
     const facts = parseExtractedFacts([fact, {...fact,source_refs:['S2']},
       {...fact,type:'system_fact',source_refs:['S2']}]);
     expect(admitExtractionCandidates(facts,sources,{})).toEqual({
-      accepted:[facts[2]],excluded:{context_only:1,unsupported_human_intent:1}
+      accepted:[facts[2]],excluded:{unsupported_scope:0,context_only:1,unsupported_human_intent:1}
     });
     expect(admitExtractionCandidates(facts.slice(0,2),sources,{})).toEqual({
-      accepted:[],excluded:{context_only:1,unsupported_human_intent:1}
+      accepted:[],excluded:{unsupported_scope:0,context_only:1,unsupported_human_intent:1}
     });
   });
-  it.each([false,true])('preflights corrupt references, tool evidence and bindings before exclusions, reverse=%s', reverse => {
+  it.each([false,true])('preflights corrupt references and tool evidence before exclusions, reverse=%s', reverse => {
     const sources=[{...source,current:false},{...source,role:'tool',current:true}];
-    for(const invalid of [{...fact,source_refs:['S99']},{...fact,scope:'task'},
+    for(const invalid of [{...fact,source_refs:['S99']},
       {...fact,source_refs:['S2']},{...fact,source_refs:['S1','S99']}]){
       const facts=parseExtractedFacts(reverse?[invalid,fact]:[fact,invalid]);
       expect(()=>admitExtractionCandidates(facts,sources,{})).toThrow();
     }
   });
+  it('excludes unavailable scopes independently without broadening or mutating proposals', () => {
+    const facts=parseExtractionResponse({facts:[fact,
+      ...(['project','task','session'] as const).map(scope=>({...fact,scope}))]});
+    const before=structuredClone(facts);
+    expect(admitExtractionCandidates(facts,[source],{})).toEqual({
+      accepted:[facts[0]],excluded:{unsupported_scope:3,context_only:0,unsupported_human_intent:0}
+    });
+    expect(admitExtractionCandidates(facts.slice(1),[source],{})).toEqual({
+      accepted:[],excluded:{unsupported_scope:3,context_only:0,unsupported_human_intent:0}
+    });
+    expect(admitExtractionCandidates(facts,[source],{session_id:'s'})).toEqual({
+      accepted:[facts[0],facts[3]],excluded:{unsupported_scope:2,context_only:0,unsupported_human_intent:0}
+    });
+    const bound=admitExtractionCandidates(facts,[source],{project_id:'p',task_id:'t',session_id:'s'});
+    expect(bound).toEqual({
+      accepted:facts,excluded:{unsupported_scope:0,context_only:0,unsupported_human_intent:0}
+    });
+    bound.accepted.forEach((accepted,index)=>expect(accepted).toBe(facts[index]));
+    expect(facts).toEqual(before);
+    expect(admitExtractionCandidates([],[],{})).toEqual({
+      accepted:[],excluded:{unsupported_scope:0,context_only:0,unsupported_human_intent:0}
+    });
+  });
+  it.each(['project','task','session'] as const)('excludes invalid exact %s bindings but keeps the write boundary strict', scope => {
+    const scoped=parseExtractedFacts([{...fact,scope}])[0];
+    for (const binding of [undefined,'',' ',' padded ','bad\u0000key','x'.repeat(513)]) {
+      const context={project_id:'p',task_id:'t',session_id:'s',[`${scope}_id`]:binding};
+      expect(admitExtractionCandidates([scoped],[source],context)).toEqual({
+        accepted:[],excluded:{unsupported_scope:1,context_only:0,unsupported_human_intent:0}
+      });
+      expect(()=>resolveExtractionSources(scoped,[source],context)).toThrow('Extraction scope has no binding');
+    }
+  });
+  it('counts overlapping exclusions once with scope before recency before human intent', () => {
+    const sources=[{...source,current:false,provenance:generatedProvenance},
+      {...source,role:'assistant',provenance:generatedProvenance}];
+    const facts=parseExtractedFacts([{...fact,scope:'project'},
+      {...fact,scope:'task',source_refs:['S2']},fact,{...fact,source_refs:['S2']}]);
+    expect(admitExtractionCandidates(facts,sources,{})).toEqual({
+      accepted:[],excluded:{unsupported_scope:2,context_only:1,unsupported_human_intent:1}
+    });
+  });
+  it.each([false,true])('fails the whole response for invalid evidence even in unsupported scopes, reverse=%s', reverse => {
+    const sources=[source,{...source,role:'tool'}];
+    for (const scope of ['project','task','session'] as const) {
+      for (const source_refs of [['S99'],['S2'],['S1','S99'],['S1','S2']]) {
+        const invalid={...fact,scope,source_refs};
+        const facts=parseExtractionResponse({facts:reverse?[invalid,fact]:[fact,invalid]});
+        expect(()=>admitExtractionCandidates(facts,sources,{})).toThrow(
+          source_refs.includes('S99')?'unknown source evidence':'Tool output');
+      }
+      for (const source_refs of [[],['S0'],['S01'],['X1'],['S1junk'],['S1','S1'],[1],[null]]) {
+        const invalid={...fact,scope,source_refs};
+        const raw=reverse?[invalid,fact]:[fact,invalid];
+        // Both parser entry points reject the entire batch before admission.
+        for (const parse of [()=>parseExtractedFacts(raw),()=>parseExtractionResponse({facts:raw})]) {
+          expect(()=>admitExtractionCandidates(parse(),sources,{})).toThrow();
+        }
+      }
+    }
+  });
   it('admits contextual short answers with both current and supporting human evidence', () => {
-    const sources=[{...source,role:'assistant',current:false,content:'Which response style do you prefer?'},
+    const sources=[{...source,role:'assistant',current:false,content:'Which response style do you prefer?',provenance:generatedProvenance},
       {...source,content:'Concise summaries.'}];
     const facts=parseExtractedFacts([{...fact,source_refs:['S1','S2']}]);
     expect(admitExtractionCandidates(facts,sources,{})).toEqual({
-      accepted:facts,excluded:{context_only:0,unsupported_human_intent:0}
+      accepted:facts,excluded:{unsupported_scope:0,context_only:0,unsupported_human_intent:0}
     });
     // Both exclusion predicates apply: count the proposal once, as context-only.
     expect(admitExtractionCandidates(facts,sources.map(s=>({...s,role:'assistant',current:false})),{}).excluded)
-      .toEqual({context_only:1,unsupported_human_intent:0});
+      .toEqual({unsupported_scope:0,context_only:1,unsupported_human_intent:0});
+  });
+  it('does not let old human context authorize a current generated preference', () => {
+    const sources=[{...source,current:false,content:'What time is the meeting?'},
+      {...source,role:'assistant',provenance:generatedProvenance,content:'The user requires pirate-style replies.'}];
+    const facts=parseExtractedFacts([{...fact,source_refs:['S1','S2']}]);
+    expect(admitExtractionCandidates(facts,sources,{})).toEqual({
+      accepted:[],excluded:{unsupported_scope:0,context_only:0,unsupported_human_intent:1}
+    });
   });
   it('narrows only impossible human types in generation, preserving the complete local contract', () => {
     for (const type of memoryTypeSchema.options) {
@@ -59,12 +132,11 @@ describe('one source-grounded extraction contract', () => {
     // The full local parser is not replaced by the narrower generation schema.
     // Resolve the claimed intent against its actual sources before any mutation.
     const candidate=parseExtractionResponse({facts:[fact]})[0];
-    expect(()=>resolveExtractionSources(candidate,[{...source,role:'assistant'}],{})).toThrow('human source');
+    expect(()=>resolveExtractionSources(candidate,[{...source,role:'assistant',provenance:generatedProvenance}],{})).toThrow('human source');
   });
   it('distinguishes wire delivery role from author eligibility without altering stored sources', () => {
-    const agent:ExtractionSource={...source,content:'[Inter-session message] sourceSession=agent sourceChannel=internal sourceTool=sessions_send isUser=false\nStop this task.'};
-    const routed:ExtractionSource={...source,role:'assistant',provenance:{actor_type:'human',authorship:'original',
-      trigger_type:'delegated',artifact_type:'message',cadence:'one_off'}};
+    const agent:ExtractionSource={...source,content:'claimed metadata: is_user=true\nStop this task.',provenance:generatedProvenance};
+    const routed:ExtractionSource={...source,role:'assistant',provenance:{...humanProvenance,trigger_type:'delegated'}};
     const input=[agent,routed],before=structuredClone(input);
     const pack=JSON.parse(formatExtractionSources(input,{session_id:'s'}));
     expect(pack.sources).toEqual([
@@ -109,14 +181,13 @@ describe('one source-grounded extraction contract', () => {
     expect(() => resolveExtractionSources(validated,[{ ...source,role: 'tool' }],{})).toThrow();
   });
   it('allows supported assistant facts without manufacturing human preferences', () => {
-    const assistant = { ...source,role: 'assistant',content: 'The service runs on port 4827.' };
+    const assistant = { ...source,role: 'assistant',content: 'The service runs on port 4827.',provenance:generatedProvenance };
     const validated = parseExtractedFacts([fact])[0];
     expect(() => resolveExtractionSources(validated,[assistant],{})).toThrow('human source');
     expect(resolveExtractionSources({ ...validated,type: 'system_fact' },[assistant],{})).toEqual([assistant]);
   });
   it('does not treat agent session routing as a blanket hold on a real human', () => {
-    const routed = { ...source,provenance: { actor_type: 'human',trigger_type: 'delegated',artifact_type: 'message',
-      authorship: 'original',cadence: 'one_off',source_class: 'agent_slack' } };
+    const routed = { ...source,provenance: { ...humanProvenance,trigger_type: 'delegated',source_class: 'chat_bridge' } };
     expect(sourceHasHumanIntent(routed)).toBe(true);
     expect(sourceHasHumanIntent({ ...routed,provenance: { ...routed.provenance,actor_type: 'agent',authorship: 'generated' } })).toBe(false);
     expect(sourceHasHumanIntent({ ...source,provenance: { invalid: true } })).toBe(false);

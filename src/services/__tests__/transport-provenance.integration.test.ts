@@ -56,8 +56,8 @@ describeWithPostgres('transport provenance idempotency (PostgreSQL)', () => {
   });
 
   it('gives separate chunks of one source event separate durable identities', () => {
-    const first = sourceEventKey(vaultId, { namespace: 'openclaw-capture', id: 'message-123', ordinal: 0 });
-    const second = sourceEventKey(vaultId, { namespace: 'openclaw-capture', id: 'message-123', ordinal: 120 });
+    const first = sourceEventKey(vaultId, { namespace: 'integration-capture', id: 'message-123', ordinal: 0 });
+    const second = sourceEventKey(vaultId, { namespace: 'integration-capture', id: 'message-123', ordinal: 120 });
     expect(first).not.toBe(second);
   });
 });

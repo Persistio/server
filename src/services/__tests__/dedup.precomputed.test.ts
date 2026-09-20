@@ -1,20 +1,22 @@
+// This unit suite isolates selection/timing; real evidence and receipt forgery are covered by arbitration-*.integration.test.ts.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks=vi.hoisted(()=>({reserve:vi.fn(),publish:vi.fn(),extractor:vi.fn()}));
 vi.mock('../crypto',()=>({isVaultEncryptionActive:()=>false}));
 vi.mock('../entity-resolver',()=>({normaliseSubject:(s:string)=>s.toLowerCase().trim(),resolveCanonical:async()=>null}));
 vi.mock('../usage',()=>({reserveMemoryCreationInTransaction:mocks.reserve}));
 vi.mock('../worker-effects',()=>({publishCommittedWorkerEffects:mocks.publish}));
-vi.mock('../extractor',()=>({ExtractorService:class{arbitrateConflict=mocks.extractor;}}));
+vi.mock('../extractor',()=>({ExtractorService:class{arbitrateConflict=mocks.extractor;},validatedConflictAssessment:(decision:unknown)=>typeof decision==='string'?{decision,evidence:{}}:undefined}));
+vi.mock('../conflict-evidence',async original=>({...await original() as object,prepareConflictEvidence:async()=>({pairId:'test'}),conflictStillCurrent:async()=>true}));
 import {deduplicateMemoryInTransaction,fingerprintDedupInput,getDedupEscalationRequest,type DedupInput} from '../dedup';
 const prepared={assertCurrent:vi.fn(async()=>{}),encrypt:(_v:unknown,s:string)=>s,decrypt:(_v:unknown,s:string)=>s,
   subject:()=>null,subjectMatch:(_v:unknown,s:string)=>s};
 const input=():DedupInput=>({vaultId:'vault',fact:'Incoming durable fact',subject:'topic',embedding:[1,0],sourceChunks:['source'],
   score:8,salience:0.8,sensitivity:'low',type:'system_fact',scope:'session',scopeKey:'s1',polarity:'neutral',
   status:'active',volatility:'low',validFrom:null,validUntil:null});
-function database(options:{none?:boolean;exact?:boolean;revision?:string;missingSource?:boolean;similarity?:number}={}){
+function database(options:{none?:boolean;exact?:boolean;revision?:string;missingSource?:boolean;similarity?:number;row?:Record<string,unknown>}={}){
   const row={id:'existing',data:options.exact?input().fact:'Prior durable fact',subject:'topic',scope:'session',scope_key:'s1',
     polarity:'neutral',type:'system_fact',status:'active',row_version:'1',valid_from:null,valid_until:null,
-    source_chunks:['prior-source'],sensitivity:'low',similarity:options.similarity??0.9};
+    source_chunks:options.exact?['source']:['prior-source'],sensitivity:'low',similarity:options.similarity??0.9,...options.row};
   return{query:vi.fn(async(sql:string,_values?:unknown[])=>{
     if(sql.includes('FROM vaults'))return{rowCount:1,rows:[{id:'vault',encrypted_dek:null,vault_encryption_enabled:false}]};
     if(sql.includes('FROM raw_chunks'))return{rowCount:options.missingSource?0:1,rows:[{id:'source'}]};
@@ -57,6 +59,37 @@ describe('prepared baseline dedup decisions',()=>{
     expect(sql).toContain('m.subject=$5');expect(sql).toContain('LIMIT 10');
     expect(sql).toContain("m.status='active'");expect(sql).not.toContain('current_date');
     expect(sql).not.toContain('authority');expect(sql).not.toContain('now()');
+  });
+  it.each(['user_rule','user_preference','task_pattern','workflow','constraint','decision'] as const)(
+    'keeps non-current %s out of arbitration on either side, without changing storage dedup',async type=>{
+      const now=new Date('2026-09-18T00:30:00Z');
+      for(const dates of [{validFrom:null,validUntil:'2020-01-01'},{validFrom:'2099-01-01',validUntil:null}]){
+        const incoming={...input(),type,...dates};
+        const db=database({row:{type,valid_from:dates.validFrom,valid_until:dates.validUntil}});
+        expect(await getDedupEscalationRequest(incoming,'request',db as never,prepared,now)).toBeNull();
+        expect(db.query).not.toHaveBeenCalled();
+        expect(await getDedupEscalationRequest(input(),'request',db as never,prepared,now)).toBeNull();
+        expect((await deduplicateMemoryInTransaction(incoming,db as never,prepared,[])).action).toBe('inserted');
+        const exact=database({exact:true,row:{type,valid_from:dates.validFrom,valid_until:dates.validUntil}});
+        expect((await deduplicateMemoryInTransaction(incoming,exact as never,prepared,[])).action).toBe('skipped');
+      }
+    });
+  it.each(['user_rule','user_preference','task_pattern','workflow','constraint','decision'] as const)(
+    'admits %s on the inclusive UTC request date',async type=>{
+      const incoming={...input(),type,validFrom:'2026-09-18',validUntil:'2026-09-18'};
+      const db=database({row:{type,valid_from:incoming.validFrom,valid_until:incoming.validUntil}});
+      expect(await getDedupEscalationRequest(incoming,'request',db as never,prepared,new Date('2026-09-18T00:30:00Z'))).not.toBeNull();
+    });
+  it.each(['project','system_fact','domain_knowledge'] as const)('retains past/future %s arbitration',async type=>{
+    for(const dates of [{validFrom:null,validUntil:'2020-01-01'},{validFrom:'2099-01-01',validUntil:null}]){
+      const incoming={...input(),type,...dates};
+      const db=database({row:{type,valid_from:dates.validFrom,valid_until:dates.validUntil}});
+      expect(await getDedupEscalationRequest(incoming,'request',db as never,prepared,new Date('2026-09-18'))).not.toBeNull();
+    }
+  });
+  it.each([{type:null},{type:'unknown'},{valid_from:'2026-02-30'},{valid_until:'bad-date'},
+    {valid_from:'2027-01-01',valid_until:'2020-01-01'}])('fails closed for malformed arbitration context %j',async row=>{
+    expect(await getDedupEscalationRequest(input(),'request',database({row}) as never,prepared)).toBeNull();
   });
   it('treats even very high similarity as a signal, never automatic equivalence',async()=>{
     const db=database({similarity:0.999});

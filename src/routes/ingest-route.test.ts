@@ -170,6 +170,31 @@ function configurePersistence(options: {
 }
 
 describe('bulk ingest route body limit', () => {
+  it.each(['/v1/ingest', '/v1/ingest/bulk'])('enforces Unicode label/context limits at the actual route %s', async url => {
+    const app = Fastify();
+    await registerIngestRoutes(app);
+    try {
+      for (const field of ['source_class','provenance_basis','session_id','project_id','source_channel']) {
+        const limit = ['source_class','provenance_basis'].includes(field) ? 64 : 512;
+        for (const size of [limit, limit + 1]) {
+          const value = '😀'.repeat(size);
+          const provenance: any = { actor_type:'human',authorship:'original',trigger_type:'direct',artifact_type:'message',cadence:'one_off',
+            payload_author:{actor_type:'human',authorship:'original',is_user:true} };
+          if (field === 'source_class') provenance.source_class = value;
+          if (field === 'provenance_basis') provenance.provenance_basis = [value];
+          if (field === 'source_channel') provenance.transport = {initiator_actor_type:'agent',receiver_actor_type:'agent',source_channel:value};
+          const chunks = [{ role:'user',content:'Unicode contract',timestamp:'2026-05-12T16:00:00.000Z',provenance }];
+          configurePersistence({ chunks });
+          embedBatchMock.mockResolvedValue([[1, 0]]);
+          const before = embedBatchMock.mock.calls.length;
+          const response = await app.inject({ method:'POST',url,payload:{session_id:field==='session_id'?value:'unicode',
+            context:field==='project_id'?{project_id:value}:{},chunks} });
+          expect(response.statusCode, `${field}:${size}: ${response.body}`).toBe(size===limit?202:400);
+          expect(embedBatchMock.mock.calls.length).toBe(before + (size===limit?1:0));
+        }
+      }
+    } finally { await app.close(); }
+  });
   it.each(['/v1/ingest', '/v1/ingest/bulk'])('keeps accepted outcomes when post-commit metrics or headers fail at %s', async url => {
     const app = Fastify();
     await registerIngestRoutes(app);
@@ -483,7 +508,7 @@ describe('bulk ingest route body limit', () => {
           role: 'user',
           content: 'committed content',
           timestamp: '2026-05-12T16:00:00.000Z',
-          source_event: { namespace: 'openclaw-capture', id: 'message-1', ordinal: 0 }
+          source_event: { namespace: 'integration-capture', id: 'message-1', ordinal: 0 }
         }]
       }
     });
@@ -751,7 +776,7 @@ describe('bulk ingest route body limit', () => {
     const app = Fastify();
     await registerIngestRoutes(app, vi.fn());
     embedBatchMock.mockResolvedValueOnce([[1, 0]]);
-    const sourceEvent = { namespace: 'openclaw-capture', id: 'message-1', ordinal: 0 };
+    const sourceEvent = { namespace: 'integration-capture', id: 'message-1', ordinal: 0 };
     const sourceKey = sourceEventKey('5a3b3e77-cbd8-48f3-98fd-095f8fcb6070', sourceEvent);
     configurePersistence({
       chunks: [{ timestamp: '2026-05-12T16:00:00.000Z' }],

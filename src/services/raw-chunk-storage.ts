@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import path from 'node:path';
 
 import { DefaultAzureCredential } from '@azure/identity';
@@ -19,6 +20,8 @@ export interface RawChunkStorage {
   readonly store: RawChunkBlobStore;
   put(key: string, content: string): Promise<RawChunkReference>;
   get(key: string): Promise<string>;
+  /** Full object or rejection, never a prefix. Limits bytes before accumulation. */
+  getBounded?(key: string, maxBytes: number): Promise<string>;
   delete(key: string): Promise<void>;
 }
 
@@ -45,12 +48,16 @@ class LocalRawChunkStorage implements RawChunkStorage {
   async put(key: string, content: string): Promise<RawChunkReference> {
     const filePath = this.resolvePath(key);
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, content, 'utf8');
+    await fs.writeFile(filePath, content, {encoding:'utf8',flag:'wx'});
     return { blobStore: this.store, blobKey: key };
   }
 
   async get(key: string): Promise<string> {
     return fs.readFile(this.resolvePath(key), 'utf8');
+  }
+
+  async getBounded(key: string, maxBytes: number): Promise<string> {
+    return readBoundedRawStream(createReadStream(this.resolvePath(key)), maxBytes);
   }
 
   async delete(key: string): Promise<void> {
@@ -92,6 +99,7 @@ class AzureBlobRawChunkStorage implements RawChunkStorage {
     await this.ensureContainer();
     const blockBlobClient = this.uploadContainerClient.getBlockBlobClient(key);
     await blockBlobClient.upload(content, Buffer.byteLength(content, 'utf8'), {
+      conditions: { ifNoneMatch: '*' },
       blobHTTPHeaders: {
         blobContentType: 'text/plain; charset=utf-8'
       }
@@ -103,6 +111,11 @@ class AzureBlobRawChunkStorage implements RawChunkStorage {
     const blockBlobClient = this.containerClient.getBlockBlobClient(key);
     const response = await blockBlobClient.download();
     return streamToString(response.readableStreamBody);
+  }
+
+  async getBounded(key: string, maxBytes: number): Promise<string> {
+    const response = await this.containerClient.getBlockBlobClient(key).download(0, maxBytes + 1);
+    return readBoundedRawStream(response.readableStreamBody, maxBytes);
   }
 
   async delete(key: string): Promise<void> {
@@ -133,7 +146,8 @@ class GcsRawChunkStorage implements RawChunkStorage {
     const file = this.uploadBucket.file(key);
     await file.save(content, {
       contentType: 'text/plain; charset=utf-8',
-      resumable: false
+      resumable: false,
+      preconditionOpts: { ifGenerationMatch: 0 }
     });
     return { blobStore: this.store, blobKey: key };
   }
@@ -141,6 +155,10 @@ class GcsRawChunkStorage implements RawChunkStorage {
   async get(key: string): Promise<string> {
     const [content] = await this.bucket.file(key).download();
     return content.toString('utf8');
+  }
+
+  async getBounded(key: string, maxBytes: number): Promise<string> {
+    return readBoundedRawStream(this.bucket.file(key).createReadStream({ start: 0, end: maxBytes }), maxBytes);
   }
 
   async delete(key: string): Promise<void> {
@@ -176,4 +194,17 @@ export function getRawChunkStorage(): RawChunkStorage {
     cachedStorage = new LocalRawChunkStorage(config.RAW_CHUNK_LOCAL_DIR);
   }
   return cachedStorage;
+}
+
+/** A single overflow byte rejects the entire object; invalid UTF-8 is corruption. */
+export async function readBoundedRawStream(stream: NodeJS.ReadableStream | undefined, maxBytes: number): Promise<string> {
+  if (!stream || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Invalid bounded source read');
+  const chunks: Buffer[] = []; let bytes = 0;
+  for await (const chunk of stream) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > maxBytes) { (stream as NodeJS.ReadableStream & {destroy?:()=>void}).destroy?.(); throw new Error('Source exceeds byte bound'); }
+    chunks.push(buffer);
+  }
+  return new TextDecoder('utf-8', {fatal:true,ignoreBOM:true}).decode(Buffer.concat(chunks, bytes));
 }

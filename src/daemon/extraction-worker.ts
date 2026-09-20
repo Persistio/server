@@ -12,18 +12,19 @@ import { aiBudgetThrottledJobsCounter, aiBudgetWaitHistogram, extractionCandidat
 import { CircuitBreakerOpenError, isRateLimitError } from '../services/ai-resilience';
 import { drainDueContradictionActivations } from '../services/contradiction-activation';
 import { prepareVaultCrypto, initCryptoClient, type PreparedVaultCrypto } from '../services/crypto';
-import { deduplicateMemoryInTransaction, getDedupEscalationRequest, type DedupInput } from '../services/dedup';
+import { deduplicateMemoryInTransaction, fingerprintDedupInput, getDedupEscalationRequest, type DedupInput } from '../services/dedup';
 import { publishCommittedWorkerEffects, type WorkerEffect } from '../services/worker-effects';
 import { filterMemoryCandidates } from '../services/deterministic-filter';
 import { getEmbedder } from '../services/embedder';
 import { admitExtractionCandidates, formatExtractionSources, resolveExtractionSources, sourceHasHumanIntent, type ExtractionSource } from '../services/extraction-contract';
 import { freezeExtractionContext, MAX_EXTRACTION_CONTEXT_BYTES } from '../services/extraction-context';
+import { extractionSummaryBoundary } from '../services/extraction-summary-boundary';
 import { enqueueCurationWork } from '../services/curation-work';
 import { buildPromptHeader } from '../services/extraction-prompt-header';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 import { ExtractorService } from '../services/extractor';
 import { getRawChunkStorage } from '../services/raw-chunk-storage';
-import type { ConflictResolution } from '../services/extractor';
+import type { ConflictAssessment } from '../services/extractor';
 import { completePersistentJobIfReady, failPersistentJob, markPersistentJobRunning } from '../services/job-status';
 import { archiveStaleMemories } from '../services/staleness';
 import { AiBudgetDeferredError } from '../services/usage';
@@ -243,6 +244,8 @@ export async function processBatch(vaultId?: string) {
 
     const sessionContextCache = new Map<string, string>();
     const subjectListCache = new Map<string, Promise<VaultSubject[]>>();
+    // One UTC reference for the batch-scoped subject cache, including retries.
+    const subjectContextNow = new Date();
     let memoriesCreated = 0;
     const leases = new Map(claimedResult.rows.map((row) => [row.queue_id, {
       queueKind: 'extraction' as const,
@@ -293,12 +296,15 @@ export async function processBatch(vaultId?: string) {
             return;
           }
           const conversation = formatExtractionSources(sources, job.context);
-          const sessionContextCacheKey = `${job.vault.id}:${job.sessionId}`;
+          const summaryBoundary = extractionSummaryBoundary(job.vault.id, job.context);
           assertNotLost();
-          const sessionContext = sessionContextCache.get(sessionContextCacheKey)
-            ?? await getOrCreateSessionContext(job.vault, job.sessionId, conversation, lease,
-              preparedCrypto, scopeKeyForContext('session', job.context), assertNotLost);
-          if (sessionContext !== null) sessionContextCache.set(sessionContextCacheKey, sessionContext);
+          const sessionContext = summaryBoundary === null ? null
+            : sessionContextCache.get(summaryBoundary.cacheKey)
+              ?? await getOrCreateSessionContext(job.vault, summaryBoundary, conversation, lease,
+                preparedCrypto, assertNotLost);
+          if (summaryBoundary !== null && sessionContext !== null) {
+            sessionContextCache.set(summaryBoundary.cacheKey, sessionContext);
+          }
           const promptHeader = [
             // Subject aliases are intentionally not injected before facts have a
             // model-assigned scope. Canonicalisation below loads only the exact
@@ -311,11 +317,12 @@ export async function processBatch(vaultId?: string) {
             promptHeader,
             job.vault.id,
             decryptVaultPromptContext(job.vault, preparedCrypto),
-            { humanIntentAvailable: sources.some(sourceHasHumanIntent) }
+            { humanIntentAvailable: sources.some(source => source.current && sourceHasHumanIntent(source)) }
           );
           // Full-response parsing and referential integrity precede proposal admission.
           // A context duplicate or unsupported human preference does not retry an
-          // otherwise valid capture. Corrupt references/bindings still fail it all.
+          // otherwise valid capture. Corrupt references still fail it all; unavailable
+          // scope is a proposal-local exclusion, never a scope downgrade.
           const admission = admitExtractionCandidates(facts, sources, job.context);
           const filteredByScore = admission.accepted.filter((fact) => fact.score >= config.EXTRACTION_SCORE_THRESHOLD);
           const afterSecretFilter = filteredByScore.filter((fact) => {
@@ -382,6 +389,7 @@ export async function processBatch(vaultId?: string) {
             msg: 'extraction pipeline attrition',
             raw_facts: facts.length,
             after_source_filter: admission.accepted.length,
+            excluded_unsupported_scope: admission.excluded.unsupported_scope,
             excluded_context_only: admission.excluded.context_only,
             excluded_unsupported_human_intent: admission.excluded.unsupported_human_intent,
             after_score_filter: filteredByScore.length,
@@ -414,7 +422,8 @@ export async function processBatch(vaultId?: string) {
                 config.SUBJECT_INJECTION_TOP_N,
                 config.SUBJECT_INJECTION_RECENT_N,
                 fact.scope,
-                scopeKey
+                scopeKey,
+                subjectContextNow
               ).catch((err) => {
                 operationalLog.warn(JSON.stringify({
                   level: 40,
@@ -484,8 +493,9 @@ export async function processBatch(vaultId?: string) {
             await preparedCrypto.assertCurrent(client);
             // Stable order avoids opposite alias-upsert lock ordering between jobs.
             for (const proposal of subjectProposals.sort((a, b) =>
-              JSON.stringify([a.fact.scope, scopeKeyForContext(a.fact.scope, job.context), normaliseSubject(a.fact.subject)])
-                .localeCompare(JSON.stringify([b.fact.scope, scopeKeyForContext(b.fact.scope, job.context), normaliseSubject(b.fact.subject)])))) {
+              compareAliasLockKeys(
+                JSON.stringify([a.fact.scope, scopeKeyForContext(a.fact.scope, job.context), normaliseSubject(a.fact.subject)]),
+                JSON.stringify([b.fact.scope, scopeKeyForContext(b.fact.scope, job.context), normaliseSubject(b.fact.subject)])))) {
               const key = scopeKeyForContext(proposal.fact.scope, job.context);
               if (proposal.fact.scope !== 'global' && key === null) continue;
               if (proposal.canonical !== undefined) {
@@ -542,13 +552,25 @@ export async function processBatch(vaultId?: string) {
           // This preflight intentionally repeats dedup's read-side matching before
           // writes. The extra DB reads let us batch expensive escalation calls while
           // dedup remains the final write authority and rechecks the best match.
+          const preflightTime = new Date();
+          // Include candidates with no escalation request: future inputs must
+          // not lose their deferred intent if another candidate's provider waits.
+          const dedupPreflights = memoryInputs.map(input => ({
+            inputFingerprint: fingerprintDedupInput(input), referenceTime: preflightTime.toISOString()
+          }));
           const escalationRequests = (await Promise.all(
-            memoryInputs.map((input, index) => getDedupEscalationRequest(input, String(index), { query }, preparedCrypto))
+            memoryInputs.map((input, index) => getDedupEscalationRequest(input, String(index), { query }, preparedCrypto, preflightTime))
           )).filter((request): request is NonNullable<typeof request> => Boolean(request));
           assertNotLost();
           const precomputedDecisions = escalationRequests.length > 0
-            ? await extractor.arbitrateConflictsBatch(escalationRequests, job.vault.id)
-            : new Map<string, ConflictResolution>();
+            ? await (async()=>{
+              const results=new Map<string,ConflictAssessment>();
+              for(let start=0;start<escalationRequests.length;start+=16){
+                for(const [id,value] of await extractor.arbitrateConflictsBatch(escalationRequests.slice(start,start+16),job.vault.id))results.set(id,value);
+              }
+              return results;
+            })()
+            : new Map<string, ConflictAssessment>();
           const escalationRequestById = new Map(escalationRequests.map((request) => [request.id, request]));
           const validPrecomputedDecisionIds = new Set<string>();
           const seenEscalationTargets = new Set<string>();
@@ -585,6 +607,7 @@ export async function processBatch(vaultId?: string) {
                 preparedCrypto,
                 effects,
                 {
+                  preflight: dedupPreflights[i],
                   precomputedConflictInput: escalationRequestById.get(String(i))?.inputFingerprint,
                   precomputedConflictDecision: validPrecomputedDecisionIds.has(String(i))
                     ? precomputedDecisions.get(String(i))
@@ -775,7 +798,7 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
 
     const segment = segmentResult.rows[0];
     const chunksResult = await query<RawChunkRow>(
-      `SELECT id, vault_id, session_id, role, blob_store, blob_key, created_at, provenance
+      `SELECT id, vault_id, session_id, role, blob_store, blob_key, created_at, provenance, capture_context
        FROM raw_chunks
        WHERE id = ANY($1::uuid[])
          AND vault_id = $2
@@ -788,6 +811,18 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
       .filter((chunk): chunk is RawChunkRow => Boolean(chunk));
     if (orderedChunks.length !== segment.chunk_ids.length) {
       throw new Error(`Segment ${segment.id} has ${segment.chunk_ids.length - orderedChunks.length} raw chunks without blob storage`);
+    }
+    // The segment is an index of accepted evidence, not authority to relabel it.
+    // Check immutable current-source boundaries before any summary/provider work,
+    // including jobs recovered from historical failures or restored data.
+    for (const chunk of orderedChunks) {
+      recallContextSchema.parse(chunk.capture_context ?? {});
+      const captured = (chunk.capture_context ?? {}) as RecallContext;
+      if (chunk.session_id !== segment.session_id
+        || (captured.project_id ?? null) !== segment.project_id
+        || (captured.task_id ?? null) !== segment.task_id) {
+        throw new Error('Segment context disagrees with accepted source boundary');
+      }
     }
 
     return {
@@ -840,7 +875,10 @@ async function loadQueuedJob(queuedJob: QueuedWorkRow): Promise<LoadedJob> {
   }
 
   const chunk = chunkResult.rows[0];
-  const captureContext = recallContextSchema.parse(chunk.capture_context ?? {});
+  // Validate persisted shape/bounds but do not apply ingestion-time trimming to
+  // historical identities: doing so could rebind evidence into another project.
+  recallContextSchema.parse(chunk.capture_context ?? {});
+  const captureContext = (chunk.capture_context ?? {}) as RecallContext;
   return {
     queueId: queuedJob.queue_id,
     jobId: queuedJob.job_id,
@@ -916,19 +954,21 @@ function getLatestChunkTimestamp(chunks: Array<{ created_at: string }>): string 
 
 async function getOrCreateSessionContext(
   vault: VaultContextRow,
-  sessionId: string,
+  summaryBoundary: NonNullable<ReturnType<typeof extractionSummaryBoundary>>,
   conversation: string,
   lease: WorkerLease,
   preparedCrypto: PreparedVaultCrypto,
-  aliasScopeKey: string | null,
   assertNotLost: () => void
 ): Promise<string | null> {
   const existing = await query<{ context: string }>(
     `SELECT context
      FROM session_contexts
      WHERE vault_id = $1 AND session_id = $2
+       AND context_boundary IS NOT NULL
+       AND digest(context_boundary::text, 'sha256') = digest(($3::jsonb)::text, 'sha256')
+       AND context_boundary = $3::jsonb
      LIMIT 1`,
-    [vault.id, sessionId]
+    [vault.id, summaryBoundary.sessionId, summaryBoundary.boundary]
   );
 
   if (existing.rowCount) {
@@ -941,20 +981,21 @@ async function getOrCreateSessionContext(
   }
 
   assertNotLost();
-  const aliases = aliasScopeKey === null ? [] : await extractor.extractSessionAliases(conversation, vault.id);
+  const aliases = await extractor.extractSessionAliases(conversation, vault.id);
   return withWorkerLeaseTransaction(lease, async client => {
     await preparedCrypto.assertCurrent(client);
     const storedContext = preparedCrypto.encrypt(vault, summary);
     const inserted = await client.query<{ context: string }>(
-      `INSERT INTO session_contexts (vault_id, session_id, context)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (vault_id, session_id) DO NOTHING
+      `INSERT INTO session_contexts (vault_id, session_id, context, context_boundary)
+       VALUES ($1, $2, $3, $4::jsonb)
+       ON CONFLICT (vault_id, session_id, (digest(context_boundary::text, 'sha256')))
+         WHERE context_boundary IS NOT NULL DO NOTHING
        RETURNING context`,
-      [vault.id, sessionId, storedContext]
+      [vault.id, summaryBoundary.sessionId, storedContext, summaryBoundary.boundary]
     );
 
     if (inserted.rowCount) {
-      await upsertEntityAliases(client, vault.id, aliases, 'session', aliasScopeKey);
+      await upsertEntityAliases(client, vault.id, aliases, 'session', summaryBoundary.sessionId);
       return summary;
     }
 
@@ -962,8 +1003,11 @@ async function getOrCreateSessionContext(
       `SELECT context
        FROM session_contexts
        WHERE vault_id = $1 AND session_id = $2
+         AND context_boundary IS NOT NULL
+         AND digest(context_boundary::text, 'sha256') = digest(($3::jsonb)::text, 'sha256')
+         AND context_boundary = $3::jsonb
        LIMIT 1`,
-      [vault.id, sessionId]
+      [vault.id, summaryBoundary.sessionId, summaryBoundary.boundary]
     );
     if (!conflictRead.rows[0]) throw new Error('Committed session context disappeared');
     return preparedCrypto.decrypt(vault, conflictRead.rows[0].context);
@@ -1016,6 +1060,12 @@ async function withRateLimitRetries(queuedJob: QueuedWorkRow, fn: () => Promise<
   }
 }
 
+// A total code-unit order avoids locale-equivalent but distinct identity ties.
+// Both initial-summary and candidate alias writes use this same lock ordering.
+function compareAliasLockKeys(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 async function upsertEntityAliases(
   client: import('pg').PoolClient,
   vaultId: string,
@@ -1026,7 +1076,10 @@ async function upsertEntityAliases(
   const normalisedAliases = aliases.map(({ alias, canonical }) => ({
     alias: normaliseSubject(alias),
     canonical: normaliseSubject(canonical)
-  }));
+  })).sort((a, b) =>
+    compareAliasLockKeys(JSON.stringify([scope, scopeKey, a.alias]), JSON.stringify([scope, scopeKey, b.alias])));
+  // Different summary boundaries can still share session aliases. Match the
+  // candidate-alias stage's lock ordering instead of trusting provider order.
 
   if (normalisedAliases.length === 0) {
     return;
@@ -1035,7 +1088,8 @@ async function upsertEntityAliases(
   await client.query(
     `INSERT INTO entity_aliases (vault_id, alias, canonical, scope, scope_key)
      SELECT $1, alias, canonical, $4, $5
-     FROM UNNEST($2::text[], $3::text[]) AS t(alias, canonical)
+     FROM UNNEST($2::text[], $3::text[]) WITH ORDINALITY AS t(alias, canonical, ordinal)
+     ORDER BY ordinal
      ON CONFLICT (vault_id, scope, scope_key, alias) DO NOTHING`,
     [
       vaultId,
@@ -1074,7 +1128,7 @@ async function runLoop() {
   }
 }
 
-async function handleRunOnce(message: WorkerRunOnceRequest) {
+export async function handleRunOnce(message: WorkerRunOnceRequest) {
   if (!parentPort) {
     return;
   }

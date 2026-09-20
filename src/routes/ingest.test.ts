@@ -38,13 +38,13 @@ describe('ingest schema', () => {
 
   it('accepts explicit capture provenance on chunks', () => {
     expect(ingestSchema.safeParse({
-      session_id: 'agent:main:cron:daily',
+      session_id: 'scheduled-session',
       chunks: [{
         role: 'assistant',
         content: 'Cron observation.',
         timestamp: '2026-05-12T16:00:00.000Z',
         provenance: {
-          source_class: 'agent_cron',
+          source_class: 'scheduled_agent',
           actor_type: 'agent',
           trigger_type: 'scheduled',
           artifact_type: 'observation',
@@ -71,21 +71,21 @@ describe('ingest schema', () => {
           message_id: 'source-message-123'
         },
         provenance: {
-          source_class: 'agent_slack',
+          source_class: 'chat_bridge',
           actor_type: 'agent',
           trigger_type: 'backfill',
           artifact_type: 'message',
           authorship: 'generated',
           cadence: 'batch',
-          provenance_basis: ['api_provenance', 'transport_envelope'],
+          provenance_basis: ['api_provenance', 'host_input_provenance'],
           payload_author: { actor_type: 'agent', authorship: 'generated', is_user: false },
           transport: {
             initiator_actor_type: 'import',
             initiator_id: 'job-123',
             receiver_actor_type: 'agent',
-            source_session_id: 'agent:main:slack:direct:user',
-            source_channel: 'slack',
-            source_tool: 'sessions_send'
+            source_session_id: 'source-session',
+            source_channel: 'chat',
+            source_tool: 'session_router'
           },
           import: {
             importer: 'persistio-v2-replay',
@@ -125,7 +125,7 @@ describe('ingest schema', () => {
   });
 
   it('rejects duplicate source-event parts within one request', () => {
-    const sourceEvent = { namespace: 'openclaw-capture', id: 'message-1', ordinal: 0 };
+    const sourceEvent = { namespace: 'integration-capture', id: 'message-1', ordinal: 0 };
     expect(ingestSchema.safeParse({
       session_id: 'session-1',
       chunks: [
@@ -157,23 +157,26 @@ describe('ingest schema', () => {
     expect(getFutureTimestampError(chunks, new Date('2026-05-12T16:01:00.000Z'))).toBeUndefined();
   });
 
-  it('rejects arbitrary provenance basis text', () => {
-    expect(ingestSchema.safeParse({
-      session_id: 'agent:main:cron:daily',
+  it('accepts bounded integration-defined provenance labels and rejects oversized labels', () => {
+    const payload = {
+      session_id: 'scheduled-session',
       chunks: [{
         role: 'assistant',
-        content: 'Cron observation.',
+        content: 'Scheduled observation.',
         timestamp: '2026-05-12T16:00:00.000Z',
         provenance: {
-          source_class: 'agent_cron',
+          source_class: 'vendor_scheduler',
           actor_type: 'agent',
           trigger_type: 'scheduled',
           artifact_type: 'observation',
           authorship: 'generated',
           cadence: 'recurring',
-          provenance_basis: ['user-id:12345']
+          provenance_basis: ['verified_host_metadata']
         }
       }]
-    }).success).toBe(false);
+    };
+    expect(ingestSchema.safeParse(payload).success).toBe(true);
+    expect(ingestSchema.safeParse({ ...payload,chunks:[{...payload.chunks[0],provenance:{
+      ...payload.chunks[0].provenance,provenance_basis:['x'.repeat(65)]}}] }).success).toBe(false);
   });
 });

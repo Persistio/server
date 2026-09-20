@@ -2,7 +2,7 @@ import { query } from '../db/client';
 import type { QueryResult, QueryResultRow } from 'pg';
 import { computeSubjectHmac, isVaultEncryptionActive, unwrapDek, type VaultEncryptionContext } from './crypto';
 import type { MemoryScope } from './memory-scope';
-import { memoryValidityPredicateSql, toDateOnly } from './memory-validity';
+import { memoryTemporalRecallPredicateSql } from './memory-temporal-recall';
 
 interface Queryable {
   query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
@@ -49,12 +49,10 @@ export async function getVaultSubjectList(
   topN: number,
   recentN: number,
   scope: MemoryScope,
-  scopeKey: string | null
+  scopeKey: string | null,
+  now: Date = new Date()
 ): Promise<VaultSubject[]> {
-  const subjectListDate = toDateOnly(new Date());
-  if (!subjectListDate) {
-    throw new Error('Unable to derive a valid subject-list date');
-  }
+  const subjectListTimestamp = now.toISOString();
   const vaultResult = await query<VaultEncryptionContext>(
     `SELECT id, encrypted_dek, vault_encryption_enabled
      FROM vaults
@@ -68,7 +66,7 @@ export async function getVaultSubjectList(
   }
 
   if (isVaultEncryptionActive(vault)) {
-    return getEncryptedVaultSubjectList(vault, topN, recentN, scope, scopeKey, subjectListDate);
+    return getEncryptedVaultSubjectList(vault, topN, recentN, scope, scopeKey, subjectListTimestamp);
   }
 
   // Top N by memory count
@@ -82,13 +80,13 @@ export async function getVaultSubjectList(
        AND m.status = 'active'
        AND m.sensitivity <> 'restricted'
        AND m.confidence > 0 AND m.confidence <= 1
-       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
-       AND ${memoryValidityPredicateSql('m', '$3')}
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= $3::timestamptz + interval '5 minutes')
+       AND ${memoryTemporalRecallPredicateSql('m', '$3')}
        AND m.subject <> ''
      GROUP BY m.subject
      ORDER BY cnt DESC
      LIMIT $2`,
-    [vaultId, topN, subjectListDate, scope, scopeKey]
+    [vaultId, topN, subjectListTimestamp, scope, scopeKey]
   );
 
   // Recent N by latest memory activity
@@ -102,13 +100,13 @@ export async function getVaultSubjectList(
        AND m.status = 'active'
        AND m.sensitivity <> 'restricted'
        AND m.confidence > 0 AND m.confidence <= 1
-       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
-       AND ${memoryValidityPredicateSql('m', '$3')}
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= $3::timestamptz + interval '5 minutes')
+       AND ${memoryTemporalRecallPredicateSql('m', '$3')}
        AND m.subject <> ''
      GROUP BY m.subject
      ORDER BY MAX(COALESCE(m.updated_at, m.created_at)) DESC NULLS LAST
      LIMIT $2`,
-    [vaultId, recentN, subjectListDate, scope, scopeKey]
+    [vaultId, recentN, subjectListTimestamp, scope, scopeKey]
   );
 
   // Deduplicate
@@ -131,7 +129,7 @@ async function getEncryptedVaultSubjectList(
   recentN: number,
   scope: MemoryScope,
   scopeKey: string | null,
-  subjectListDate: string
+  subjectListTimestamp: string
 ): Promise<VaultSubject[]> {
   if (!vault.encrypted_dek) {
     return [];
@@ -172,12 +170,12 @@ async function getEncryptedVaultSubjectList(
        AND m.status = 'active'
        AND m.sensitivity <> 'restricted'
        AND m.confidence > 0 AND m.confidence <= 1
-       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
-       AND ${memoryValidityPredicateSql('m', '$5')}
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= $5::timestamptz + interval '5 minutes')
+       AND ${memoryTemporalRecallPredicateSql('m', '$5')}
      GROUP BY ks.canonical
      ORDER BY cnt DESC
      LIMIT $4`,
-    [vault.id, hmacs, hmacCanonicals, topN, subjectListDate, scope, scopeKey]
+    [vault.id, hmacs, hmacCanonicals, topN, subjectListTimestamp, scope, scopeKey]
   );
 
   const recentResult = await query<{ canonical: string }>(
@@ -195,12 +193,12 @@ async function getEncryptedVaultSubjectList(
        AND m.status = 'active'
        AND m.sensitivity <> 'restricted'
        AND m.confidence > 0 AND m.confidence <= 1
-       AND (m.source_timestamp IS NULL OR m.source_timestamp <= now() + interval '5 minutes')
-       AND ${memoryValidityPredicateSql('m', '$5')}
+       AND (m.source_timestamp IS NULL OR m.source_timestamp <= $5::timestamptz + interval '5 minutes')
+       AND ${memoryTemporalRecallPredicateSql('m', '$5')}
      GROUP BY ks.canonical
      ORDER BY MAX(COALESCE(m.updated_at, m.created_at)) DESC NULLS LAST
      LIMIT $4`,
-    [vault.id, hmacs, hmacCanonicals, recentN, subjectListDate, scope, scopeKey]
+    [vault.id, hmacs, hmacCanonicals, recentN, subjectListTimestamp, scope, scopeKey]
   );
 
   return hydrateVaultSubjects(vault.id, [

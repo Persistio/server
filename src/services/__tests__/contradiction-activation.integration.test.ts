@@ -1,3 +1,4 @@
+import {fixtureSource,cleanFixtureSources,fixtureExtractor,fixtureAssessment} from '../../__tests__/arbitration-fixtures';
 import crypto from 'node:crypto';
 import { Client, Pool } from 'pg';
 import { afterAll,afterEach,beforeAll,beforeEach,describe,it,expect,vi } from 'vitest';
@@ -18,6 +19,7 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   });
   beforeEach(()=>{config.CONTRADICTION_SCAN_ENABLED=true;config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH=4;});
   afterEach(async()=>{
+    await cleanFixtureSources();
     vi.restoreAllMocks();await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])',[vaults]);vaults.length=0;
   });
   afterAll(async()=>{await pool.end();await db?.closePool();});
@@ -28,8 +30,8 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   }
   async function memory(vaultId:string,data:string,extra:{scope?:string;scopeKey?:string|null;from?:string|null;until?:string|null;type?:string}={}){
     const id=crypto.randomUUID(),scope=extra.scope??'session';
-    await pool.query("INSERT INTO memories(id,vault_id,data,subject,hash,embedding,scope,scope_key,status,type,valid_from,valid_until) VALUES($1,$2,$3,'Topic',$4,$5::vector,$6,$7,'active',$8,$9::date,$10::date)",
-      [id,vaultId,data,crypto.randomUUID(),JSON.stringify(vector),scope,scope==='global'?null:extra.scopeKey??'s1',extra.type??'system_fact',extra.from??null,extra.until??null]);
+    await pool.query("INSERT INTO memories(id,vault_id,data,subject,hash,embedding,scope,scope_key,status,type,valid_from,valid_until,source_chunks) VALUES($1,$2,$3,'Topic',$4,$5::vector,$6,$7,'active',$8,$9::date,$10::date,ARRAY[$11::uuid])",
+      [id,vaultId,data,crypto.randomUUID(),JSON.stringify(vector),scope,scope==='global'?null:extra.scopeKey??'s1',extra.type??'system_fact',extra.from??null,extra.until??null,await fixtureSource(pool,vaultId,data)]);
     await pool.query('INSERT INTO memory_embeddings(memory_id,embedding) VALUES($1,$2::vector)',[id,JSON.stringify(vector)]);
     return id;
   }
@@ -44,6 +46,45 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
     return{v,old,current};
   }
   const statuses=async(v:string)=>(await pool.query('SELECT id,status,archived_at FROM memories WHERE vault_id=$1',[v])).rows;
+  it.each([false,true])('reconsiders revised unresolved pairs outside similarity, independent of orientation (reverse=%s)',async reverse=>{
+    const f=await pair(),extractor=fixtureExtractor(async()=>'keep_both');
+    const ids=reverse?[f.current,f.old]:[f.old,f.current];
+    await pool.query("INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b) VALUES($1,$2,$3,'keep_both',1,1,1)",[f.v,...ids]);
+    await pool.query('UPDATE memories SET embedding=$2::vector WHERE id=$1',[f.current,JSON.stringify([0,1,...vector.slice(2)])]);
+    await drain(extractor as never);
+    expect(extractor.arbitrateConflict).toHaveBeenCalledOnce();
+    expect(await schedule(f.current)).toBeUndefined();
+    await due(f.v);await drain(extractor as never);expect(extractor.arbitrateConflict).toHaveBeenCalledOnce();
+    expect((await pool.query("SELECT count(*)::int AS n FROM contradiction_scan_log WHERE vault_id=$1 AND decision='keep_both'",[f.v])).rows[0].n).toBe(2);
+  });
+  it.each(['missing','zero'])('reconsiders a changed supported fact with a %s primary embedding',async embedding=>{
+    const f=await pair(),extractor=fixtureExtractor(async()=>'keep_both');
+    await pool.query("INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b) VALUES($1,$2,$3,'keep_both',1,1,1)",[f.v,f.old,f.current]);
+    await pool.query("UPDATE memories SET embedding=$2::vector,data='A revised supported database observation.' WHERE id=$1",[f.current,embedding==='missing'?null:JSON.stringify(vector.map(()=>0))]);
+    await drain(extractor as never);expect(extractor.arbitrateConflict).toHaveBeenCalledOnce();
+  });
+  it.each(['retired','deleted','binding','expired','resolved'])('does not reopen an inapplicable historical pair (%s)',async change=>{
+    const f=await pair(),extractor=fixtureExtractor(async()=>'keep_both');
+    await pool.query("INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b) VALUES($1,$2,$3,'keep_both',1,1,1)",[f.v,f.old,f.current]);
+    if(change==='retired')await pool.query("UPDATE memories SET status='superseded' WHERE id=$1",[f.old]);
+    if(change==='deleted')await pool.query('DELETE FROM memories WHERE id=$1',[f.old]);
+    if(change==='binding')await pool.query("UPDATE memories SET scope_key='other' WHERE id=$1",[f.old]);
+    if(change==='expired')await pool.query("UPDATE memories SET type='workflow',valid_until='2020-01-01' WHERE vault_id=$1",[f.v]);
+    if(change==='resolved')await pool.query("INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b) VALUES($1,$2,$3,'supersede_old',1,1,1)",[f.v,f.old,f.current]);
+    await pool.query('UPDATE memories SET embedding=$2::vector WHERE id=$1',[f.current,JSON.stringify([0,1,...vector.slice(2)])]);
+    await pool.query('DELETE FROM memory_contradiction_schedule WHERE vault_id=$1 AND memory_id<>$2',[f.v,f.current]);
+    await drain(extractor as never);expect(extractor.arbitrateConflict).not.toHaveBeenCalled();
+  });
+  it('characterizes scoped aliases as non-authorizing, non-discovery metadata for this scanner',async()=>{
+    const f=await pair(),before=await schedule(f.current);
+    const {storeSubjectAlias,storeCanonicalEmbedding}=await import('../entity-resolver');
+    for(const scopeKey of ['s1','unrelated']){
+      await storeSubjectAlias(f.v,'Topic','Renamed topic','session',scopeKey,pool);
+      await storeCanonicalEmbedding(f.v,'Renamed topic',vector,'session',scopeKey,pool);
+    }
+    expect(await schedule(f.current)).toEqual(before);
+    expect((await pool.query('SELECT revision::text FROM memories WHERE id=$1',[f.current])).rows[0].revision).toBe('1');
+  });
   it.each(['global','session','task','project'])('schedules %s memories once, without any approval state',async scope=>{
     const v=await vault(),id=await memory(v,'Durable fact',{scope});
     const rows=(await pool.query('SELECT * FROM memory_contradiction_schedule WHERE memory_id=$1',[id])).rows;
@@ -53,7 +94,7 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   it.each([{from:'2099-01-01'},{until:'2020-01-01'}])('scans historical/future knowledge without waiting for applicability: %j',async dates=>{
     const v=await vault(),old=await memory(v,'Older observation',dates),current=await memory(v,'Different observation',dates);
     await pool.query('DELETE FROM memory_contradiction_schedule WHERE vault_id=$1 AND memory_id<>$2',[v,current]);
-    const extractor={arbitrateConflict:vi.fn(async()=>'keep_both')};
+    const extractor=fixtureExtractor(async()=>'keep_both');
     await drain(extractor as never);expect(extractor.arbitrateConflict).toHaveBeenCalledOnce();
     expect(await schedule(current)).toBeUndefined();expect((await statuses(v)).every(r=>r.status==='active')).toBe(true);
     expect((await pool.query('SELECT decision FROM contradiction_scan_log WHERE vault_id=$1 AND memory_id_a=$2',[v,old])).rows).toEqual([{decision:'keep_both'}]);
@@ -61,7 +102,7 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   it('uses database due time even when the application clock is ahead or behind',async()=>{
     const f=await pair(),realNow=Date.now;
     vi.spyOn(Date,'now').mockImplementation(()=>realNow()-86400000);
-    await drain({arbitrateConflict:async()=>'keep_both'} as never);expect(await schedule(f.current)).toBeUndefined();
+    await drain(fixtureExtractor(async()=>'keep_both') as never);expect(await schedule(f.current)).toBeUndefined();
     const next=await memory(f.v,'Another observation');
     await pool.query("UPDATE memory_contradiction_schedule SET available_at=now()+interval '1 day' WHERE memory_id=$1",[next]);
     await pool.query("UPDATE memory_contradiction_pending_vaults SET next_visit_at=now()+interval '1 day' WHERE vault_id=$1",[f.v]);
@@ -70,14 +111,14 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
     expect(extractor.arbitrateConflict).not.toHaveBeenCalled();expect(await schedule(next)).toBeDefined();
   });
   it('retains disabled work and resumes without an approval workflow',async()=>{
-    const f=await pair(),extractor={arbitrateConflict:vi.fn(async()=>'keep_both')};
+    const f=await pair(),extractor=fixtureExtractor(async()=>'keep_both');
     config.CONTRADICTION_SCAN_ENABLED=false;await drain(extractor as never);
     expect(extractor.arbitrateConflict).not.toHaveBeenCalled();expect(await schedule(f.current)).toBeDefined();
     config.CONTRADICTION_SCAN_ENABLED=true;await drain(extractor as never);expect(extractor.arbitrateConflict).toHaveBeenCalledOnce();
   });
   it('preserves generations and backoff on provider failure without hiding memories',async()=>{
     const f=await pair(),before=await schedule(f.current);
-    await drain({arbitrateConflict:async()=>{throw Error('Provider unavailable');}} as never);
+    await drain(fixtureExtractor(async()=>{throw Error('Provider unavailable');}) as never);
     const after=await schedule(f.current);
     expect(after.generation).toBe(before.generation);expect(after.failures).toBe(1);expect(after.available_at.getTime()).toBeGreaterThan(Date.now());
     expect((await statuses(f.v)).every(r=>r.status==='active')).toBe(true);
@@ -87,7 +128,7 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
     const first=await pair(),second=await pair();await memory(first.v,'A third conflicting observation');
     await pool.query('DELETE FROM memory_contradiction_schedule WHERE vault_id=$1 AND memory_id<>$2',[first.v,first.current]);
     config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH=1;
-    const extractor={arbitrateConflict:vi.fn(async()=>'keep_both')};
+    const extractor=fixtureExtractor(async()=>'keep_both');
     for(let i=0;i<3;i++){
       await due(first.v);await due(second.v);
       const before=extractor.arbitrateConflict.mock.calls.length;
@@ -100,7 +141,7 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
     const f=await pair(),other=await pair(),owner=new Client({connectionString:databaseUrl});await owner.connect();
     const key='persistio:contradiction-activation:'+f.v;
     await owner.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[key]);
-    const extractor={arbitrateConflict:vi.fn(async()=>'keep_both')};
+    const extractor=fixtureExtractor(async()=>'keep_both');
     try{
       await drain(extractor as never);expect(extractor.arbitrateConflict).toHaveBeenCalledOnce();
       expect(await schedule(other.current)).toBeUndefined();expect(await schedule(f.current)).toBeDefined();
@@ -136,19 +177,19 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   });
   it('cannot apply a decision after its advisory-lock connection is lost',async()=>{
     const f=await pair();
-    const extractor={arbitrateConflict:vi.fn(async()=>{
+    const extractor=fixtureExtractor(async()=>{
       const terminated=await pool.query("SELECT pg_terminate_backend(pid) AS stopped FROM pg_stat_activity WHERE datname=current_database() AND application_name='persistio:contradiction-activation'");
       expect(terminated.rows).toEqual([{stopped:true}]);return 'supersede_old';
-    })};
+    });
     await expect(drain(extractor as never)).rejects.toThrow();
     expect((await statuses(f.v)).every(r=>r.status==='active')).toBe(true);
     expect((await pool.query('SELECT id FROM contradiction_scan_log WHERE vault_id=$1',[f.v])).rowCount).toBe(0);
     expect(await schedule(f.current)).toBeDefined();
-    await drain({arbitrateConflict:async()=>'keep_both'} as never);expect(await schedule(f.current)).toBeUndefined();
+    await drain(fixtureExtractor(async()=>'keep_both') as never);expect(await schedule(f.current)).toBeUndefined();
   });
   it.each(['scope','dates','data','archive','delete','encryption'])('rejects stale full decisions after concurrent %s changes',async change=>{
     const f=await pair();
-    await drain({arbitrateConflict:async()=>{
+    await drain(fixtureExtractor(async()=>{
       if(change==='scope')await pool.query("UPDATE memories SET scope_key='s2' WHERE id=$1",[f.old]);
       if(change==='dates')await pool.query("UPDATE memories SET valid_until='2020-01-01' WHERE id=$1",[f.old]);
       if(change==='data')await pool.query("UPDATE memories SET data='Independent correction' WHERE id=$1",[f.old]);
@@ -156,7 +197,7 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
       if(change==='delete')await pool.query('DELETE FROM memories WHERE id=$1',[f.old]);
       if(change==='encryption')await pool.query('UPDATE vaults SET vault_encryption_enabled=true WHERE id=$1',[f.v]);
       return 'supersede_old';
-    }} as never);
+    }) as never);
     expect((await statuses(f.v)).every(r=>r.status==='active')).toBe(true);
     expect((await pool.query('SELECT id FROM contradiction_scan_log WHERE vault_id=$1',[f.v])).rowCount).toBe(0);
     expect((await schedule(f.current)).failures).toBe(1);
@@ -164,16 +205,16 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   it.each(['scope','type','dates'])('keeps unlike %s memories separate even with identical text',async change=>{
     const v=await vault(),a=await memory(v,'An identical observation'),b=await memory(v,'An identical observation',
       change==='scope'?{scopeKey:'s2'}:change==='type'?{type:'decision'}:{until:'2020-12-31'});
-    const extractor={arbitrateConflict:vi.fn(async()=>'merge')};await scan(v,[b],extractor as never);
+    const extractor=fixtureExtractor(async()=>'merge');await scan(v,[b],extractor as never);
     expect(extractor.arbitrateConflict).not.toHaveBeenCalled();expect((await statuses(v)).every(r=>r.status==='active')).toBe(true);
     expect(await schedule(a)).toBeDefined();
   });
   it('records a merge atomically with source union and no confidence inflation',async()=>{
     const v=await vault(),a=await memory(v,'Same observation'),b=await memory(v,'Same observation'),sources=[crypto.randomUUID(),crypto.randomUUID()];
-    await pool.query("INSERT INTO raw_chunks(id,vault_id,session_id,role) SELECT id,$1,'s1','user' FROM unnest($2::uuid[]) id",[v,sources]);
+    for(const id of sources)await fixtureSource(pool,v,undefined,id);
     await pool.query('UPDATE memories SET source_chunks=ARRAY[$2::uuid],confidence=0.8 WHERE id=$1',[a,sources[0]]);
     await pool.query("UPDATE memories SET source_chunks=ARRAY[$2::uuid],sensitivity='high',confidence=0.9 WHERE id=$1",[b,sources[1]]);
-    await scan(v,[b],{arbitrateConflict:vi.fn()} as never);
+    await scan(v,[b],fixtureExtractor(()=> 'merge') as never);
     const survivor=(await pool.query('SELECT source_chunks,sensitivity,confidence FROM memories WHERE id=$1',[a])).rows[0];
     expect(survivor.source_chunks.sort()).toEqual(sources.sort());expect(survivor.sensitivity).toBe('high');expect(survivor.confidence).toBe(0.8);
     expect((await statuses(v)).find(r=>r.id===b)).toMatchObject({status:'superseded'});

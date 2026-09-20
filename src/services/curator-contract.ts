@@ -3,7 +3,7 @@ import type { CuratorAliasMaps, CuratorMemory } from './curator';
 import { isSecretLikeMemoryContent } from './deterministic-filter';
 import { isValidDateOnly } from './memory-validity';
 import { memoryTypeSchema, nonHumanMemoryTypeSchema, sourceHasHumanIntent, type ExtractionSource } from './extraction-contract';
-import { scopeKeyForContext, type RecallContext } from './memory-applicability';
+import { contextIdentitySchema, scopeKeyForContext, type RecallContext } from './memory-applicability';
 import { ModelOutputContractError } from './model-output-error';
 
 export interface CuratorRawSource extends ExtractionSource { context: RecallContext }
@@ -40,7 +40,7 @@ function createCuratorResultSchema<T extends z.ZodTypeAny>(memoryMetadata: T) {
     edges: z.array(z.object({ from: finalAlias, to: finalAlias,
       type: z.enum(['applies_to','part_of','depends_on','supports','contradicts','supersedes','refines','relevant_when']),
       confidence: z.number().min(0).max(1), reason: text }).strict()).max(500),
-    scope_changes: z.array(z.object({ id: finalAlias, scope, scope_key: z.string().trim().min(1).max(512).nullable(),
+    scope_changes: z.array(z.object({ id: finalAlias, scope, scope_key: contextIdentitySchema.nullable(),
       source_refs: z.array(z.string().regex(/^S[1-9][0-9]*$/)).min(1).max(100), reason: text }).strict()).max(500)
   }).strict();
 }

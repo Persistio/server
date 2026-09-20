@@ -1,0 +1,71 @@
+{
+  "name": "persistio",
+  "private": true,
+  "version": "0.1.9",
+  "license": "BUSL-1.1",
+  "workspaces": [
+    "packages/*",
+    "app/worker",
+    "app/web",
+    "app/packages/*"
+  ],
+  "devDependencies": {
+    "@grpc/grpc-js": "1.14.4",
+    "@grpc/proto-loader": "0.8.1",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "google-proto-files": "5.0.3",
+    "sharp": "0.35.4",
+    "wrangler": "^4.130.0",
+    "yaml": "2.9.0"
+  },
+  "overrides": {
+    "sharp": "$sharp",
+    "protobufjs": "7.6.6",
+    "@opentelemetry/otlp-transformer": {
+      "protobufjs": "7.6.6"
+    },
+    "@opentelemetry/exporter-trace-otlp-grpc": {
+      "protobufjs": "7.6.6"
+    },
+    "@opentelemetry/exporter-trace-otlp-proto": {
+      "protobufjs": "7.6.6"
+    },
+    "@opentelemetry/otlp-grpc-exporter-base": {
+      "protobufjs": "7.6.6"
+    },
+    "@opentelemetry/sdk-node": {
+      "protobufjs": "7.6.6"
+    }
+  },
+  "scripts": {
+    "check:prompts": "node scripts/check-prompts.mjs",
+    "test:prompts": "node --test scripts/lib/prompt-manifest.test.mjs eval/restoration/*.test.mjs",
+    "audit:ci": "node ./scripts/npm-audit-high-critical.mjs",
+    "audit:memory-observability": "node ./scripts/audit-memory-observability.mjs",
+    "test:memory-alerts": "node --test ./scripts/lib/memory-security-alerts.test.mjs",
+    "test:memory-rollout": "node --test ./scripts/lib/memory-collector.test.mjs ./scripts/lib/memory-exporter.test.mjs ./scripts/lib/memory-sdk.test.mjs ./scripts/lib/memory-promql.test.mjs",
+    "test:replay-import": "node --test ./scripts/lib/replay-import-provenance.test.mjs ./scripts/lib/replay-import-lifecycle.test.mjs ./scripts/lib/replay-checkpoint.test.mjs ./scripts/lib/replay-dataset.test.mjs ./scripts/lib/replay-source-contract.test.mjs",
+    "build": "npm run build --workspace @persistio/server",
+    "build:app": "npm run build --workspace @persistio/app-shared && npm run build --workspace @persistio/app-worker && npm run build --workspace @persistio/app-web",
+    "configure:auth0:dev": "node ./scripts/configure-auth0-dev.mjs",
+    "deploy:app:dev": "node ./scripts/deploy-app-dev.mjs",
+    "bump:server-version": "node ./scripts/bump-server-version.mjs",
+    "check:versions": "node ./scripts/check-versions.mjs",
+    "migrate:raw-chunks": "node ./scripts/migrate-raw-chunks-to-blob.mjs",
+    "migrate:qwen3-embeddings": "node ./scripts/reembed-qwen3.mjs",
+    "test:app": "npm test --workspace @persistio/app-worker",
+    "start": "npm run start --workspace @persistio/server",
+    "eval:locomo": "node eval/locomo/run.mjs",
+    "eval:locomo:import": "node eval/locomo/import.mjs",
+    "eval:locomo:qa": "node eval/locomo/run_qa.mjs",
+    "eval:behavioral": "node eval/run.mjs --dataset behavioral",
+    "eval:behavioral:import": "node eval/run.mjs --dataset behavioral --import-only",
+    "eval:behavioral:generate": "node eval/behavioral/generate_dataset.mjs",
+    "eval:behavioral:variants": "node eval/behavioral/generate_variants.mjs",
+    "eval:behavioral:label": "node eval/behavioral/label_dataset.mjs",
+    "eval:behavioral:summarize": "node eval/behavioral/summarize_run.mjs",
+    "eval:behavioral:compare": "node eval/behavioral/compare_runs.mjs",
+    "eval:behavioral:validate": "node eval/behavioral/validate_dataset.mjs"
+  }
+}
