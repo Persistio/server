@@ -1,8 +1,8 @@
 import type {FastifyServerOptions} from 'fastify';
 import {ModelOutputContractError,isSafeModelOutputIssueCode,isSafeModelOutputIssuePath} from './services/model-output-error';
 /** Operational export only. Domain evidence/audits and HTTP bodies are separate. */
-const numericKeys=new Set(['status','status_code','duration_ms','response_bytes','result_count','count','total','idle','waiting',
-  'prompt_tokens','completion_tokens','total_tokens','pairs_count','candidates_count','active_memories_count',
+const numericKeys=new Set(['recent_dead_letter_window_ms','delivery_delivered','delivery_retried','delivery_stale','delivery_dead','delivery_purged','value','observed_at_ms','eligible_depth','oldest_due_age_ms','deferred_depth','expired_leases','dead_letters','last_cycle_success_age_ms','status','status_code','duration_ms','response_bytes','result_count','count','total','idle','waiting',
+  'prompt_tokens','completion_tokens','visible_completion_tokens','reasoning_tokens','output_tokens','total_tokens','pairs_count','candidates_count','active_memories_count',
   'accepted','inserted','replayed','deferred','retry_count','retry_after_ms','wait_ms','batch_size',
   'raw_facts','after_source_filter','excluded_context_only','excluded_unsupported_human_intent','excluded_unsupported_scope',
   'after_score_filter','after_secret_filter','after_sensitivity_filter','after_deterministic_filter','threshold',
@@ -10,6 +10,13 @@ const numericKeys=new Set(['status','status_code','duration_ms','response_bytes'
   'extraction.memories_created','extraction.candidates.extracted','extraction.candidates.accepted','extraction.candidates.dropped']);
 const idKeys=new Set(['vault_id','vaultId','vault.id']);
 const enumValues:Record<string,ReadonlySet<string>>={
+  shadow_metric:new Set(['persistio.recall.duration','persistio.ingest.chunks.total','persistio.extraction.jobs.total',
+    'persistio.extraction.lag_ms','persistio.extraction.candidates.total','persistio.ai_budget.wait_ms',
+    'persistio.ai_budget.throttled_jobs.total','persistio.embedding.duration','persistio.event_outbox.dispatch.total',
+    'persistio.event_outbox.publish_failures.total','persistio.event_outbox.lag_ms']),
+  shadow_kind:new Set(['extraction','curation','contradiction','platform_outbox','usage_periods','blob_reconciliation','customer_metrics']),
+  shadow_outcome:new Set(['completed','failed','stale','busy','created','retained','rotated','idle','unknown']),
+  shadow_health:new Set(['ok','monitor_error']),
   method:new Set(['GET','POST','PATCH','PUT','DELETE','HEAD','OPTIONS']),
   mode:new Set(['agent','factual']),source:new Set(['api','extraction_worker','curation_worker']),
   model_role:new Set(['extraction','escalation','embedding','curation']),
@@ -23,9 +30,10 @@ const enumValues:Record<string,ReadonlySet<string>>={
   dedup_action:new Set(['skipped','updated','inserted','conflict']),
   'embedding.provider':new Set(['openai','vertex','ollama','tei']),
   event:new Set(['scope_widening_attempt','invalid_source','invalid_scope','invalid_model_output']),
-  outcome:new Set(['accepted','rejected','deferred','completed','failed','cycle','attempted','delivered','dead'])
+  outcome:new Set(['accepted','rejected','deferred','completed','failed','cycle','attempted','delivered','dead']),
+  reasoning_token_source:new Set(['explicit','derived','unavailable'])
 };
-const safeMessages=new Set(['Recall served','Extraction job failed','Curation job failed','Extraction loop iteration failed',
+const safeMessages=new Set(['shadow_customer_delivery','shadow_domain_metric','shadow_worker_cycle','shadow_worker_observation','shadow_dispatch_cycle','Recall served','Extraction job failed','Curation job failed','Extraction loop iteration failed',
   'extraction pipeline attrition',
   'Curation loop iteration failed','Contradiction activation iteration failed','Extraction worker terminated','Curation worker terminated',
   'curator token usage','arbitration token usage','batch arbitration token usage','circuit_breaker_open',

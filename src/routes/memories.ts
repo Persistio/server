@@ -20,8 +20,8 @@ import { lockMemoryWriteVault } from '../services/dedup';
 import { enqueueCurationWork } from '../services/curation-work';
 import { isSecretLikeMemoryContent } from '../services/deterministic-filter';
 import { isValidDateOnly } from '../services/memory-validity';
-import { publishCommittedWorkerEffects,type WorkerEffect } from '../services/worker-effects';
-import { checkMemoryCreationCapacity, reserveMemoryCreationInTransaction, recordMemoryCountDelta } from '../services/usage';
+import { memoryCountEffect, captureShadowWorkerEffects, publishCommittedWorkerEffects,type WorkerEffect } from '../services/worker-effects';
+import { checkMemoryCreationCapacity, reserveMemoryCreationInTransaction } from '../services/usage';
 import { isScopeWidening, parseMemoryScope, resolveMemoryScopeChange, type MemoryScope } from '../services/memory-scope';
 import { contextIdentitySchema } from '../services/memory-applicability';
 
@@ -276,7 +276,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       const row=inserted.rows[0];
       await client.query('INSERT INTO memory_embeddings(memory_id,embedding) VALUES($1,$2::vector)',[row.id,JSON.stringify(embedding)]);
       await enqueueCurationWork(client,{vaultId:request.vault.id,workKey:'manual:'+crypto.randomUUID(),memoryIds:[String(row.id)]});
-      effects.push({kind:'quota',reservation},{kind:'memory-count',vaultId:request.vault.id,accountId:request.vault.account_id,delta:1,source:'api'});
+      effects.push({kind:'quota',reservation},memoryCountEffect(request.vault.id,request.vault.account_id,1,'api'));
+      await captureShadowWorkerEffects(client,effects);
       return row;
     });
     publishCommittedWorkerEffects(effects);
@@ -313,10 +314,12 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       if(!previous)return null;
       const updated=await client.query<{id:string;archived_at:string}>(`UPDATE memories SET archived_at=COALESCE(archived_at,now()),updated_at=now()
         WHERE vault_id=$1 AND id=$2 RETURNING id,archived_at`,[request.vault.id,id]);
-      return{row:updated.rows[0],changed:previous.archived_at===null};
+      const effects = previous.archived_at===null ? [memoryCountEffect(request.vault.id,request.vault.account_id,-1,'api')] : [];
+      await captureShadowWorkerEffects(client,effects);
+      return{row:updated.rows[0],changed:previous.archived_at===null,effects};
     });
     if(!result)return reply.code(404).send({error:'Memory not found'});
-    if(result.changed){publishCommittedWorkerEffects([{kind:'memory-count',vaultId:request.vault.id,accountId:request.vault.account_id,delta:-1,source:'api'}]);
+    if(result.changed){publishCommittedWorkerEffects(result.effects);
       await recordMemoryArchivedActivity(request,id);}
     return result.row;
   });
@@ -391,7 +394,8 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       const revision=(await client.query('SELECT revision::text FROM memories WHERE id=$1 AND vault_id=$2',[id,request.vault.id])).rows[0].revision;
       if(revision!==String(current.revision))await enqueueCurationWork(client,{vaultId:request.vault.id,workKey:'manual:'+crypto.randomUUID(),memoryIds:[id]});
       const delta=current.archived_at===null && updated.archived_at!==null ? -1:restoring ? 1:0;
-      effects.push({kind:'memory-count',vaultId:request.vault.id,accountId:request.vault.account_id,delta,source:'api'});
+      effects.push(memoryCountEffect(request.vault.id,request.vault.account_id,delta,'api'));
+      await captureShadowWorkerEffects(client,effects);
       return{row:updated,delta};
     });
     if(!result)return reply.code(404).send({error:'Memory not found'});

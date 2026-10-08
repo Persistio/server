@@ -94,7 +94,14 @@ describe.each(providers)('Curator structured output through real SDK: $name', pr
     const expectedEstimate = Math.max(256, Math.ceil(wire.text.length / 4));
     expect(h.order).toEqual(['reserve', 'request', 'provider', 'usage', 'settle', 'record']);
     expect(h.accounting.beforeRequest).toHaveBeenCalledOnce();
-    expect(h.accounting.returnedUsage).toHaveBeenCalledExactlyOnceWith({ promptTokens: 120, completionTokens: 30, totalTokens: 150 });
+    expect(h.accounting.returnedUsage).toHaveBeenCalledExactlyOnceWith({
+      promptTokens: 120,
+      visibleCompletionTokens: 30,
+      reasoningTokens: 0,
+      outputTokens: 30,
+      totalTokens: 150,
+      reasoningTokenSource: 'unavailable'
+    });
     expect(usage.acquire).toHaveBeenCalledExactlyOnceWith(vaultId, 'curation', expectedEstimate);
     expect(usage.settle).toHaveBeenCalledExactlyOnceWith(vaultId, 'curation', expectedEstimate, 150);
     expect(usage.record).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ vaultId, model: provider.model,
@@ -270,7 +277,7 @@ describe.each(providers)('Curator structured output through real SDK: $name', pr
     expect(h.accounting.returnedUsage).not.toHaveBeenCalled();
     expect(usage.settle).not.toHaveBeenCalled();
     expect(usage.record).not.toHaveBeenCalled();
-    expect(h.wire().body.max_tokens).toBe(provider.native ? 8192 : undefined);
+    expect(h.wire().body.max_tokens).toBe(8192);
   });
 
   it.each([false, true])('fits complete records and custom instructions around behavioral schema=%s at the enforced minimum input budget', async behavioral => {

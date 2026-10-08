@@ -44,6 +44,9 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
     providers.metric.mockReset();
   });
   afterEach(async () => {
+    config.CUSTOMER_METRICS_SHADOW_CAPTURE = false;
+    config.TELEMETRY_SHADOW_ENABLED = false;
+    await pool.query("DELETE FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=ANY($1::text[])",[vaults]);
     providers.port = null;
     vi.restoreAllMocks();
     await pool.query('DELETE FROM worker_action_receipts WHERE queue_id=ANY($1::uuid[])', [queues]);
@@ -86,6 +89,7 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
   const deltas = () => providers.metric.mock.calls.map(([event]) => event).filter(event => event.event_type === 'quota_delta');
 
   it.each([false, true])('commits the real %s legacy/segment path and both metric dimensions only after commit', async legacy => {
+    config.CUSTOMER_METRICS_SHADOW_CAPTURE = true;
     const f = await fixture({ legacy });
     const observed: Promise<unknown>[] = [];
     providers.metric.mockImplementation(event => {
@@ -100,6 +104,9 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
     expect(deltas()).toHaveLength(2);
     await processBatch(f.vault);
     expect(deltas()).toHaveLength(2);
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[f.vault])).rows.map(row=>row.payload);
+    expect(shadow).toHaveLength(2);
+    for(const legacy of deltas())expect(shadow).toContainEqual(legacy);
   });
   it('finishes zero-candidate work without quota/count effects', async () => {
     const f = await fixture(); facts.mockResolvedValue([]);
@@ -394,14 +401,24 @@ describe.skipIf(!databaseUrl)('actual extraction worker commit lifecycle (Postgr
     expect((await pool.query('SELECT 1 FROM extraction_dead_letter WHERE job_id=$1', [f.job])).rowCount).toBe(1);
     expect(deltas()).toEqual([]);
   });
-  it.each(['budget', 'circuit'] as const)('defers real extraction on %s without retry increments or committed effects', async reason => {
+  it.each(['extraction', 'escalation', 'circuit'] as const)('defers real extraction on %s without retry increments or committed effects', async reason => {
     const f = await fixture();
     const { AiBudgetDeferredError } = await import('../services/usage');
     const { CircuitBreakerOpenError } = await import('../services/ai-resilience');
-    facts.mockRejectedValue(reason === 'budget' ? new AiBudgetDeferredError('extraction', new Date(Date.now()+60_000), 60_000) : new CircuitBreakerOpenError('extractor', 60_000));
+    config.TELEMETRY_SHADOW_ENABLED=true;
+    const info=vi.spyOn(console,'info').mockImplementation(()=>{});
+    facts.mockRejectedValue(reason !== 'circuit' ? new AiBudgetDeferredError(reason, new Date(Date.now()+60_000), 60_000) : new CircuitBreakerOpenError('extractor', 60_000));
     await processBatch(f.vault);
     expect(await status(f)).toMatchObject({ job: 'running', processed: false, memories: [], usage: 0, receipts: 0,
       queue: [expect.objectContaining({ retry_count: 0, claim_token: null })] });
     expect(deltas()).toEqual([]);
+    const budgetRecords=info.mock.calls.map(([line])=>JSON.parse(String(line)))
+      .filter(record=>record.event==='shadow_domain_metric' && record.shadow_metric.startsWith('persistio.ai_budget.'));
+    expect(budgetRecords.map(({shadow_metric,value,model_role,queue})=>({shadow_metric,value,model_role,queue})))
+      .toEqual(reason==='circuit'?[]:[
+        {shadow_metric:'persistio.ai_budget.wait_ms',value:60000,model_role:reason,queue:'extraction'},
+        {shadow_metric:'persistio.ai_budget.throttled_jobs.total',value:1,model_role:reason,queue:'extraction'}
+      ]);
+    for(const record of budgetRecords)expect(record).not.toHaveProperty('vault_id');
   });
 });

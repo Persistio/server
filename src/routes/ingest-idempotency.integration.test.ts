@@ -5,12 +5,13 @@ import Fastify from 'fastify';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fixture = vi.hoisted(() => ({
-  vaultId: '', loseCommit: false, loseReplay: false, storageUnavailable: false, blobs: new Map<string, string>(),
+  metric:vi.fn(), crossMidnight:false, accountId: null as string|null, vaultId: '', loseCommit: false, loseReplay: false, storageUnavailable: false, blobs: new Map<string, string>(),
   embed: vi.fn(), put: vi.fn(), get: vi.fn(), remove: vi.fn(), unwrap:vi.fn(),
   encryptedDek:null as string|null, encryptionEnabled:false
 }));
+vi.mock('../services/customer-metrics',async original=>({...await original<typeof import('../services/customer-metrics')>(),recordCustomerMetric:fixture.metric}));
 vi.mock('../middleware/auth', () => ({ requireVaultWriteAuth: async (request: { vault: unknown }) => {
-  request.vault = { id: fixture.vaultId, name: 'ingest test', purpose: null, settings: {}, plan_id: 'unlimited',
+  request.vault = { id: fixture.vaultId, account_id:fixture.accountId, name: 'ingest test', purpose: null, settings: {}, plan_id: 'unlimited',
     status: 'active', encrypted_dek: fixture.encryptedDek, vault_encryption_enabled: fixture.encryptionEnabled };
 } }));
 vi.mock('@google-cloud/kms',()=>({KeyManagementServiceClient:class {decrypt=fixture.unwrap;}}));
@@ -42,6 +43,7 @@ vi.mock('../db/client', async original => {
         return client.query(sql, values);
       }
     })));
+    if(wroteRaw && fixture.crossMidnight)vi.setSystemTime(new Date('2026-10-07T00:00:00.001Z'));
     if (wroteRaw && fixture.loseCommit) { fixture.loseCommit = false; throw new Error('Simulated lost COMMIT acknowledgement'); }
     return result;
   } };
@@ -82,7 +84,7 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     await registerIngestRoutes(app, triggerExtraction);
   });
   beforeEach(async () => {
-    fixture.encryptedDek=null;fixture.encryptionEnabled=false;
+    fixture.accountId=null;fixture.encryptedDek=null;fixture.encryptionEnabled=false;
     (await import('../config')).getConfig().ENCRYPTION_ENABLED=false;
     fixture.vaultId = crypto.randomUUID(); fixture.loseCommit = false; fixture.loseReplay=false; fixture.blobs.clear();
     fixture.storageUnavailable = false;
@@ -99,6 +101,9 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
       VALUES ($1,'PR369 test',$2,'unlimited','{"ingest_events_per_month":1}')`, [fixture.vaultId, crypto.randomUUID()]);
   });
   afterEach(async () => {
+    vi.useRealTimers();fixture.crossMidnight=false;fixture.metric.mockReset();
+    (await import('../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE=false;
+    await pool.query("DELETE FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[fixture.vaultId]);
     await pool.query('DELETE FROM vaults WHERE id=$1', [fixture.vaultId]);
     await pool.query('DELETE FROM raw_chunk_blob_write_intents WHERE vault_id=$1', [fixture.vaultId]);
     await pool.query('DELETE FROM raw_chunk_blob_deletion_queue WHERE vault_id=$1', [fixture.vaultId]);
@@ -137,11 +142,27 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     expect(fixture.blobs.size).toBe(1);
   });
 
-  it('does not refund a committed charge after lost COMMIT acknowledgement', async () => {
+  it('reuses accepted quota and storage envelopes after COMMIT crosses midnight',async()=>{
+    (await import('../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE=true;
+    fixture.accountId=crypto.randomUUID();await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1',[fixture.vaultId,fixture.accountId]);
+    fixture.crossMidnight=true;vi.useFakeTimers({toFake:['Date']});vi.setSystemTime(new Date('2026-10-06T23:59:59.999Z'));
+    const response=await post();expect(response.statusCode,response.body).toBe(202);
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[fixture.vaultId])).rows.map(row=>row.payload);
+    expect(shadow).toHaveLength(2);expect(fixture.metric).toHaveBeenCalledTimes(2);
+    for(const [legacy] of fixture.metric.mock.calls){expect(shadow).toContainEqual(legacy);expect(legacy).toMatchObject({event_ts:'2026-10-06T23:59:59.999Z',event_date:'2026-10-06'});}
+    expect((await post()).statusCode).toBe(202);expect(fixture.metric).toHaveBeenCalledTimes(2);
+  });
+  it('does not refund or duplicate shadow quota/storage after lost COMMIT acknowledgement', async () => {
+    (await import('../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE=true;
+    fixture.accountId=crypto.randomUUID();await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1',[fixture.vaultId,fixture.accountId]);
     fixture.loseCommit = true;
     expect((await post()).statusCode).toBe(500);
     expect(await counts()).toEqual({ raw: 1, segments: 1, queue: 1, intents: 0, charges: 1 });
+    const original=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1 ORDER BY event_id",[fixture.vaultId])).rows;
+    expect(original).toHaveLength(2);
+    expect(original.map(row=>row.payload.event_type).sort()).toEqual(['quota_delta','storage_delta']);
     const retry = await post(); expect(retry.statusCode, retry.body).toBe(202);
+    expect((await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1 ORDER BY event_id",[fixture.vaultId])).rows).toEqual(original);
     expect(retry.json()).toMatchObject({ inserted: 0, replayed: 1 });
     expect((await counts()).charges).toBe(1); expect(fixture.blobs.size).toBe(1);
   });

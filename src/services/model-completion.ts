@@ -1,3 +1,5 @@
+import { executionSignal } from '../request-worker/context';
+import { checkpointExecutionState } from '../request-worker/state';
 import type OpenAI from 'openai';
 
 export { modelResponseFormat } from './model-output-schema';
@@ -18,6 +20,59 @@ export interface ModelCompletion {
   usage?: OpenAI.CompletionUsage;
   /** Provider evidence for existing private audit storage, never operational logs. */
   native_response?: unknown;
+}
+
+export type ReasoningTokenSource = 'explicit' | 'derived' | 'unavailable';
+
+export interface NormalizedModelUsage {
+  promptTokens: number;
+  visibleCompletionTokens: number;
+  reasoningTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  reasoningTokenSource: ReasoningTokenSource;
+}
+
+function validTokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Normalizes OpenAI and OpenAI-compatible usage without assuming whether a
+ * provider includes hidden reasoning in completion_tokens. Provider total is
+ * authoritative for quota whenever it is internally consistent. */
+export function normalizeModelUsage(usage: OpenAI.CompletionUsage): NormalizedModelUsage | null {
+  const promptTokens = usage.prompt_tokens;
+  const completionTokens = usage.completion_tokens;
+  const totalTokens = usage.total_tokens;
+  if (!validTokenCount(promptTokens) || !validTokenCount(completionTokens) || !validTokenCount(totalTokens)
+    || totalTokens < promptTokens) return null;
+
+  const outputTokens = totalTokens - promptTokens;
+  const details = object(usage.completion_tokens_details) ? usage.completion_tokens_details : null;
+  const explicitReasoning = details?.reasoning_tokens;
+  if (details && Object.hasOwn(details, 'reasoning_tokens')) {
+    if (validTokenCount(explicitReasoning) && explicitReasoning <= outputTokens) {
+      if (completionTokens === outputTokens && explicitReasoning <= completionTokens) {
+        return { promptTokens, visibleCompletionTokens: completionTokens - explicitReasoning,
+          reasoningTokens: explicitReasoning, outputTokens, totalTokens, reasoningTokenSource: 'explicit' };
+      }
+      if (completionTokens + explicitReasoning === outputTokens) {
+        return { promptTokens, visibleCompletionTokens: completionTokens,
+          reasoningTokens: explicitReasoning, outputTokens, totalTokens, reasoningTokenSource: 'explicit' };
+      }
+    }
+    return { promptTokens, visibleCompletionTokens: completionTokens, reasoningTokens: 0, outputTokens, totalTokens,
+      reasoningTokenSource: 'unavailable' };
+  }
+
+  if (outputTokens >= completionTokens) {
+    const reasoningTokens = outputTokens - completionTokens;
+    return { promptTokens, visibleCompletionTokens: completionTokens, reasoningTokens, outputTokens, totalTokens,
+      reasoningTokenSource: reasoningTokens > 0 ? 'derived' : 'unavailable' };
+  }
+
+  return { promptTokens, visibleCompletionTokens: completionTokens, reasoningTokens: 0, outputTokens, totalTokens,
+    reasoningTokenSource: 'unavailable' };
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -119,11 +174,14 @@ function normalizedNativeResponse(raw: unknown): ModelCompletion {
 }
 
 export async function completeModelRequest(client: OpenAI, input: ChatInput, baseURL: string, options?: {maxRetries:0}): Promise<ModelCompletion> {
-  if (!usesNativeMessages(input, baseURL)) return options ? client.chat.completions.create(input, options) : client.chat.completions.create(input);
+  await checkpointExecutionState();
+  const signal = executionSignal();
+  const requestOptions = signal ? { ...options, signal, maxRetries: 0 } : options;
+  if (!usesNativeMessages(input, baseURL)) return requestOptions ? client.chat.completions.create(input, requestOptions) : client.chat.completions.create(input);
   const body = modelRequestBody(input, baseURL);
   const response = await client.post<ChatInput | NativeRequest, unknown>('/messages', {
     body,
-    ...options,
+    ...requestOptions,
     headers: { 'x-api-key': client.apiKey, 'anthropic-version': '2023-06-01', authorization: null }
   });
   return normalizedNativeResponse(response);

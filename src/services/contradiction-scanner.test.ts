@@ -5,7 +5,7 @@ vi.mock('../config',()=>({getConfig:()=>({CONTRADICTION_SCAN_ENABLED:true,CONTRA
 vi.mock('../db/client',()=>({query:(sql:string,...args:unknown[])=>sql.startsWith('WITH future_memories')?mocks.remind(sql,...args):mocks.query(sql,...args),withTransaction:mocks.tx}));
 vi.mock('./crypto',()=>({decryptForVault:mocks.decrypt,prepareVaultCrypto:async()=>({assertCurrent:mocks.identity})}));
 vi.mock('./curation-work',()=>({enqueueCurationWork:mocks.enqueue}));
-vi.mock('./worker-effects',()=>({publishCommittedWorkerEffects:mocks.publish}));
+vi.mock('./worker-effects',async original=>({...await original<typeof import('./worker-effects')>(),publishCommittedWorkerEffects:mocks.publish}));
 // Source authorization is exercised with the real database and SDK in arbitration-evidence.integration.test.ts.
 vi.mock('./conflict-evidence',async original=>({...await original() as object,prepareConflictEvidence:async()=>({pairId:'test'}),conflictStillCurrent:async()=>true}));
 vi.mock('./extractor',()=>({validatedConflictAssessment:(decision:unknown)=>['merge','discard_new','supersede_old','keep_both'].includes(decision as string)?{decision,evidence:{}}:undefined}));

@@ -26,12 +26,27 @@ describe.skipIf(!url)('actual vault-key memory authority (PostgreSQL)',()=>{
       await pool.query("INSERT INTO vaults(id,name,api_key_hash,plan_id) VALUES($1,'auth-boundary',$2,'unlimited')",[id,hash(key)]);
     }
   });
-  afterEach(async()=>{await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])',[vaults]);vaults.length=0;keys.length=0;});
+  afterEach(async()=>{vi.restoreAllMocks();(await import('../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE=false;
+    await pool.query("DELETE FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=ANY($1::text[])",[vaults]);
+    await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])',[vaults]);vaults.length=0;keys.length=0;});
   afterAll(async()=>{await app.close();await pool.end();await db?.closePool();});
   const headers=(key?:string)=>key?{authorization:'Bearer '+key}:{};
   const create=(key?:string,extra:Record<string,unknown>={})=>app.inject({method:'POST',url:'/v1/memories',headers:headers(key),
     payload:{data:'Useful durable owner-authored fact',subject:'Topic',scope:'session',scope_key:'s1',...extra}});
   const recall=(key?:string)=>app.inject({method:'POST',url:'/v1/recall',headers:headers(key),payload:{query:'Useful fact',context:{session_id:'s1'}}});
+  it('reuses complete envelopes for create, archive and restore through the actual API',async()=>{
+    (await import('../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE=true;
+    await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1',[vaults[0],crypto.randomUUID()]);
+    const metric=vi.spyOn(await import('../services/customer-metrics'),'recordCustomerMetric').mockImplementation(()=>{});
+    const added=await create(keys[0]);expect(added.statusCode,added.body).toBe(201);const id=added.json().id;
+    expect((await app.inject({method:'DELETE',url:'/v1/memories/'+id,headers:headers(keys[0])})).statusCode).toBe(200);
+    const restored=await app.inject({method:'PATCH',url:'/v1/memories/'+id,headers:headers(keys[0]),payload:{archived:false}});
+    expect(restored.statusCode,restored.body).toBe(200);
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[vaults[0]])).rows.map(row=>row.payload);
+    expect(metric).toHaveBeenCalledTimes(5);expect(shadow).toHaveLength(5);
+    for(const [event] of metric.mock.calls)expect(shadow).toContainEqual(event);
+    expect(shadow.filter(event=>event.operation==='memory_count').map(event=>event.memory_count_delta).sort()).toEqual([-1,1,1]);
+  });
   it('allows the same full vault key to create active knowledge and recall it without approval',async()=>{
     const added=await create(keys[0]);expect(added.statusCode,added.body).toBe(201);
     const row=added.json();expect(row.status).toBe('active');expect(row).not.toHaveProperty('authority_state');

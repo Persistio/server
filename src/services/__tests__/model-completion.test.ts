@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { extractedFactSchema } from '../extraction-contract';
 import { curatorResultSchema, nonBehavioralCuratorResultSchema } from '../curator-contract';
-import { completeModelRequest, modelRequestBody, modelResponseFormat, serializeModelRequest } from '../model-completion';
+import { completeModelRequest, modelRequestBody, modelResponseFormat, normalizeModelUsage, serializeModelRequest } from '../model-completion';
 
 type Input = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
 const nativeURL = 'https://api.anthropic.com/v1/';
@@ -255,6 +255,61 @@ describe('structured model transport boundary', () => {
     await expect(completeModelRequest(client, request(), nativeURL)).rejects.toMatchObject({ status });
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(fetch.mock.calls[0][1]!.body))).toHaveProperty('output_config.format.type', 'json_schema');
+  });
+});
+
+describe('model usage normalization', () => {
+  it('derives hidden Gemini reasoning from internally consistent totals', () => {
+    expect(normalizeModelUsage({ prompt_tokens: 300, completion_tokens: 67, total_tokens: 2284 })).toEqual({
+      promptTokens: 300,
+      visibleCompletionTokens: 67,
+      reasoningTokens: 1917,
+      outputTokens: 1984,
+      totalTokens: 2284,
+      reasoningTokenSource: 'derived'
+    });
+  });
+
+  it('separates explicit OpenAI reasoning already included in completion tokens', () => {
+    expect(normalizeModelUsage({
+      prompt_tokens: 100,
+      completion_tokens: 80,
+      total_tokens: 180,
+      completion_tokens_details: { reasoning_tokens: 50, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0, audio_tokens: 0 }
+    })).toEqual({
+      promptTokens: 100,
+      visibleCompletionTokens: 30,
+      reasoningTokens: 50,
+      outputTokens: 80,
+      totalTokens: 180,
+      reasoningTokenSource: 'explicit'
+    });
+  });
+
+  it('accepts explicit reasoning reported separately from visible completion', () => {
+    expect(normalizeModelUsage({
+      prompt_tokens: 100,
+      completion_tokens: 30,
+      total_tokens: 180,
+      completion_tokens_details: { reasoning_tokens: 50, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0, audio_tokens: 0 }
+    })).toMatchObject({
+      visibleCompletionTokens: 30,
+      reasoningTokens: 50,
+      outputTokens: 80,
+      reasoningTokenSource: 'explicit'
+    });
+  });
+
+  it('never invents negative reasoning for inconsistent provider counters', () => {
+    expect(normalizeModelUsage({ prompt_tokens: 100, completion_tokens: 50, total_tokens: 120 })).toEqual({
+      promptTokens: 100,
+      visibleCompletionTokens: 50,
+      reasoningTokens: 0,
+      outputTokens: 20,
+      totalTokens: 120,
+      reasoningTokenSource: 'unavailable'
+    });
+    expect(normalizeModelUsage({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 90 })).toBeNull();
   });
 });
 

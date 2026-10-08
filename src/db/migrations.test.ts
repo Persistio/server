@@ -31,6 +31,15 @@ function repositorySources(...roots: string[]): Array<{ path: string; source: st
 }
 
 describe('database migration guardrails', () => {
+  it('raises only the untouched unlimited curator output default and does not reverse operator state', () => {
+    const sql = migration('062_curator_generation_capacity.sql');
+    expect(sql).toContain("WHERE id = 'unlimited'");
+    expect(sql).toContain("limits->>'curator_output_tokens_per_call' = '2000'");
+    expect(sql).toContain("'8192'::jsonb");
+    const down = migration('down/062_curator_generation_capacity.sql');
+    expect(down).toContain('Intentionally irreversible');
+    expect(down).not.toContain('UPDATE plans');
+  });
   it('adds bounded contradiction progress without changing deployed scheduling or customer memories', () => {
     const sql=migration('059_bounded_contradiction_progress.sql');
     expect(sql).toContain('LOCK TABLE memory_contradiction_schedule IN ACCESS EXCLUSIVE MODE');
@@ -306,8 +315,8 @@ describe('database migration guardrails', () => {
 
   it('fences every worker transition and constrains vault-owned relationships', () => {
     const sql = migration('051_worker_fencing_and_vault_integrity.sql');
-    const extractionWorker = repoFile('packages', 'server', 'src', 'daemon', 'extraction-worker.ts');
-    const curationWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-worker.ts');
+    const extractionWorker = repoFile('packages', 'server', 'src', 'daemon', 'extraction-execution.ts');
+    const curationWorker = repoFile('packages', 'server', 'src', 'daemon', 'curation-execution.ts');
     const leaseService = repoFile('packages', 'server', 'src', 'services', 'worker-lease.ts');
 
     expect(sql).toContain('claim_token UUID');

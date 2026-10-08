@@ -8,7 +8,7 @@ import { getConfig } from '../config';
 import { decryptForVault,prepareVaultCrypto,type VaultEncryptionContext } from './crypto';
 import type { ExtractorService,ConflictResolution } from './extractor';
 import { enqueueCurationWork } from './curation-work';
-import { publishCommittedWorkerEffects } from './worker-effects';
+import { memoryCountEffect, captureShadowWorkerEffects, type WorkerEffect, publishCommittedWorkerEffects } from './worker-effects';
 import crypto from 'node:crypto';
 
 type ScanClient=Client|PoolClient;
@@ -31,6 +31,7 @@ export interface ContradictionScanCursor {
 export interface ContradictionScanOptions {
   client?:ScanClient;budget?:{remaining:number};maxArbitrations?:number;now?:Date;
   cursors?:Record<string,ContradictionScanCursor>;
+  admitArbitration?:()=>Promise<boolean>;
 }
 export interface ContradictionScanResult {
   completedMemoryIds:string[];deferredMemoryIds:string[];
@@ -152,6 +153,7 @@ export async function scanForContradictions(vaultId:string,memoryIds:string[],ex
         decision='incomplete';
         const evidence=await prepareConflictEvidence(vaultId,candidate.memory_id,current.memory_id,{query:execute} as never);
         if(evidence){
+          if(options.admitArbitration && !await options.admitArbitration()){complete=false;break;}
           budget.remaining--;
           const temporal=(m:MemoryCandidateRow)=>({sourceTimestamp:m.source_timestamp,validFrom:m.valid_from,validUntil:m.valid_until,createdAt:m.created_at});
           receipt=validatedConflictAssessment(await extractor.arbitrateConflict(fact,currentFact,vaultId,
@@ -161,7 +163,7 @@ export async function scanForContradictions(vaultId:string,memoryIds:string[],ex
       }
 
       const prepared=await prepareVaultCrypto(current);
-      let retired=false;
+      const effects: WorkerEffect[] = [];
       await transaction(async client=>{
         await client.query('SELECT id FROM vaults WHERE id=$1 FOR NO KEY UPDATE',[vaultId]);
         // These helpers use only the pg query interface on the same advisory-lock
@@ -196,15 +198,16 @@ export async function scanForContradictions(vaultId:string,memoryIds:string[],ex
           }
           await client.query(`UPDATE memories SET status=$3,archived_at=now(),updated_at=now() WHERE vault_id=$1 AND id=$2`,
             [vaultId,removed,decision==='discard_new'?'contradicted':'superseded']);
-          retired=true;
+          effects.push(memoryCountEffect(vaultId,current.account_id,-1,'extraction_worker'));
         }
         // A is the first model input, B the second; log exact resulting revisions.
         await client.query(`INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,revision_b)
           SELECT $1,a.id,b.id,$4,$5,a.revision,b.revision FROM memories a,memories b
           WHERE a.vault_id=$1 AND b.vault_id=$1 AND a.id=$2 AND b.id=$3`,
           [vaultId,candidate.memory_id,current.memory_id,decision,candidate.similarity]);
+        await captureShadowWorkerEffects(client as PoolClient,effects);
       });
-      if(retired)publishCommittedWorkerEffects([{kind:'memory-count',vaultId,accountId:current.account_id,delta:-1,source:'extraction_worker'}]);
+      if(effects.length)publishCommittedWorkerEffects(effects);
       if(decision==='merge' || decision==='discard_new'){currentRetired=true;break;}
     }
     // Neither completion nor progress is valid for changed input. Retirement

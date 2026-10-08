@@ -8,7 +8,7 @@ import { prepareVaultCrypto, type PreparedVaultCrypto, isVaultEncryptionActive, 
 import { normaliseSubject, resolveCanonical } from './entity-resolver';
 import { ExtractorService, type ConflictResolution, type ConflictArbitrationContext, type ConflictAssessment, validatedConflictAssessment } from './extractor';
 import { reserveMemoryCreationInTransaction, type ApiQuotaReservation } from './usage';
-import { publishCommittedWorkerEffects, type WorkerEffect } from './worker-effects';
+import { memoryCountEffect, captureShadowWorkerEffects, publishCommittedWorkerEffects, type WorkerEffect } from './worker-effects';
 import { enqueueCurationWork } from './curation-work';
 import type { MemoryScope } from './memory-scope';
 import { mergeMemoryEvidence } from './memory-evidence';
@@ -165,6 +165,7 @@ export async function deduplicateMemory(input: DedupInput, extractor?: Extractor
     if (result.action !== 'skipped' && result.memoryId) await enqueueCurationWork(client, {
       vaultId: input.vaultId, workKey: 'dedup:' + crypto.randomUUID(), memoryIds: [result.memoryId], segmentId: input.sourceSegmentId
     });
+    await captureShadowWorkerEffects(client, effects);
     return result;
   });
   publishCommittedWorkerEffects(effects);
@@ -254,7 +255,7 @@ export async function deduplicateMemoryInTransaction(
   if (related && decision === 'supersede_old') {
     await db.query("UPDATE memories SET status='superseded',archived_at=now(),updated_at=now() WHERE id=$1 AND vault_id=$2", [related.id,input.vaultId]);
   }
-  if (related && decision === 'supersede_old') effects.push({kind:'memory-count',vaultId:input.vaultId,accountId:match.vault.account_id,delta:-1,source:'extraction_worker'});
+  if (related && decision === 'supersede_old') effects.push(memoryCountEffect(input.vaultId,match.vault.account_id,-1,'extraction_worker'));
   const reservation = await reserveMemoryCreationInTransaction(db,input.vaultId);
   const inserted = await insertMemory(db,match.vault,input,match.hash,match.canonicalSubject,preparedCrypto);
   const id = inserted.rows[0].id;
@@ -427,7 +428,7 @@ function recordSuccessfulInsert(
 ): void {
   effects.push(
     { kind: 'quota', reservation },
-    { kind: 'memory-count', vaultId, accountId, delta: 1, source: 'extraction_worker' }
+    memoryCountEffect(vaultId,accountId,1,'extraction_worker')
   );
 }
 

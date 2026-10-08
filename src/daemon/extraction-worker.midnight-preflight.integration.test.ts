@@ -34,7 +34,7 @@ describe.skipIf(!databaseUrl)('extraction batch midnight preflight (PostgreSQL 1
   const workerConnections = new Set<Client>();
   let pool: Pool | undefined;
   let db: typeof import('../db/client'), crypt: typeof import('../services/crypto');
-  let processBatch: typeof import('./extraction-worker').processBatch;
+  let processBatch: import('./extraction-execution').ExtractionExecution['processBatch'];
   let drain: typeof import('../services/contradiction-activation').drainDueContradictionActivations;
   let extractor: typeof import('../services/extractor').ExtractorService;
   let realConflict:ExtractorService['arbitrateConflict'];
@@ -73,7 +73,7 @@ describe.skipIf(!databaseUrl)('extraction batch midnight preflight (PostgreSQL 1
     extractor = (await import('../services/extractor')).ExtractorService;
     realConflict=extractor.prototype.arbitrateConflict;
     realBatch=extractor.prototype.arbitrateConflictsBatch;
-    ({ processBatch } = await import('./extraction-worker'));
+    ({ processBatch } = (await import('./extraction-execution')).createExtractionExecution());
     ({ drainDueContradictionActivations: drain } = await import('../services/contradiction-activation'));
     const server = (await db.query(`SELECT current_setting('server_version_num')::int AS version,
       current_setting('TimeZone') AS timezone, (statement_timestamp() AT TIME ZONE 'UTC')::date::text AS day`)).rows[0];

@@ -42,7 +42,7 @@ describe.skipIf(!url)('committed outcomes migration histories (production runner
     expect(await repair({vaultId:v})).toMatchObject({examined:2,scheduled:2,done:true});
     expect(await repair({vaultId:v})).toMatchObject({scheduled:0,done:true});
     expect((await pool.query('SELECT * FROM schema_migrations ORDER BY filename')).rows).toEqual(schema);
-    expect(schema.at(-1).filename).toBe(filename);
+    expect(schema.at(-1).filename).toBe('065_shadow_customer_metrics.sql');
     expect((await pool.query('SELECT id,decision,arbitration_job_key,send_attempt FROM contradiction_scan_log WHERE vault_id=$1 ORDER BY id',[v])).rows).toEqual(before);
     expect((await pool.query('SELECT * FROM memories WHERE vault_id=$1 ORDER BY id',[v])).rows).toEqual(memories);
     const insert=(key:string,decision='merge',owner=v)=>pool.query('INSERT INTO contradiction_scan_log(vault_id,memory_id_a,memory_id_b,decision,similarity,revision_a,dedup_input_key) VALUES($1,$2,NULL,$3,1,1,$4)',[owner,a,decision,key]);

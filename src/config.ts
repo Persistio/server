@@ -25,7 +25,7 @@ const configSchema = z.object({
   PLATFORM_OAUTH_ISSUER: z.string().default(''),
   PLATFORM_OAUTH_AUDIENCE: z.string().default(''),
   PLATFORM_OAUTH_CLIENT_POLICIES: z.string().default(''),
-  PERSISTIO_MODE: z.enum(['api', 'worker', 'combined', 'analytics-api']).default('combined'),
+  PERSISTIO_MODE: z.enum(['api', 'worker', 'combined', 'analytics-api', 'request-worker']).default('combined'),
   EMBEDDER_PROVIDER: z.enum(['openai', 'ollama', 'tei', 'vertex']).default('openai'),
   STORAGE_EMBEDDING_DIMENSIONS: z.coerce.number().int().positive().max(2000).default(1536),
   OPENAI_API_KEY: z.string().default(''),
@@ -55,6 +55,9 @@ const configSchema = z.object({
   CURATOR_API_KEY: z.string().default(''),
   CURATOR_MODEL: z.string().default('claude-sonnet-4-5'),
   CURATOR_PROMPT_FILE: z.string().default('prompts/curator.txt'),
+  CURATOR_REASONING_EFFORT: z.string().default(''),
+  CURATOR_REASONING_TOKEN_RESERVE: z.coerce.number().int().nonnegative().default(0),
+  CURATOR_MAX_GENERATION_TOKENS: z.coerce.number().int().positive().default(8192),
   PROMPTS_DIR: z.string().default('/prompts'),
   RAW_CHUNK_STORAGE_PROVIDER: z.enum(['local', 'azure_blob', 'gcs']).default('local'),
   RAW_CHUNK_LOCAL_DIR: z.string().default(RAW_CHUNK_LOCAL_DIR_DEFAULT),
@@ -93,6 +96,8 @@ const configSchema = z.object({
   USAGE_PERIOD_SWEEP_BATCH_SIZE: z.coerce.number().int().positive().default(100),
   RAW_CHUNK_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   RAW_CHUNK_RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(100),
+  TELEMETRY_SHADOW_ENABLED: booleanFlag,
+  CUSTOMER_METRICS_SHADOW_CAPTURE: booleanFlag,
   CUSTOMER_METRICS_PUBLISHER: z.enum(['noop', 'log', 'gcp_pubsub']).default('noop'),
   CUSTOMER_METRICS_GCP_PUBSUB_PROJECT_ID: z.string().default(''),
   CUSTOMER_METRICS_GCP_PUBSUB_TOPIC: z.string().default(''),
@@ -143,6 +148,7 @@ const configSchema = z.object({
   GCP_KMS_KEY_NAME: z.string().default('')
 }).superRefine((value, ctx) => {
   const isAnalyticsApi = value.PERSISTIO_MODE === 'analytics-api';
+  const isRequestWorker = value.PERSISTIO_MODE === 'request-worker';
 
   if (!isAnalyticsApi && !value.DATABASE_URL) {
     ctx.addIssue({
@@ -152,10 +158,10 @@ const configSchema = z.object({
     });
   }
 
-  if (!isAnalyticsApi && !value.ADMIN_API_KEY) {
+  if (!isAnalyticsApi && !isRequestWorker && !value.ADMIN_API_KEY) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'ADMIN_API_KEY is required unless PERSISTIO_MODE=analytics-api',
+      message: 'ADMIN_API_KEY is required unless PERSISTIO_MODE is analytics-api or request-worker',
       path: ['ADMIN_API_KEY']
     });
   }
@@ -184,9 +190,9 @@ const configSchema = z.object({
     value.PLATFORM_OAUTH_AUDIENCE ||
     value.PLATFORM_OAUTH_CLIENT_POLICIES
   );
-  const shouldRequirePlatformOAuthConfig = value.PLATFORM_AUTH_MODE === 'oauth' ||
+  const shouldRequirePlatformOAuthConfig = !isRequestWorker && (value.PLATFORM_AUTH_MODE === 'oauth' ||
     (value.PLATFORM_AUTH_MODE === 'dual' && platformOAuthConfigPresent) ||
-    isAnalyticsApi;
+    isAnalyticsApi);
 
   if (isAnalyticsApi && value.PLATFORM_AUTH_MODE === 'api_key') {
     ctx.addIssue({
@@ -307,7 +313,7 @@ const configSchema = z.object({
   validateOptionalHttpUrl(ctx, value.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT');
   validateOptionalHttpUrl(ctx, value.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, 'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT');
 
-  const shouldValidateEventPublisher = value.PERSISTIO_MODE === 'combined' || value.PERSISTIO_MODE === 'worker';
+  const shouldValidateEventPublisher = value.PERSISTIO_MODE === 'combined' || value.PERSISTIO_MODE === 'worker' || isRequestWorker;
 
   if (shouldValidateEventPublisher && value.EVENT_PUBLISHER === 'webhook') {
     if (!value.PLATFORM_EVENTS_WEBHOOK_URL) {

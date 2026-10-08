@@ -12,7 +12,7 @@ vi.mock('../../db/client', () => ({
   withTransaction: async (callback: (client: { query: typeof queryMock }) => Promise<unknown>) => callback({ query: queryMock })
 }));
 
-vi.mock('../customer-metrics', () => ({
+vi.mock('../customer-metrics', async original => ({...await original<typeof import('../customer-metrics')>(),
   recordCustomerMetric: recordCustomerMetricMock
 }));
 
@@ -115,6 +115,7 @@ describe('usage service', () => {
         10
       ]);
       expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         event_type: 'quota_delta',
         memory_adds_delta: 1,
         operation: 'memory_adds',
@@ -165,6 +166,7 @@ describe('usage service', () => {
       expect(queryMock.mock.calls[3]?.[0]).toContain('AND period = $2');
       expect(queryMock.mock.calls[3]?.[1]).toEqual(['vault-1', reservation.period]);
       expect(recordCustomerMetricMock).toHaveBeenNthCalledWith(1, {
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         event_type: 'quota_delta',
         ingest_events_delta: 1,
         operation: 'ingest_events',
@@ -173,6 +175,7 @@ describe('usage service', () => {
         workspace_id: 'account-1'
       });
       expect(recordCustomerMetricMock).toHaveBeenNthCalledWith(2, {
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         event_type: 'quota_delta',
         ingest_events_delta: -1,
         operation: 'ingest_events',
@@ -275,6 +278,7 @@ describe('usage service', () => {
         4
       ]);
       expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         event_type: 'quota_delta',
         operation: 'searches',
         searches_delta: 1,
@@ -373,6 +377,7 @@ describe('usage service', () => {
 
       expect(queryMock).not.toHaveBeenCalled();
       expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         event_type: 'quota_delta',
         memory_count_delta: -1,
         operation: 'memory_count',
@@ -413,6 +418,7 @@ describe('usage service', () => {
         0
       ]);
       expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         event_type: 'quota_delta',
         memory_adds_delta: 1,
         operation: 'memory_adds',
@@ -457,6 +463,7 @@ describe('usage service', () => {
         125
       ]);
       expect(recordCustomerMetricMock).toHaveBeenCalledWith({
+        contract_version:1,event_id:expect.any(String),event_ts:expect.any(String),event_date:expect.any(String),
         completion_tokens: 25,
         event_type: 'model_usage',
         model: 'gemini-2.5-flash',

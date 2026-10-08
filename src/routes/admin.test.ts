@@ -19,7 +19,7 @@ vi.mock('../services/raw-chunk-storage', () => ({
   })
 }));
 
-vi.mock('../services/customer-metrics', () => ({
+vi.mock('../services/customer-metrics', async original => ({...await original<typeof import('../services/customer-metrics')>(),
   recordCustomerMetric: recordCustomerMetricMock
 }));
 
@@ -591,7 +591,7 @@ describe('admin vault updates', () => {
   it('updates plan limits through PATCH /admin/plans/:id', async () => {
     queryMock.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ id: 'unlimited', limits: { memories_max: 2000000 } }]
+      rows: [{ id: 'unlimited', limits: { memories_max: 2000000, searches_per_month: 5000000 } }]
     });
 
     const app = await buildApp();
@@ -603,9 +603,12 @@ describe('admin vault updates', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ id: 'unlimited', limits: { memories_max: 2000000 } });
+    expect(response.json()).toEqual({
+      id: 'unlimited',
+      limits: { memories_max: 2000000, searches_per_month: 5000000 }
+    });
     expect(queryMock).toHaveBeenCalledWith(
-      expect.stringContaining('UPDATE plans'),
+      expect.stringContaining('SET limits = limits || $2::jsonb'),
       ['unlimited', JSON.stringify({ memories_max: 2000000 })]
     );
 

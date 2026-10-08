@@ -10,12 +10,12 @@
     "app/packages/*"
   ],
   "devDependencies": {
-    "@grpc/grpc-js": "1.14.4",
+    "@grpc/grpc-js": "1.14.5",
     "@grpc/proto-loader": "0.8.1",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
     "google-proto-files": "5.0.3",
-    "sharp": "0.35.4",
+    "sharp": "0.35.5",
     "wrangler": "^4.130.0",
     "yaml": "2.9.0"
   },
@@ -36,12 +36,13 @@
     },
     "@opentelemetry/sdk-node": {
       "protobufjs": "7.6.6"
-    }
+    },
+    "undici@7.29.0": "7.29.1"
   },
   "scripts": {
     "check:prompts": "node scripts/check-prompts.mjs",
     "test:prompts": "node --test scripts/lib/prompt-manifest.test.mjs eval/restoration/*.test.mjs",
-    "audit:ci": "node ./scripts/npm-audit-high-critical.mjs",
+    "audit:ci": "node --test scripts/lib/npm-audit-high-critical.test.mjs && node ./scripts/npm-audit-high-critical.mjs",
     "audit:memory-observability": "node ./scripts/audit-memory-observability.mjs",
     "test:memory-alerts": "node --test ./scripts/lib/memory-security-alerts.test.mjs",
     "test:memory-rollout": "node --test ./scripts/lib/memory-collector.test.mjs ./scripts/lib/memory-exporter.test.mjs ./scripts/lib/memory-sdk.test.mjs ./scripts/lib/memory-promql.test.mjs",

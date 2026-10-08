@@ -9,7 +9,8 @@ const { recordCustomerMetricMock } = vi.hoisted(() => ({
   recordCustomerMetricMock: vi.fn()
 }));
 
-vi.mock('./customer-metrics', () => ({
+vi.mock('./customer-metrics', async original => ({
+  ...await original<typeof import('./customer-metrics')>(),
   recordCustomerMetric: recordCustomerMetricMock
 }));
 

@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { queryMock, recordMemoryCountDeltaMock, config } = vi.hoisted(() => ({
-  queryMock: vi.fn(), recordMemoryCountDeltaMock: vi.fn(), config: { MEMORY_ARCHIVE_TTL_DAYS: 0 }
+const { queryMock, recordCustomerMetricMock, config } = vi.hoisted(() => ({
+  queryMock: vi.fn(), recordCustomerMetricMock: vi.fn(), config: { MEMORY_ARCHIVE_TTL_DAYS: 0 }
 }));
 vi.mock('../config', () => ({ getConfig: () => config }));
 vi.mock('../db/client', () => ({ query: queryMock, withTransaction: (fn:Function) => fn({query:queryMock}) }));
-vi.mock('./usage', () => ({ recordMemoryCountDelta: recordMemoryCountDeltaMock }));
+vi.mock('./customer-metrics', async original => ({...await original<typeof import('./customer-metrics')>(), recordCustomerMetric:recordCustomerMetricMock}));
 import { archiveStaleMemories } from './staleness';
 
 describe('opt-in inactivity retention', () => {
@@ -18,7 +18,7 @@ describe('opt-in inactivity retention', () => {
   it('performs no ageing or confidence mutations by default', async () => {
     await archiveStaleMemories();
     expect(queryMock).not.toHaveBeenCalled();
-    expect(recordMemoryCountDeltaMock).not.toHaveBeenCalled();
+    expect(recordCustomerMetricMock).not.toHaveBeenCalled();
   });
 
   it('archives only under explicit TTL, without treating valid_until as deletion', async () => {
@@ -33,6 +33,6 @@ describe('opt-in inactivity retention', () => {
     expect(sql).toContain('GREATEST(');
     expect(sql).toContain('last_recalled, updated_at, created_at');
     expect(sql).not.toMatch(/valid_until|confidence|needs_review|last_decayed_at/);
-    expect(recordMemoryCountDeltaMock).toHaveBeenCalledExactlyOnceWith('v1', 'a1', -2, 'extraction_worker');
+    expect(recordCustomerMetricMock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({vault_id:'v1',workspace_id:'a1',memory_count_delta:-2,source:'extraction_worker'}));
   });
 });

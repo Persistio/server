@@ -8,11 +8,13 @@ import { z } from 'zod';
 
 import { getConfig } from '../config';
 import { CircuitBreakerOpenError, ServiceCircuitBreaker, isAuthFailureError } from './ai-resilience';
+import { checkpointExecutionState } from '../request-worker/state';
 import { PromptLoader } from './prompt-loader';
 import { acquireAiBudget, recordModelUsage, settleAiUsage } from './usage';
 import { CURATOR_CONTRACT, CURATOR_SCHEMA_VERSION, CURATOR_PROMPT_VERSION, curatorResultSchema, nonBehavioralCuratorResultSchema, validateCuratorContract, type CuratorResult, type CuratorRawSource } from './curator-contract';
 import { sourceHasHumanIntent } from './extraction-contract';
-import { completeModelRequest, modelResponseFormat, serializeModelRequest } from './model-completion';
+import { completeModelRequest, modelResponseFormat, normalizeModelUsage, serializeModelRequest,
+  type NormalizedModelUsage } from './model-completion';
 import { ModelOutputContractError } from './model-output-error';
 import { MIN_CURATOR_INPUT_TOKENS } from './curator-limits';
 export { CURATOR_SCHEMA_VERSION, CURATOR_PROMPT_VERSION, type CuratorResult } from './curator-contract';
@@ -59,11 +61,7 @@ export interface CuratorAliasMaps {
   idToAlias: Map<string, string>;
 }
 
-export interface CuratorUsage {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-}
+export type CuratorUsage = NormalizedModelUsage;
 
 export interface CuratorAttemptAccounting {
   beforeRequest(): Promise<void>;
@@ -78,6 +76,7 @@ const CURATOR_SYSTEM_OVERHEAD_CHARS = 1000;
 const MIN_CURATOR_SYSTEM_PROMPT_CHARS = 2000;
 const MIN_CURATOR_USER_CONTENT_CHARS = 4000;
 const TARGET_CURATOR_USER_CONTENT_CHARS = 12000;
+const CONSERVATIVE_JSON_BYTES_PER_TOKEN = 2;
 
 export interface CuratorValidationAudit {
   model: string;
@@ -113,6 +112,16 @@ export interface PreparedCuratorBatch {
   request: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
   requestHash: string;
   rawSources: CuratorRawSource[];
+}
+
+export function minimumCuratorPlanTokens(candidateCount: number): number {
+  if (!Number.isSafeInteger(candidateCount) || candidateCount < 0) throw new Error('Invalid curator candidate count');
+  const minimumPlan = {
+    schema_version: CURATOR_SCHEMA_VERSION,
+    keep: Array.from({ length: candidateCount }, (_, index) => ({ id: `M${index + 1}`, reason: 'unchanged' })),
+    update: [], consolidate: [], archive: [], edges: [], scope_changes: []
+  };
+  return Math.ceil(Buffer.byteLength(JSON.stringify(minimumPlan), 'utf8') / CONSERVATIVE_JSON_BYTES_PER_TOKEN);
 }
 
 type CuratorOptions = { now?: Date; rawSources?: CuratorRawSource[]; maxInputTokens?: number; maxOutputTokens?: number; vaultPromptContext?: VaultPromptContext | null };
@@ -238,17 +247,23 @@ export class CuratorService {
       throw new CuratorPreparationDeferredError(`Curator input budget must be at least ${MIN_CURATOR_INPUT_TOKENS} whole tokens`);
     }
     const maxPromptChars = inputTokens * 4;
+    const config = getConfig();
+    const configuredOutputTokens = options.maxOutputTokens ?? config.CURATOR_MAX_GENERATION_TOKENS;
+    const maxOutputTokens = Math.min(configuredOutputTokens, config.CURATOR_MAX_GENERATION_TOKENS);
     if (!Number.isFinite(maxPromptChars) || maxPromptChars <= 0
-      || (options.maxOutputTokens !== undefined && (!Number.isFinite(options.maxOutputTokens) || options.maxOutputTokens <= 0))) {
+      || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
       throw new CuratorPreparationDeferredError('Invalid curator request capacity');
+    }
+    const visibleOutputTokens = maxOutputTokens - config.CURATOR_REASONING_TOKEN_RESERVE;
+    if (visibleOutputTokens < minimumCuratorPlanTokens(0)) {
+      throw new CuratorPreparationDeferredError('Curator output budget cannot fit a minimum valid plan after the reasoning reserve');
     }
     // Capture prefixes once. Measure the SDK's actual wire serialization,
     // including the static schema and native provider request envelope.
-    const config = getConfig();
     const prefix = config.LLM_SYSTEM_PROMPT_PREFIX.trim();
-    const reasoningEffort = config.LLM_REASONING_EFFORT.trim();
+    const reasoningEffort = config.CURATOR_REASONING_EFFORT.trim();
     const emptyRequest: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
-      model: this.model, temperature: 0, response_format: curatorResponseFormat, max_tokens: options.maxOutputTokens,
+      model: this.model, temperature: 0, response_format: curatorResponseFormat, max_tokens: maxOutputTokens,
       messages: [{ role: 'system', content: '' }, { role: 'user', content: [{ type: 'text', text: '' }] }]
     };
     const fixedRequestChars = serializeModelRequest(withSystemPromptPrefix(emptyRequest, prefix, reasoningEffort), this.baseURL).length;
@@ -277,13 +292,12 @@ export class CuratorService {
           { type: 'text', text: formatMemories('Reviewed active context', active, aliasMaps) },
           { type: 'text', text: JSON.stringify({sources:rawSources.map((s,i) => ({ref:`S${i+1}`,transport_role:s.role,human_intent_source:sourceHasHumanIntent(s),content:s.content,provenance:s.provenance,observed_at:s.created_at,available_scope_bindings:s.context}))}) }
         ] }
-      ], max_tokens: options.maxOutputTokens, response_format: responseFormat }, prefix, reasoningEffort);
+      ], max_tokens: maxOutputTokens, response_format: responseFormat }, prefix, reasoningEffort);
       return { candidates: selected, activeMemories: active, aliasMaps, request, rawSources };
     };
     const fits = (batch: ReturnType<typeof build>) => serializeModelRequest(batch.request, this.baseURL).length
       <= maxPromptChars - CURATOR_SYSTEM_OVERHEAD_CHARS;
-    const outputFits = (count: number) => options.maxOutputTokens === undefined
-      || options.maxOutputTokens >= 64 + count * 24; // Minimum disposition envelope, not an output guarantee.
+    const outputFits = (count: number) => visibleOutputTokens >= minimumCuratorPlanTokens(count);
     let selected: CuratorMemory[] = [];
     for (const candidate of candidates) {
       const trial = [...selected, candidate];
@@ -315,16 +329,20 @@ export class CuratorService {
     const { candidates, activeMemories, aliasMaps } = batch;
     const response = await this.createChatCompletion(batch.request, vaultId, accounting);
 
-    const usage = response.usage;
+    const usage = response.usage ? normalizeModelUsage(response.usage) : null;
     if (usage) {
       operationalLog.log(JSON.stringify({
         level: 30,
         msg: 'curator token usage',
         model: this.model,
         model_role: 'curation',
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
+        prompt_tokens: usage.promptTokens,
+        completion_tokens: usage.visibleCompletionTokens,
+        visible_completion_tokens: usage.visibleCompletionTokens,
+        reasoning_tokens: usage.reasoningTokens,
+        output_tokens: usage.outputTokens,
+        total_tokens: usage.totalTokens,
+        reasoning_token_source: usage.reasoningTokenSource,
         candidates_count: candidates.length,
         active_memories_count: activeMemories.length
       }));
@@ -407,13 +425,7 @@ export class CuratorService {
       result,
       graph,
       aliasMaps,
-      usage: usage
-        ? {
-          promptTokens: usage.prompt_tokens,
-          completionTokens: usage.completion_tokens,
-          totalTokens: usage.total_tokens
-        }
-        : null,
+      usage,
       rawResponse,
       audit: {
         model: this.model,
@@ -443,11 +455,11 @@ export class CuratorService {
 
       await accounting?.beforeRequest();
       const response = await completeModelRequest(this.client, requestInput, this.baseURL);
-      if (response.usage) await accounting?.returnedUsage({promptTokens:response.usage.prompt_tokens,
-        completionTokens:response.usage.completion_tokens,totalTokens:response.usage.total_tokens});
-      if (vaultId && response.usage?.total_tokens) {
+      const normalizedUsage = response.usage ? normalizeModelUsage(response.usage) : null;
+      if (normalizedUsage) await accounting?.returnedUsage(normalizedUsage);
+      if (vaultId && normalizedUsage?.totalTokens) {
         try {
-          await settleAiUsage(vaultId, 'curation', estimatedTokens, response.usage.total_tokens);
+          await settleAiUsage(vaultId, 'curation', estimatedTokens, normalizedUsage.totalTokens);
         } catch (error) {
           operationalLog.warn(JSON.stringify({
             level: 40,
@@ -465,9 +477,9 @@ export class CuratorService {
             modelRole: 'curation',
             source: 'curation_worker',
             requestCount: 1,
-            promptTokens: response.usage.prompt_tokens,
-            completionTokens: response.usage.completion_tokens,
-            totalTokens: response.usage.total_tokens
+            promptTokens: normalizedUsage.promptTokens,
+            completionTokens: normalizedUsage.visibleCompletionTokens,
+            totalTokens: normalizedUsage.totalTokens
           });
         } catch (error) {
           operationalLog.warn(JSON.stringify({
@@ -482,9 +494,11 @@ export class CuratorService {
         }
       }
       CuratorService.circuitBreaker.onSuccess();
+      await checkpointExecutionState();
       return response;
     } catch (error) {
       const breakerResult = CuratorService.circuitBreaker.onFailure(error);
+      await checkpointExecutionState();
       if (breakerResult.opened && isAuthFailureError(error)) {
         operationalLog.warn(JSON.stringify({
           level: 40,

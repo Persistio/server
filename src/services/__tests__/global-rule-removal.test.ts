@@ -11,7 +11,7 @@ describe('global-rule feature removal',()=>{
     for(const name of ['global-arbitration','curator-global-arbitration']) {
       expect(existsSync(fileURLToPath(new URL(`packages/server/src/services/${name}.ts`,root)))).toBe(false);
     }
-    for(const path of ['services/extractor.ts','daemon/extraction-worker.ts','daemon/curation-worker.ts','config.ts']) {
+    for(const path of ['services/extractor.ts','daemon/extraction-worker.ts','daemon/curation-worker.ts','daemon/extraction-execution.ts','daemon/curation-execution.ts','config.ts']) {
       expect(read('packages/server/src/'+path)).not.toMatch(/arbitrateGlobal|arbitrateCuratorGlobals|GLOBAL_ARBITRATION_|global_arbitration/);
     }
   });

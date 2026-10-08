@@ -1,3 +1,4 @@
+import { executionApplicationName, executionDatabaseOptions, guardExecutionClient, assertExecutionLive } from '../request-worker/context';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('contradiction-activation');
 import { Client } from 'pg';
@@ -23,8 +24,11 @@ interface ScheduledMemory {
   scan_memory_id: string | null;
 }
 
-/** Only the periodic extraction loop calls this. Manual jobs cannot reset its budget. */
-export async function drainDueContradictionActivations(extractor: ExtractorService): Promise<void> {
+/** Periodic or bounded request execution; manual jobs cannot reset its budget. */
+export async function drainDueContradictionActivations(extractor: ExtractorService, options: { maxVaults?: number; admitArbitration?: () => Promise<boolean> } = {}): Promise<void> {
+  const maxVaults = options.maxVaults ?? MAX_VAULTS_PER_TICK;
+  if (!Number.isSafeInteger(maxVaults) || maxVaults < 1 || maxVaults > MAX_VAULTS_PER_TICK) throw new Error('Invalid activation bound');
+  assertExecutionLive();
   const config = getConfig();
   if (!config.CONTRADICTION_SCAN_ENABLED || config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH <= 0) return;
 
@@ -32,9 +36,11 @@ export async function drainDueContradictionActivations(extractor: ExtractorServi
   // its only connection during a model call when DB_POOL_MAX is one.
   const client = new Client({
     connectionString: config.DATABASE_URL,
-    application_name: 'persistio:contradiction-activation',
-    connectionTimeoutMillis: config.DB_POOL_CONNECTION_TIMEOUT_MS
+    application_name: executionApplicationName('persistio:contradiction-activation'),
+    connectionTimeoutMillis: config.DB_POOL_CONNECTION_TIMEOUT_MS,
+    ...executionDatabaseOptions()
   });
+  guardExecutionClient(client);
   // A server-side disconnect can arrive while the model is running and no query
   // is active. Handle pg's error event without replacing the failed connection;
   // every subsequent read/write must fail on this same lock-owning client.
@@ -49,7 +55,7 @@ export async function drainDueContradictionActivations(extractor: ExtractorServi
       `SELECT vault_id, revision::text FROM memory_contradiction_pending_vaults
        WHERE pending_count > 0 AND next_visit_at <= now()
        ORDER BY next_visit_at, vault_id LIMIT $1`,
-      [MAX_VAULTS_PER_TICK]
+      [maxVaults]
     );
     for (const { vault_id: vaultId, revision } of vaults.rows) {
       if (budget.remaining <= 0) break;
@@ -87,6 +93,7 @@ export async function drainDueContradictionActivations(extractor: ExtractorServi
               : undefined;
             const result = await scanForContradictions(vaultId, [memory.memory_id], extractor, {
               client, budget, maxArbitrations: 1, now: memory.reference_now,
+              admitArbitration: options.admitArbitration,
               cursors: cursor ? { [memory.memory_id]: cursor } : undefined
             });
             const activation = result.reactivations?.[memory.memory_id];

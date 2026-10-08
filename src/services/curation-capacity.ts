@@ -134,7 +134,7 @@ const unlimitedCuratorLimits: CuratorPlanLimits = {
   curator_candidates_per_call: 20,
   curator_active_memories_per_call: 80,
   curator_input_tokens_per_call: MIN_CURATOR_INPUT_TOKENS,
-  curator_output_tokens_per_call: 2000,
+  curator_output_tokens_per_call: 8192,
   curator_tokens_per_month: 25000000,
   curator_requests_per_month: 6000,
   curator_max_queue_age_hours: 24,
@@ -343,7 +343,7 @@ export async function recordCuratorUsage(input: {
   candidatesProcessed: number;
   countRun?: boolean;
   promptTokens: number;
-  completionTokens: number;
+  outputTokens: number;
   limits: CuratorPlanLimits;
   actionReceipt?: { queueId: string; actionKey: string };
 }): Promise<boolean> {
@@ -355,7 +355,7 @@ export async function recordCuratorUsageInTransaction(client: PoolClient, input:
   candidatesProcessed: number;
   countRun?: boolean;
   promptTokens: number;
-  completionTokens: number;
+  outputTokens: number;
   limits: CuratorPlanLimits;
   actionReceipt?: { queueId: string; actionKey: string };
   /** Provider attempts, returned token usage and committed work are separate receipts. */
@@ -395,7 +395,7 @@ export async function recordCuratorUsageInTransaction(client: PoolClient, input:
            curator_candidates_processed = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_processed + EXCLUDED.curator_candidates_processed ELSE EXCLUDED.curator_candidates_processed END,
            curator_candidates_deferred = CASE WHEN vault_usage.period = EXCLUDED.period THEN vault_usage.curator_candidates_deferred ELSE 0 END,
            updated_at = now()`,
-      [input.vaultId, period, curatorRuns, input.promptTokens, input.completionTokens, input.candidatesProcessed,input.requestCount ?? 1]
+      [input.vaultId, period, curatorRuns, input.promptTokens, input.outputTokens, input.candidatesProcessed,input.requestCount ?? 1]
   );
   if (curatorRuns > 0) {
     await client.query(

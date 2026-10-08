@@ -197,7 +197,7 @@ describe('curation capacity service', () => {
       candidatesProcessed: 3,
       countRun: false,
       promptTokens: 100,
-      completionTokens: 25,
+      outputTokens: 25,
       limits: mergeCuratorLimits('unlimited', null, null)
     });
 
@@ -227,7 +227,7 @@ describe('curation capacity service', () => {
       candidatesProcessed: 3,
       countRun: false,
       promptTokens: 100,
-      completionTokens: 25,
+      outputTokens: 25,
       limits: mergeCuratorLimits('unlimited', null, null),
       actionReceipt: { queueId: 'b3313205-c43a-48b7-b861-3679e9849928', actionKey: 'apply-actions' }
     };
@@ -275,7 +275,7 @@ describe('curation capacity service', () => {
       candidatesProcessed: 3,
       countRun: false,
       promptTokens: 100,
-      completionTokens: 25,
+      outputTokens: 25,
       limits: mergeCuratorLimits('unlimited', null, null)
     });
 

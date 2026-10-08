@@ -20,6 +20,8 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     dedup = await import('../dedup'); crypt = await import('../crypto');
   });
   afterEach(async () => {
+    (await import('../../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE = false;
+    await pool.query("DELETE FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=ANY($1::text[])",[vaults]);
     await cleanFixtureSources();
     vi.restoreAllMocks(); events.metric.mockReset();
     await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])', [vaults]); vaults.length = 0;
@@ -89,7 +91,8 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     expect((await pool.query('SELECT 1 FROM memories WHERE vault_id=$1', [input.vaultId])).rowCount).toBe(0);
     expect(deltas()).toEqual([]);
   });
-  it('does not guess events or refund when COMMIT acknowledgement is lost', async () => {
+  it('retains durable shadow evidence without guessing legacy events after unknown COMMIT and replay', async () => {
+    (await import('../../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE = true;
     const { input } = await fixture();
     const transaction = db.withTransaction;
     vi.spyOn(db, 'withTransaction').mockImplementationOnce(async work => {
@@ -100,6 +103,24 @@ describe.skipIf(!databaseUrl)('dedup commit-owned effects (PostgreSQL)', () => {
     expect(await usage(input.vaultId)).toBe(1);
     expect((await pool.query('SELECT 1 FROM memories WHERE vault_id=$1', [input.vaultId])).rowCount).toBe(1);
     expect(deltas()).toEqual([]);
+    const first=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[input.vaultId])).rows;
+    expect(first).toHaveLength(2);
+    await dedup.deduplicateMemory(input);
+    const replay=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[input.vaultId])).rows;
+    expect(replay).toEqual(first);
+    expect(await usage(input.vaultId)).toBe(1);
+  });
+  it('matches committed legacy quota/capacity fields while keeping a failed publisher outside business control', async () => {
+    (await import('../../config')).getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE = true;
+    const { input } = await fixture();
+    await dedup.deduplicateMemory(input);
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[input.vaultId])).rows.map(row=>row.payload);
+    expect(shadow).toHaveLength(2);
+    for(const legacy of deltas()) expect(shadow).toContainEqual(legacy);
+    input.fact='Another durable independently accepted statement.';input.embedding=[0,1,...vector.slice(2)];
+    events.metric.mockImplementation(()=>{throw new Error('publisher unavailable');});
+    await expect(dedup.deduplicateMemory(input)).resolves.toMatchObject({action:'inserted'});
+    expect((await pool.query("SELECT 1 FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[input.vaultId])).rowCount).toBe(4);
   });
   it('preflights arbitration without locks and safely refuses a decision for a changed input', async () => {
     const { input } = await fixture(); input.type = 'user_preference';

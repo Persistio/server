@@ -1,3 +1,4 @@
+import { assertExecutionLive, executionApplicationName, executionDatabaseOptions, guardExecutionClient } from '../request-worker/context';
 import { createOperationalLogger } from '../operational-metadata';
 import { safeErrorCode } from '../operational-metadata';
 const operationalLog=createOperationalLogger('client');
@@ -54,6 +55,7 @@ export function createPgvectorVerifyHook(
   isEnabled = () => pgvectorTypeRegistrationEnabled
 ): (client: PoolClient, callback: (error?: Error) => void) => void {
   return (client, callback) => {
+    try { assertExecutionLive(); guardExecutionClient(client); } catch (error) { callback(toError(error)); return; }
     if (!isEnabled() || registeredPgvectorClients.has(client)) {
       callback();
       return;
@@ -67,9 +69,10 @@ export function createPgvectorVerifyHook(
 
 export const pool = new Pool({
   connectionString: config.DATABASE_URL,
-  application_name: databaseApplicationName(config.PERSISTIO_MODE),
+  application_name: executionApplicationName(databaseApplicationName(config.PERSISTIO_MODE)),
   connectionTimeoutMillis: config.DB_POOL_CONNECTION_TIMEOUT_MS,
   max: getConfiguredPoolMax(config),
+  ...executionDatabaseOptions(),
   verify: createPgvectorVerifyHook()
 } as PoolConfigWithVerify);
 
@@ -93,11 +96,13 @@ export function createPoolErrorHandler(
 pool.on('error', createPoolErrorHandler(pool));
 
 export async function query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]) {
+  assertExecutionLive();
   warnIfPoolNearExhaustion();
   return pool.query<T>(text, values);
 }
 
 export async function withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+  assertExecutionLive();
   warnIfPoolNearExhaustion();
   const client = await pool.connect();
 
@@ -105,6 +110,7 @@ export async function withTransaction<T>(callback: (client: PoolClient) => Promi
     await client.query('BEGIN');
     try {
       const result = await callback(client);
+      assertExecutionLive();
       await client.query('COMMIT');
       return result;
     } catch (error) {
@@ -197,6 +203,17 @@ export async function runMigrations() {
 
 export async function closePool() {
   await pool.end();
+}
+
+/** Read-only startup for request execution against an already migrated database. */
+export async function prepareExistingDatabase(): Promise<void> {
+  assertExecutionLive();
+  pgvectorTypeRegistrationEnabled = true;
+  const client = await pool.connect();
+  try {
+    await registerPgvectorTypes(client);
+    await validateStorageEmbeddingDimensions(client);
+  } finally { client.release(); }
 }
 
 export function getConfiguredPoolMax(appConfig = config): number {

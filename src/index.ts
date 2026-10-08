@@ -18,7 +18,7 @@ import { registerPlatformOAuth } from './oauth';
 import { registerAnalyticsRoutes } from './routes/analytics';
 import { registerHealthRoutes } from './routes/health';
 import { initCryptoClient } from './services/crypto';
-import { recordCustomerApiRequestMetric } from './services/customer-api-request-metrics';
+import { recordCustomerApiRequestObservation } from './services/customer-api-request-metrics';
 import { initCustomerMetrics, shutdownCustomerMetrics } from './services/customer-metrics';
 import { getSpanAttributes } from './telemetry';
 
@@ -75,6 +75,10 @@ class InMemoryJobStore implements JobStore {
 
 async function main() {
   const config = getConfig();
+  if (config.PERSISTIO_MODE === 'request-worker') {
+    await (await import('./request-worker/main')).startRequestWorker();
+    return;
+  }
   const isAnalyticsApi = config.PERSISTIO_MODE === 'analytics-api';
   const shouldStartWorker = config.PERSISTIO_MODE === 'combined' || config.PERSISTIO_MODE === 'worker';
   const shouldStartCurationWorker = shouldStartWorker && config.CURATOR_AUTO_RUN;
@@ -115,7 +119,7 @@ async function main() {
       route,
       status_code: String(reply.statusCode)
     });
-    recordCustomerApiRequestMetric(request, reply);
+    await recordCustomerApiRequestObservation(request, reply);
   });
 
   registerPlatformErrorHandler(app);

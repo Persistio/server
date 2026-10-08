@@ -1,6 +1,4 @@
-export const EXTRACTION_QUEUE_READY_PREDICATE = `(eq.claim_token IS NULL OR eq.lease_expires_at <= now())
-           AND eq.available_at <= now()
-           AND (
+export const EXTRACTION_QUEUE_BLOB_READY_PREDICATE = `(
              (
                eq.segment_id IS NOT NULL
                AND EXISTS (
@@ -26,3 +24,7 @@ export const EXTRACTION_QUEUE_READY_PREDICATE = `(eq.claim_token IS NULL OR eq.l
                )
              )
            )`;
+
+export const EXTRACTION_QUEUE_READY_PREDICATE = `(eq.claim_token IS NULL OR eq.lease_expires_at <= now())
+           AND eq.available_at <= now()
+           AND ${EXTRACTION_QUEUE_BLOB_READY_PREDICATE}`;

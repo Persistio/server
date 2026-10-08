@@ -1,4 +1,6 @@
 import { getConfig } from '../config';
+import { z } from 'zod';
+import { registerExecutionState } from '../request-worker/state';
 
 export class CircuitBreakerOpenError extends Error {
   readonly statusCode = 503;
@@ -54,6 +56,15 @@ export class ServiceCircuitBreaker {
       nextProbeAt: null,
       state: 'closed'
     };
+    registerExecutionState('circuit:' + service, value => {
+      Object.assign(this.state, z.object({
+        consecutiveFailures: z.number().int().nonnegative(), currentProbeIntervalMs: z.number().int().positive(),
+        halfOpenProbeInFlight: z.boolean(), nextProbeAt: z.number().finite().nullable(),
+        state: z.enum(['closed', 'open'])
+      }).strict().parse(value));
+    }, () => this.state.state === 'half-open'
+      ? { ...this.state, state: 'open', halfOpenProbeInFlight: false, nextProbeAt: Date.now() + this.state.currentProbeIntervalMs }
+      : { ...this.state });
   }
 
   beforeRequest(now = Date.now()) {

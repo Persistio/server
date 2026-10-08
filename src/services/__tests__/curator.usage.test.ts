@@ -6,6 +6,7 @@ vi.mock('../usage',()=>({acquireAiBudget:mocks.acquire,recordModelUsage:mocks.re
 import {CuratorService,CURATOR_PROMPT_VERSION,type CuratorMemory} from '../curator';
 import {CURATOR_CONTRACT,type CuratorResult} from '../curator-contract';
 import {serializeModelRequest} from '../model-completion';
+import {getConfig} from '../../config';
 const memory=(id='target'):CuratorMemory=>({id,subject:'Service database',data:'The service uses PostgreSQL.',type:'system_fact',
   scope:'session',scope_key:'s1',salience:0.8,confidence:0.9,sensitivity:'low',polarity:'neutral',volatility:'low',parent_id:null});
 const plan=(count=1):CuratorResult=>({schema_version:'curation-plan.v2',keep:Array.from({length:count},(_,i)=>({id:'M'+(i+1),reason:'Already useful'})),
@@ -30,7 +31,18 @@ describe('Curator model contract and paid-attempt accounting',()=>{
     mocks.create.mockImplementation(async()=>{order.push('provider');return response({wrong:true});});
     const service=new CuratorService();
     await expect(service.curatePrepared(service.prepare([memory()],[],null),'vault-1',accounting)).rejects.toThrow('validation');
-    expect(order).toEqual(['request','provider','usage']);expect(accounting.returnedUsage).toHaveBeenCalledWith({promptTokens:120,completionTokens:30,totalTokens:150});
+    expect(order).toEqual(['request','provider','usage']);expect(accounting.returnedUsage).toHaveBeenCalledWith({
+      promptTokens:120,visibleCompletionTokens:30,reasoningTokens:0,outputTokens:30,totalTokens:150,reasoningTokenSource:'unavailable'
+    });
+  });
+  it('accounts hidden reasoning in output quota while retaining visible completion analytics',async()=>{
+    mocks.create.mockResolvedValue({usage:{prompt_tokens:120,completion_tokens:30,total_tokens:1174},choices:response().choices});
+    const accounting={beforeRequest:vi.fn(),returnedUsage:vi.fn()},service=new CuratorService();
+    const result=await service.curatePrepared(service.prepare([memory()],[],null),'vault-1',accounting);
+    expect(result.usage).toEqual({promptTokens:120,visibleCompletionTokens:30,reasoningTokens:1024,outputTokens:1054,
+      totalTokens:1174,reasoningTokenSource:'derived'});
+    expect(accounting.returnedUsage).toHaveBeenCalledWith(result.usage);
+    expect(mocks.record).toHaveBeenCalledWith(expect.objectContaining({promptTokens:120,completionTokens:30,totalTokens:1174}));
   });
   it('does not dispatch after failed live entitlement/lease accounting',async()=>{
     const service=new CuratorService(),accounting={beforeRequest:vi.fn(async()=>{throw new Error('Live claim lost');}),returnedUsage:vi.fn()};
@@ -67,6 +79,15 @@ describe('Curator model contract and paid-attempt accounting',()=>{
   it('does not let a custom prompt suppress the server contract by naming its version',()=>{
     const batch=new CuratorService().prepare([memory()],[],null,{vaultPromptContext:{type:'custom',custom_curation_prompt:CURATOR_PROMPT_VERSION+' custom policy'}});
     expect(String(batch.request.messages[0].content)).toContain(CURATOR_CONTRACT);
+  });
+  it('uses curator reasoning configuration without inheriting the global setting',()=>{
+    const config=getConfig(),originalCurator=config.CURATOR_REASONING_EFFORT,originalGlobal=config.LLM_REASONING_EFFORT;
+    try{
+      config.CURATOR_REASONING_EFFORT='low';config.LLM_REASONING_EFFORT='high';
+      expect(new CuratorService().prepare([memory()],[],null).request.reasoning_effort).toBe('low');
+      config.CURATOR_REASONING_EFFORT='';
+      expect(new CuratorService().prepare([memory()],[],null).request.reasoning_effort).toBeUndefined();
+    }finally{config.CURATOR_REASONING_EFFORT=originalCurator;config.LLM_REASONING_EFFORT=originalGlobal;}
   });
   it.each(['length','content_filter',undefined])('retains private validation audit and refuses incomplete response %s',async finish=>{
     mocks.create.mockResolvedValue({...response(),choices:[{finish_reason:finish,message:{content:'PRIVATE incomplete response'}}]});

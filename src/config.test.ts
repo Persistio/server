@@ -107,9 +107,25 @@ describe('config environment normalization', () => {
     expect(config.EXTRACTOR_BASE_URL).toBe('https://api.openai.com/v1');
     expect(config.EXTRACTOR_MODEL).toBe('gpt-4o-mini');
     expect(config.CURATOR_MODEL).toBe('claude-sonnet-4-5');
+    expect(config.CURATOR_REASONING_EFFORT).toBe('');
+    expect(config.CURATOR_REASONING_TOKEN_RESERVE).toBe(0);
+    expect(config.CURATOR_MAX_GENERATION_TOKENS).toBe(8192);
     expect(config.STORAGE_EMBEDDING_DIMENSIONS).toBe(1536);
     expect(config.TELEMETRY_PROVIDER).toBe('none');
     expect(getConfiguredEmbeddingDimensions(config)).toBe(1536);
+  });
+
+  it('parses curator generation controls independently from the global reasoning setting', async () => {
+    const config = await parseConfig({
+      LLM_REASONING_EFFORT: 'high',
+      CURATOR_REASONING_EFFORT: 'low',
+      CURATOR_REASONING_TOKEN_RESERVE: '1024',
+      CURATOR_MAX_GENERATION_TOKENS: '8192'
+    });
+    expect(config.LLM_REASONING_EFFORT).toBe('high');
+    expect(config.CURATOR_REASONING_EFFORT).toBe('low');
+    expect(config.CURATOR_REASONING_TOKEN_RESERVE).toBe(1024);
+    expect(config.CURATOR_MAX_GENERATION_TOKENS).toBe(8192);
   });
 
   it('keeps Ollama storage dimensions upgrade-safe without an explicit dimension override', async () => {
@@ -266,7 +282,7 @@ describe('config environment normalization', () => {
 
     await expect(parseConfig({
       ADMIN_API_KEY: ''
-    })).rejects.toThrow('ADMIN_API_KEY is required unless PERSISTIO_MODE=analytics-api');
+    })).rejects.toThrow('ADMIN_API_KEY is required unless PERSISTIO_MODE is analytics-api or request-worker');
   });
 
   it('allows analytics API mode without platform database, admin, storage, embedder, or KMS secrets', async () => {

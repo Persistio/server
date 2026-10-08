@@ -1,3 +1,4 @@
+import { executionSignal, executionFetch } from '../request-worker/context';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('embedder');
 import OpenAI from 'openai';
@@ -23,7 +24,7 @@ export interface EmbedderTelemetry {
   inputType?: 'document' | 'query';
   modelRole?: ModelUsageRole;
   source?: CustomerMetricSource;
-  usageClient?: Pick<PoolClient, 'query'>;
+  usageClient?: PoolClient;
   vaultId?: string;
 }
 
@@ -146,10 +147,11 @@ export class OpenAIEmbedder implements Embedder {
 
       for (const batch of batches) {
         const start = performance.now();
-        const response = await this.client.embeddings.create({
-          model: this.model,
-          input: batch
-        });
+        const request = { model: this.model, input: batch };
+        const signal = executionSignal();
+        const response = signal
+          ? await this.client.embeddings.create(request, { signal, maxRetries: 0 })
+          : await this.client.embeddings.create(request);
         const durationMs = performance.now() - start;
         totalDurationMs += durationMs;
         embeddingDurationHistogram.record(durationMs, {
@@ -269,7 +271,7 @@ export class VertexEmbedder implements Embedder {
     }
 
     const url = `https://${this.location}-aiplatform.googleapis.com/v1/projects/${this.projectId}/locations/${this.location}/publishers/google/models/${this.model}:predict`;
-    const response = await fetch(url, {
+    const response = await executionFetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -333,7 +335,7 @@ export class OllamaEmbedder implements Embedder {
       'embedding.provider': 'ollama'
     }, async (span) => {
       const start = performance.now();
-      const response = await fetch(`${this.baseUrl}/api/embeddings`, {
+      const response = await executionFetch(`${this.baseUrl}/api/embeddings`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -403,7 +405,7 @@ export class TeiEmbedder implements Embedder {
 
       for (const batch of batches) {
         const start = performance.now();
-        const response = await fetch(`${this.baseUrl}/v1/embeddings`, {
+        const response = await executionFetch(`${this.baseUrl}/v1/embeddings`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'

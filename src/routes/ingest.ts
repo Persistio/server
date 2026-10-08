@@ -1,3 +1,4 @@
+import { captureShadowCustomerMetric } from '../services/customer-metric-shadow';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('ingest');
 import crypto from 'node:crypto';
@@ -12,7 +13,7 @@ import { ingestChunksCounter } from '../metrics';
 import { requireVaultWriteAuth } from '../middleware/auth';
 import type { VaultContext } from '../middleware/auth';
 import { prepareVaultCrypto } from '../services/crypto';
-import { recordCustomerMetric } from '../services/customer-metrics';
+import { buildCustomerMetricEvent, recordCustomerMetric } from '../services/customer-metrics';
 import { OPENAI_EMBEDDING_MAX_TOKENS_PER_INPUT, estimateEmbeddingTokens, getEmbedder } from '../services/embedder';
 import { createRawChunkBlobKey, getRawChunkStorage, type RawChunkReference, type RawChunkStorage } from '../services/raw-chunk-storage';
 import { applyRateLimitHeaders, checkQuota, consumeNormalIngestRateLimit, isPremiumPlan, recordCommittedApiQuotaReservation, reserveApiQuotaInTransaction, type RateLimitSnapshot } from '../services/usage';
@@ -388,12 +389,16 @@ async function ingestChunksForVault(
         );
       }
 
+      const shadowStorageEvent = rawChunkStorageEvent(vault,
+        blobInputs.filter((_, index) => insertedIndexSet.has(preparedIndexes[index])));
+      if (shadowStorageEvent) await captureShadowCustomerMetric(client, shadowStorageEvent);
       return {
         inserted,
         outcomes,
         segmentsQueued: segments.length,
         insertedIndexes,
-        quotaReservation
+        quotaReservation,
+        storageEvent: shadowStorageEvent
       };
     });
     if (result.quotaReservation) bestEffortAcceptanceTelemetry(() => recordCommittedApiQuotaReservation(result.quotaReservation!));
@@ -411,10 +416,9 @@ async function ingestChunksForVault(
         errors: reconciliationErrors.map(String)
       }));
     }
-    bestEffortAcceptanceTelemetry(() => recordRawChunkStorageDelta(
-      vault,
-      blobInputs.filter((_, index) => insertedIndexSet.has(preparedIndexes[index]))
-    ));
+    bestEffortAcceptanceTelemetry(() => {
+      if (result.storageEvent) recordCustomerMetric(result.storageEvent);
+    });
     return {
       accepted: result.outcomes.length,
       inserted: result.inserted.length,
@@ -504,15 +508,13 @@ function bestEffortAcceptanceTelemetry(work: () => void): void {
   try { work(); } catch { operationalLog.warn('Ingest accepted; nonessential acceptance telemetry unavailable'); }
 }
 
-function recordRawChunkStorageDelta(
-  vault: VaultContext,
-  blobs: Array<{ storageBytes: number }>
-): void {
+function rawChunkStorageEvent(vault: VaultContext, blobs: Array<{ storageBytes: number }>):
+  import('../services/customer-metrics').CustomerMetricEvent | undefined {
   if (!vault.account_id) return;
   const storageBytes = blobs.reduce((total, blob) => total + blob.storageBytes, 0);
   if (storageBytes === 0) return;
 
-  recordCustomerMetric({
+  return buildCustomerMetricEvent({
     event_type: 'storage_delta',
     operation: 'raw_chunk_blob_write',
     source: 'api',

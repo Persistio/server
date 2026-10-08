@@ -19,6 +19,8 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
   });
   beforeEach(()=>{config.CONTRADICTION_SCAN_ENABLED=true;config.CONTRADICTION_MAX_ARBITRATIONS_PER_BATCH=4;});
   afterEach(async()=>{
+    config.CUSTOMER_METRICS_SHADOW_CAPTURE=false;
+    await pool.query("DELETE FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=ANY($1::text[])",[vaults]);
     await cleanFixtureSources();
     vi.restoreAllMocks();await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])',[vaults]);vaults.length=0;
   });
@@ -46,6 +48,36 @@ describe.skipIf(!databaseUrl)('revision-tagged contradiction activation (Postgre
     return{v,old,current};
   }
   const statuses=async(v:string)=>(await pool.query('SELECT id,status,archived_at FROM memories WHERE vault_id=$1',[v])).rows;
+  it.each(['commit','rollback','unknown commit'] as const)('captures contradiction retirement with the owning %s outcome',async outcome=>{
+    const f=await pair(),account=crypto.randomUUID();config.CUSTOMER_METRICS_SHADOW_CAPTURE=true;
+    await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1',[f.v,account]);
+    const metric=vi.spyOn(await import('../customer-metrics'),'recordCustomerMetric').mockImplementation(()=>{});
+    if(outcome!=='commit'){
+      const transact=db.withTransaction;
+      vi.spyOn(db,'withTransaction').mockImplementationOnce(async work=>{
+        if(outcome==='rollback')return transact(async client=>{await work(client);throw new Error('rollback');});
+        await transact(work);throw new Error('unknown commit');
+      });
+    }
+    const run=scan(f.v,[f.current],fixtureExtractor(async()=>'supersede_old') as never);
+    if(outcome==='commit')await run;else await expect(run).rejects.toThrow(outcome);
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1",[f.v])).rows.map(row=>row.payload);
+    const retired=(await statuses(f.v)).filter(row=>row.archived_at!==null);
+    expect(retired).toHaveLength(outcome==='rollback'?0:1);expect(shadow).toHaveLength(outcome==='rollback'?0:1);
+    if(outcome==='commit')expect(shadow).toEqual(metric.mock.calls.map(([event])=>event));
+    else expect(metric).not.toHaveBeenCalled();
+    if(shadow.length)expect(shadow[0]).toMatchObject({workspace_id:account,memory_count_delta:-1,source:'extraction_worker'});
+  });
+  it('retains due work when durable arbitration admission is exhausted and bounds vault selection',async()=>{
+    const first=await pair(),second=await pair(),extractor=fixtureExtractor(async()=>'keep_both');
+    const admit=vi.fn().mockResolvedValue(false);
+    await drain(extractor as never,{maxVaults:1,admitArbitration:admit});
+    expect(admit).toHaveBeenCalledOnce();
+    expect(extractor.arbitrateConflict).not.toHaveBeenCalled();
+    expect(await schedule(first.current)).toBeDefined();expect(await schedule(second.current)).toBeDefined();
+    expect((await pool.query('SELECT 1 FROM contradiction_scan_log WHERE vault_id=ANY($1::uuid[])',[[first.v,second.v]])).rowCount).toBe(0);
+    await expect(drain(extractor as never,{maxVaults:0})).rejects.toThrow('Invalid activation bound');
+  });
   it.each([false,true])('reconsiders revised unresolved pairs outside similarity, independent of orientation (reverse=%s)',async reverse=>{
     const f=await pair(),extractor=fixtureExtractor(async()=>'keep_both');
     const ids=reverse?[f.current,f.old]:[f.old,f.current];

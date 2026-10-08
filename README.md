@@ -90,6 +90,9 @@ The full OpenAPI description is in [`openapi.yaml`](./openapi.yaml).
 | `CURATOR_BASE_URL` | Optional OpenAI-compatible curator endpoint | unset |
 | `CURATOR_API_KEY` | Optional curator API key | unset |
 | `CURATOR_MODEL` | Optional curator model | unset |
+| `CURATOR_REASONING_EFFORT` | Optional curator-only reasoning effort | unset |
+| `CURATOR_REASONING_TOKEN_RESERVE` | Tokens reserved for hidden curator reasoning | `0` |
+| `CURATOR_MAX_GENERATION_TOKENS` | Curator generation hard ceiling | `8192` |
 | `RAW_CHUNK_STORAGE_PROVIDER` | Raw chunk storage backend | `local` |
 | `RAW_CHUNK_LOCAL_DIR` | Local raw chunk storage root | `./data/raw-chunks` |
 

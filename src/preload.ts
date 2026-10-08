@@ -46,6 +46,8 @@ switch (provider) {
 }
 
 function getTelemetryProvider(): string {
+  // Request mode must not start an idle/background SDK before its guard runs.
+  if (process.env.PERSISTIO_MODE === 'request-worker') return 'none';
   if (process.env.TELEMETRY_PROVIDER) {
     return process.env.TELEMETRY_PROVIDER;
   }

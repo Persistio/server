@@ -1,6 +1,6 @@
 import { getConfig } from '../config';
 import { query, withTransaction } from '../db/client';
-import { recordMemoryCountDelta } from './usage';
+import { memoryCountEffect, captureShadowWorkerEffects, publishCommittedWorkerEffects } from './worker-effects';
 
 /** Explicit inactivity retention, not a judgement about whether a fact is true. */
 export async function archiveStaleMemories() {
@@ -21,8 +21,10 @@ export async function archiveStaleMemories() {
       const archived = await client.query(
         `UPDATE memories SET archived_at=now(),updated_at=now() WHERE vault_id=$2 AND ${stale}`,
         [ttlDays, vaultId]);
-      return { accountId: vault.account_id, count: archived.rowCount ?? 0 };
+      const effects = [memoryCountEffect(vaultId,vault.account_id,-(archived.rowCount ?? 0),'extraction_worker')];
+      await captureShadowWorkerEffects(client,effects);
+      return effects;
     });
-    if (result?.count) recordMemoryCountDelta(vaultId, result.accountId, -result.count, 'extraction_worker');
+    if (result) publishCommittedWorkerEffects(result);
   }
 }

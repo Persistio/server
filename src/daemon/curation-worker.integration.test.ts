@@ -12,7 +12,7 @@ describe.skipIf(!databaseUrl)('actual curation worker lifecycle (PostgreSQL)', (
   const pool = new Pool({ connectionString: databaseUrl });
   const vaults: string[] = [];
   const queues: string[] = [];
-  let processBatch: typeof import('./curation-worker').processBatch;
+  let processBatch: import('./curation-execution').CurationExecution['processBatch'];
   let service: typeof import('../services/curator').CuratorService;
   let config: ReturnType<typeof import('../config').getConfig>;
   let closePool: () => Promise<void>;
@@ -33,9 +33,12 @@ describe.skipIf(!databaseUrl)('actual curation worker lifecycle (PostgreSQL)', (
     state.vector = [1, ...Array(dimensions - 1).fill(0)];
     state.embed.mockImplementation(async () => state.vector);
     service = (await import('../services/curator')).CuratorService;
-    ({ processBatch } = await import('./curation-worker'));
+    ({ processBatch } = (await import('./curation-execution')).createCurationExecution());
   });
   afterEach(async () => {
+    config.CUSTOMER_METRICS_SHADOW_CAPTURE=false;
+    config.TELEMETRY_SHADOW_ENABLED=false;
+    await pool.query("DELETE FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=ANY($1::text[])",[vaults]);
     vi.restoreAllMocks();
     config.CURATION_BATCH_SIZE = 1;
     config.ENCRYPTION_ENABLED = false;
@@ -79,7 +82,7 @@ describe.skipIf(!databaseUrl)('actual curation worker lifecycle (PostgreSQL)', (
       const parts=request.messages[1].content;
       const ids=(index:number)=>JSON.parse(parts[index].text).memories.map((m:any)=>m.id);
       const result=await plan(ids(0),ids(1));
-      await accounting.returnedUsage({promptTokens:100,completionTokens:50,totalTokens:150});
+      await accounting.returnedUsage({promptTokens:100,visibleCompletionTokens:50,reasoningTokens:0,outputTokens:50,totalTokens:150,reasoningTokenSource:'unavailable'});
       return {usage:{prompt_tokens:100,completion_tokens:50,total_tokens:150},choices:[{finish_reason:'stop',message:{content:JSON.stringify(result)}}]};
     });
   }
@@ -111,11 +114,21 @@ describe.skipIf(!databaseUrl)('actual curation worker lifecycle (PostgreSQL)', (
     const { AiBudgetDeferredError } = await import('../services/usage');
     const { CircuitBreakerOpenError } = await import('../services/ai-resilience');
     const f = await fixture(1);
+    config.TELEMETRY_SHADOW_ENABLED=true;
+    const info=vi.spyOn(console,'info').mockImplementation(()=>{});
     model(() => { throw reason === 'budget' ? new AiBudgetDeferredError('curation', new Date(Date.now()+60_000), 60_000) : new CircuitBreakerOpenError('curator', 60_000); });
     await processBatch();
     expect((await pool.query('SELECT retry_count,claim_token,last_error FROM curation_queue WHERE id=$1', [f.queue])).rows[0])
       .toMatchObject({ retry_count: 0, claim_token: null, last_error: expect.any(String) });
     expect((await pool.query('SELECT last_curator_defer_reason FROM vault_curation_state WHERE vault_id=$1', [f.vault])).rows[0].last_curator_defer_reason).toBeTruthy();
+    const budgetRecords=info.mock.calls.map(([line])=>JSON.parse(String(line)))
+      .filter(record=>record.event==='shadow_domain_metric' && record.shadow_metric.startsWith('persistio.ai_budget.'));
+    expect(budgetRecords.map(({shadow_metric,value,model_role,queue})=>({shadow_metric,value,model_role,queue})))
+      .toEqual(reason==='circuit'?[]:[
+        {shadow_metric:'persistio.ai_budget.wait_ms',value:60000,model_role:'curation',queue:'curation'},
+        {shadow_metric:'persistio.ai_budget.throttled_jobs.total',value:1,model_role:'curation',queue:'curation'}
+      ]);
+    for(const record of budgetRecords)expect(record).not.toHaveProperty('vault_id');
     await pool.query('UPDATE curation_queue SET available_at=now() WHERE id=$1', [f.queue]);
     await pool.query('UPDATE vault_curation_state SET next_curator_run_at=NULL,last_curator_defer_reason=NULL WHERE vault_id=$1', [f.vault]);
     model(async () => {
@@ -233,11 +246,24 @@ describe.skipIf(!databaseUrl)('actual curation worker lifecycle (PostgreSQL)', (
       .toEqual({curator_requests:1,curator_candidates_processed:1});
     expect((await pool.query('SELECT data FROM memories WHERE id=$1',[f.candidates[0]])).rows[0].data).toBe('Refined durable fact');
   });
-  it('keeps committed curation completed if count publication fails',async()=>{
-    const f=await fixture(1);model(ids=>({...empty(),archive:ids.map(id=>({id,reason:'No future-use information',basis:'no_durable_value'}))}));
-    vi.spyOn(await import('../services/usage'),'recordMemoryCountDelta').mockImplementation(()=>{throw new Error('Synthetic publisher failure');});
+  it('preserves the complete curation capacity envelope through commit',async()=>{
+    const f=await fixture(1),account=crypto.randomUUID();config.CUSTOMER_METRICS_SHADOW_CAPTURE=true;
+    await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1',[f.vault,account]);
+    model(ids=>({...empty(),archive:ids.map(id=>({id,reason:'No future-use information',basis:'no_durable_value'}))}));
+    const metric=vi.spyOn(await import('../services/customer-metrics'),'recordCustomerMetric').mockImplementation(()=>{});
+    await processBatch();
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1 AND payload->>'operation'='memory_count'",[f.vault])).rows.map(row=>row.payload);
+    expect(shadow).toHaveLength(1);expect(shadow).toEqual(metric.mock.calls.map(([event])=>event).filter(event=>event.event_type==='quota_delta'));
+  });
+  it('keeps committed curation and its shadow delta completed if legacy count publication fails',async()=>{
+    config.CUSTOMER_METRICS_SHADOW_CAPTURE=true;
+    const f=await fixture(1);
+    const account=crypto.randomUUID();await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1',[f.vault,account]);model(ids=>({...empty(),archive:ids.map(id=>({id,reason:'No future-use information',basis:'no_durable_value'}))}));
+    vi.spyOn(await import('../services/customer-metrics'),'recordCustomerMetric').mockImplementation(()=>{throw new Error('Synthetic publisher failure');});
     await processBatch();await processBatch();expect(completion).toHaveBeenCalledOnce();
     expect((await pool.query('SELECT id FROM curation_queue WHERE id=$1',[f.queue])).rowCount).toBe(0);
+    const shadow=(await pool.query("SELECT payload FROM customer_metric_shadow_outbox WHERE payload->>'vault_id'=$1 AND payload->>'operation'='memory_count'",[f.vault])).rows;
+    expect(shadow).toHaveLength(1);expect(shadow[0].payload).toMatchObject({memory_count_delta:-1,workspace_id:account,source:'curation_worker'});
   });
   it('processes independent improvement groups under one vault claim',async()=>{
     const f=await fixture(1);config.CURATION_BATCH_SIZE=2;

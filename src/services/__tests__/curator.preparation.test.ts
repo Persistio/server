@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getConfig } from '../../config';
-import { CURATOR_PROMPT_VERSION, CuratorService, CuratorPreparationDeferredError, type CuratorMemory } from '../curator';
+import { CURATOR_PROMPT_VERSION, CuratorService, CuratorPreparationDeferredError, minimumCuratorPlanTokens, type CuratorMemory } from '../curator';
 import { serializeModelRequest } from '../model-completion';
 
 vi.hoisted(() => { process.env.CURATOR_API_KEY = 'test-curator-key'; });
@@ -100,11 +100,36 @@ describe('whole-record curator preparation', () => {
     const service = new CuratorService();
     const call = vi.spyOn(service as any, 'createChatCompletion');
     const candidates = Array.from({ length: 40 }, (_, i) => memory(`c${i}`, { data: 'short' }));
-    expect(service.prepare(candidates, [], null, { maxOutputTokens: 112 }).candidates).toHaveLength(2);
+    expect(service.prepare(candidates, [], null, { maxOutputTokens: minimumCuratorPlanTokens(2) }).candidates).toHaveLength(2);
     await expect(service.curate(candidates, [], null, undefined, { maxOutputTokens: 10 })).rejects.toThrow(CuratorPreparationDeferredError);
     getConfig().LLM_SYSTEM_PROMPT_PREFIX = 'prefix'.repeat(20_000);
     await expect(service.curate(candidates, [], null, undefined, { maxInputTokens: 12000 })).rejects.toThrow(CuratorPreparationDeferredError);
     expect(call).not.toHaveBeenCalled();
+  });
+
+  it('uses a serialized minimum v2 plan and reserves hidden reasoning before preflight', () => {
+    const config = getConfig();
+    const original = {
+      reserve: config.CURATOR_REASONING_TOKEN_RESERVE,
+      ceiling: config.CURATOR_MAX_GENERATION_TOKENS
+    };
+    try {
+      config.CURATOR_REASONING_TOKEN_RESERVE = 1024;
+      config.CURATOR_MAX_GENERATION_TOKENS = 8192;
+      const candidates = Array.from({ length: 20 }, (_, i) => memory(`c${i}`, { data: 'short' }));
+      const minimum = minimumCuratorPlanTokens(20);
+      const batch = new CuratorService().prepare(candidates, [], null, { maxOutputTokens: minimum + 1024 });
+      expect(batch.candidates).toHaveLength(20);
+      expect(batch.request.max_tokens).toBe(minimum + 1024);
+      expect(() => new CuratorService().prepare([memory('one')], [], null, {
+        maxOutputTokens: minimumCuratorPlanTokens(1) + 1023
+      }))
+        .toThrow(CuratorPreparationDeferredError);
+      expect(new CuratorService().prepare([memory('one')], [], null, { maxOutputTokens: 20000 }).request.max_tokens).toBe(8192);
+    } finally {
+      config.CURATOR_REASONING_TOKEN_RESERVE = original.reserve;
+      config.CURATOR_MAX_GENERATION_TOKENS = original.ceiling;
+    }
   });
 
   it('preserves full subject/binding identity and prevents data from forging record boundaries', () => {

@@ -44,7 +44,7 @@ vi.mock('../extractor', async original => ({ ...await original<typeof import('..
   arbitrateSubject = async () => 'use_existing';
 } }));
 vi.mock('../contradiction-activation', async original => ({ ...await original<typeof import('../contradiction-activation')>(), drainDueContradictionActivations: async () => 0 }));
-vi.mock('../customer-metrics', () => ({ initCustomerMetrics: async () => {}, shutdownCustomerMetrics: async () => {}, recordCustomerMetric: () => {} }));
+vi.mock('../customer-metrics', async original => ({...await original<typeof import('../customer-metrics')>(), initCustomerMetrics: async () => {}, shutdownCustomerMetrics: async () => {}, recordCustomerMetric: () => {} }));
 // Background global cleanup is not part of this vault-scoped replay test.
 vi.mock('../staleness', () => ({ archiveStaleMemories: async () => 0 }));
 

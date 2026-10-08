@@ -12,7 +12,7 @@ describe.skipIf(!databaseUrl)('active-memory curation worker (PostgreSQL)',()=>{
   const pool=new Pool({connectionString:databaseUrl});
   const vaults:string[]=[],queues:string[]=[];
   let db:typeof import('../db/client');
-  let worker:typeof import('./curation-worker');
+  let worker:import('./curation-execution').CurationExecution;
   let CuratorService:typeof import('../services/curator').CuratorService;
   let config:ReturnType<typeof import('../config').getConfig>;
   let vector:number[];
@@ -23,7 +23,7 @@ describe.skipIf(!databaseUrl)('active-memory curation worker (PostgreSQL)',()=>{
     const type=(await pool.query("SELECT format_type(atttypid,atttypmod) AS type FROM pg_attribute WHERE attrelid='memories'::regclass AND attname='embedding'")).rows[0].type;
     const dimensions=Number(/\((\d+)\)/.exec(type)![1]);
     vector=[1,...Array(dimensions-1).fill(0)];state.embed.mockResolvedValue(vector);
-    ({CuratorService}=await import('../services/curator'));worker=await import('./curation-worker');
+    ({CuratorService}=await import('../services/curator'));worker=(await import('./curation-execution')).createCurationExecution();
   });
   afterEach(async()=>{
     vi.restoreAllMocks();state.embed.mockReset().mockResolvedValue(vector);state.read.mockReset();
@@ -54,7 +54,7 @@ describe.skipIf(!databaseUrl)('active-memory curation worker (PostgreSQL)',()=>{
       await accounting.beforeRequest();
       const result=await fn(JSON.parse(request.messages[1].content[0].text).memories,JSON.parse(request.messages[1].content[1].text).memories,
         JSON.parse(request.messages[1].content[2].text).sources);
-      await accounting.returnedUsage({promptTokens:100,completionTokens:50,totalTokens:150});
+      await accounting.returnedUsage({promptTokens:100,visibleCompletionTokens:50,reasoningTokens:0,outputTokens:50,totalTokens:150,reasoningTokenSource:'unavailable'});
       return{usage:{prompt_tokens:100,completion_tokens:50,total_tokens:150},choices:[{finish_reason:finish,message:{content:JSON.stringify(result)}}]};
     });
   }
@@ -162,6 +162,50 @@ describe.skipIf(!databaseUrl)('active-memory curation worker (PostgreSQL)',()=>{
     expect((await pool.query('SELECT id FROM memories WHERE vault_id=$1 AND status=\'active\' AND archived_at IS NULL',[f.vault])).rowCount).toBe(2);
     expect((await pool.query('SELECT retry_count FROM curation_queue WHERE id=$1',[f.queue])).rows[0].retry_count).toBe(1);
     expect(await usage(f.vault)).toMatchObject({curator_requests:1,curator_input_tokens:100,curator_output_tokens:50,curator_candidates_processed:0});
+  });
+  it('halves target and context batches only after truncation and produces new request hashes',async()=>{
+    const f=await fixture(100);
+    await pool.query('DELETE FROM curation_queue_items WHERE queue_id=$1 AND memory_id=ANY($2::uuid[])',[f.queue,f.ids.slice(20)]);
+    const observed:Array<[number,number]>=[];
+    const call=model((targets,context)=>{observed.push([targets.length,context.length]);return{
+      ...empty(),keep:targets.map(t=>({id:t.id,reason:'Useful'}))
+    };},'length');
+    for(let attempt=0;attempt<3;attempt++){
+      await makeFixtureDue(f.vault);await worker.processBatch();
+    }
+    expect(call).toHaveBeenCalledTimes(3);
+    expect(observed).toEqual([[4,80],[2,40],[1,20]]);
+    const hashes=(await pool.query('SELECT prompt_hash FROM curation_review_runs WHERE vault_id=$1 ORDER BY created_at',[f.vault])).rows.map(row=>row.prompt_hash);
+    expect(new Set(hashes).size).toBe(3);
+    expect((await pool.query('SELECT retry_count,last_error FROM curation_queue WHERE id=$1',[f.queue])).rows[0])
+      .toMatchObject({retry_count:3,last_error:expect.stringMatching(/^curator_output_truncated:truncated:[0-9a-f]{64}:1:20$/)});
+  });
+  it('never pays to resend an identical request that already truncated',async()=>{
+    const f=await fixture(1);
+    const call=model(targets=>({...empty(),keep:targets.map(t=>({id:t.id,reason:'Useful'}))}),'length');
+    await worker.processBatch();
+    const first=(await pool.query('SELECT retry_count,last_error FROM curation_queue WHERE id=$1',[f.queue])).rows[0];
+    await makeFixtureDue(f.vault);await worker.processBatch();
+    expect(call).toHaveBeenCalledOnce();
+    expect(await usage(f.vault)).toMatchObject({curator_requests:1,curator_input_tokens:100,curator_output_tokens:50});
+    expect((await pool.query('SELECT retry_count,last_error FROM curation_queue WHERE id=$1',[f.queue])).rows[0])
+      .toEqual({retry_count:2,last_error:first.last_error});
+  });
+  it('preserves the reduced batch across an intervening provider failure',async()=>{
+    const f=await fixture(8),observed:Array<[number,number]>=[];let attempt=0;
+    await pool.query('DELETE FROM curation_queue_items WHERE queue_id=$1 AND memory_id=ANY($2::uuid[])',[f.queue,f.ids.slice(4)]);
+    const call=model((targets,context)=>{
+      observed.push([targets.length,context.length]);
+      if(++attempt===2)throw new Error('Synthetic transient provider failure');
+      return{...empty(),keep:targets.map(t=>({id:t.id,reason:'Useful'}))};
+    },'length');
+    await worker.processBatch();
+    await makeFixtureDue(f.vault);await worker.processBatch();
+    expect((await pool.query('SELECT last_error FROM curation_queue WHERE id=$1',[f.queue])).rows[0].last_error)
+      .toMatch(/^curator_output_truncated:continuation:[0-9a-f]{64}:2:2$/);
+    await makeFixtureDue(f.vault);await worker.processBatch();
+    expect(call).toHaveBeenCalledTimes(3);
+    expect(observed).toEqual([[4,4],[2,2],[2,2]]);
   });
   it('rejects a stale complete plan and preserves the separately queued newer revision',async()=>{
     const f=await fixture(1);let changedQueue:string|undefined;

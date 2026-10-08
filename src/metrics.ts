@@ -1,53 +1,54 @@
+import { shadowCounter, shadowHistogram } from './shadow-metrics';
 import type { ObservableResultLike } from './telemetry';
 import { meter } from './telemetry';
 import { query } from './db/client';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from './services/extraction-queue-eligibility';
 
-export const recallDurationHistogram = meter.createHistogram('persistio.recall.duration', {
+export const recallDurationHistogram = shadowHistogram('persistio.recall.duration', {
   description: 'Recall latency',
   unit: 'ms'
 });
 
-export const ingestChunksCounter = meter.createCounter('persistio.ingest.chunks.total', {
+export const ingestChunksCounter = shadowCounter('persistio.ingest.chunks.total', {
   description: 'Chunks ingested'
 });
 
-export const extractionJobsCounter = meter.createCounter('persistio.extraction.jobs.total', {
+export const extractionJobsCounter = shadowCounter('persistio.extraction.jobs.total', {
   description: 'Extraction jobs by status'
 });
 
-export const extractionLagHistogram = meter.createHistogram('persistio.extraction.lag_ms', {
+export const extractionLagHistogram = shadowHistogram('persistio.extraction.lag_ms', {
   description: 'Time from ingest to memory creation',
   unit: 'ms'
 });
 
-export const extractionCandidatesCounter = meter.createCounter('persistio.extraction.candidates.total', {
+export const extractionCandidatesCounter = shadowCounter('persistio.extraction.candidates.total', {
   description: 'Memory candidates accepted or dropped during extraction'
 });
 
-export const aiBudgetWaitHistogram = meter.createHistogram('persistio.ai_budget.wait_ms', {
+export const aiBudgetWaitHistogram = shadowHistogram('persistio.ai_budget.wait_ms', {
   description: 'Time background AI work waits for vault-local AI budget',
   unit: 'ms'
 });
 
-export const aiBudgetThrottledJobsCounter = meter.createCounter('persistio.ai_budget.throttled_jobs.total', {
+export const aiBudgetThrottledJobsCounter = shadowCounter('persistio.ai_budget.throttled_jobs.total', {
   description: 'Background jobs deferred because vault-local AI budget was unavailable'
 });
 
-export const embeddingDurationHistogram = meter.createHistogram('persistio.embedding.duration', {
+export const embeddingDurationHistogram = shadowHistogram('persistio.embedding.duration', {
   description: 'Embedding call latency',
   unit: 'ms'
 });
 
-export const eventOutboxDispatchCounter = meter.createCounter('persistio.event_outbox.dispatch.total', {
+export const eventOutboxDispatchCounter = shadowCounter('persistio.event_outbox.dispatch.total', {
   description: 'Event outbox dispatch cycle and row outcomes'
 });
 
-export const eventOutboxPublishFailureCounter = meter.createCounter('persistio.event_outbox.publish_failures.total', {
+export const eventOutboxPublishFailureCounter = shadowCounter('persistio.event_outbox.publish_failures.total', {
   description: 'Event outbox publish failures by adapter and event type'
 });
 
-export const eventOutboxLagHistogram = meter.createHistogram('persistio.event_outbox.lag_ms', {
+export const eventOutboxLagHistogram = shadowHistogram('persistio.event_outbox.lag_ms', {
   description: 'Age of oldest pending platform event outbox row during dispatch',
   unit: 'ms'
 });

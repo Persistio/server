@@ -1,4 +1,8 @@
 import type { FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { getConfig } from '../config';
+import { captureShadowCustomerMetric } from './customer-metric-shadow';
+import { registerExecutionState } from '../request-worker/state';
 import type { PoolClient } from 'pg';
 
 import { query, withTransaction } from '../db/client';
@@ -8,7 +12,7 @@ import type {
   VaultUsagePeriodLimitField
 } from '../events/platform-event';
 import { usagePeriodClosedEventType } from '../events/platform-event';
-import { recordCustomerMetric, type CustomerMetricSource } from './customer-metrics';
+import { buildCustomerMetricEvent, recordCustomerMetric, type CustomerMetricEvent, type CustomerMetricSource } from './customer-metrics';
 import { memoryCapacityPredicateSql } from './memory-capacity';
 
 export type UsageField = 'ingest_events' | 'memory_adds' | 'searches';
@@ -87,6 +91,7 @@ export interface RateLimitSnapshot {
 }
 
 export interface ApiQuotaReservation {
+  metricEvent: CustomerMetricEvent | null;
   accountId: string | null;
   field: UsageField;
   period: string;
@@ -159,12 +164,20 @@ const aiPlanDefaults: Record<PlanId, Required<Pick<LimitConfig, AiLimitKey>>> = 
   free: conservativeAiDefaults
 };
 
-// TODO: These buckets are in-process only. They reset on restart and do not coordinate across
-// replicas, so precise enforcement at scale requires Redis or shared database-backed state.
+// Legacy modes keep process-local buckets. Request mode restores/checkpoints them
+// under its singleton SQL execution owner before provider dispatch.
 const aiRequestBuckets = new Map<string, BucketState>();
-// TODO: These buckets are in-process only. They reset on restart and do not coordinate across
-// replicas, so precise enforcement at scale requires Redis or shared database-backed state.
 const aiTokenBuckets = new Map<string, BucketState>();
+const persistedBucket = z.object({ capacity: z.number().finite().positive(), lastRefillMs: z.number().finite().nonnegative(),
+  refillPerMs: z.number().finite().positive(), tokens: z.number().finite() }).strict();
+for (const [name, buckets] of [['ai-requests', aiRequestBuckets], ['ai-tokens', aiTokenBuckets]] as const) {
+  registerExecutionState(name, value => {
+    for (const [key, bucket] of Object.entries(z.record(persistedBucket).parse(value))) buckets.set(key, bucket);
+  }, () => Object.fromEntries([...buckets].flatMap(([key, bucket]) => {
+    const refilled = refillBucket(bucket, bucket.capacity, Date.now());
+    return refilled.tokens >= refilled.capacity ? [] : [[key, refilled]];
+  })));
+}
 // TODO: Normal-ingest RPM buckets are in-process only. Use Redis/shared state if strict
 // cross-replica enforcement becomes necessary.
 const ingestRequestBuckets = new Map<string, BucketState>();
@@ -267,7 +280,7 @@ export async function incrementUsage(
     END`;
   }).join(',\n           ');
 
-  const accountId = await withTransaction(async (client) => {
+  const event = await withTransaction(async (client) => {
     const vaultResult = await client.query<{ account_id: string | null }>(
       `SELECT account_id::text AS account_id
        FROM vaults
@@ -292,15 +305,12 @@ export async function incrementUsage(
         field === 'searches' ? 1 : 0
       ]
     );
-    return vaultResult.rows[0]?.account_id ?? null;
+    const accountId = vaultResult.rows[0]?.account_id ?? null;
+    const event = buildQuotaDeltaEvent({vaultId, accountId, operation:field, delta:1, source});
+    if (event) await captureShadowCustomerMetric(client, event);
+    return event;
   });
-  recordUsageQuotaDelta({
-    accountId,
-    delta: 1,
-    field,
-    source,
-    vaultId
-  });
+  recordPreparedQuotaDelta(event);
 }
 
 export async function consumeApiQuota(
@@ -322,8 +332,8 @@ export async function reserveApiQuota(
   return reservation;
 }
 
-/** Caller must commit the resource write and this charge together. No metric is
- * emitted until the caller has received a definite successful commit result. */
+/** Caller commits the resource, charge and shadow intent together. Legacy emission
+ * remains after confirmed commit; durable shadow survives an unknown COMMIT result. */
 export async function reserveApiQuotaInTransaction(
   client: PoolClient,
   vaultId: string,
@@ -331,21 +341,19 @@ export async function reserveApiQuotaInTransaction(
   source: CustomerMetricSource = 'api'
 ): Promise<ApiQuotaReservation> {
   const result = await consumeApiQuotaWithPeriodInTransaction(client, vaultId, field);
-  return { accountId: result.accountId, field, period: result.period, snapshot: result.snapshot, source, vaultId };
+  const metricEvent = buildQuotaDeltaEvent({vaultId, accountId:result.accountId, operation:field, delta:1, source});
+  if (metricEvent) await captureShadowCustomerMetric(client, metricEvent);
+  return { accountId: result.accountId, field, period: result.period, snapshot: result.snapshot, source, vaultId, metricEvent };
 }
 
 export function recordCommittedApiQuotaReservation(reservation: ApiQuotaReservation): void {
-  recordUsageQuotaDelta({
-    accountId: reservation.accountId,
-    delta: 1,
-    field: reservation.field,
-    source: reservation.source,
-    vaultId: reservation.vaultId
-  });
+  recordPreparedQuotaDelta(reservation.metricEvent);
 }
 
 export async function consumeApiQuotaInTransaction(client: PoolClient, vaultId: string, field: UsageField): Promise<RateLimitSnapshot> {
   const result = await consumeApiQuotaWithPeriodInTransaction(client, vaultId, field);
+  const event = buildQuotaDeltaEvent({vaultId, accountId:result.accountId, operation:field, delta:1, source:'api'});
+  if (event) await captureShadowCustomerMetric(client, event);
   return result.snapshot;
 }
 
@@ -581,25 +589,25 @@ export async function refundApiQuotaReservation(reservation: ApiQuotaReservation
   }
 
   const column = fieldColumn[reservation.field];
-  const result = await query(
-    `UPDATE vault_usage
-     SET ${column} = GREATEST(${column} - 1, 0),
-         updated_at = now()
-     WHERE vault_id = $1
-       AND period = $2
-       AND ${column} > 0
-     RETURNING vault_id`,
-    [reservation.vaultId, reservation.period]
-  );
-  if (result.rowCount) {
-    recordUsageQuotaDelta({
-      accountId: reservation.accountId,
-      delta: -1,
-      field: reservation.field,
-      source: reservation.source,
-      vaultId: reservation.vaultId
-    });
-  }
+  const update = async (client?: PoolClient) => {
+    const result = await (client ? client.query.bind(client) : query)(
+      `UPDATE vault_usage
+       SET ${column} = GREATEST(${column} - 1, 0),
+           updated_at = now()
+       WHERE vault_id = $1
+         AND period = $2
+         AND ${column} > 0
+       RETURNING vault_id`,
+      [reservation.vaultId, reservation.period]
+    );
+    // A refund is a new activity, not a replay of the reservation's envelope.
+    const event = result.rowCount ? buildQuotaDeltaEvent({vaultId:reservation.vaultId,
+      accountId:reservation.accountId, operation:reservation.field, delta:-1, source:reservation.source}) : null;
+    if (event && client) await captureShadowCustomerMetric(client, event);
+    return event;
+  };
+  const event = getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE ? await withTransaction(update) : await update();
+  recordPreparedQuotaDelta(event);
 }
 
 export async function checkQuota(vaultId: string, field: UsageField, rejectExhausted = true): Promise<RateLimitSnapshot> {
@@ -686,13 +694,13 @@ export function recordMemoryCountDelta(
   source: CustomerMetricSource = 'api'
 ): void {
   if (delta === 0) return;
-  recordQuotaDelta({
+  recordPreparedQuotaDelta(buildQuotaDeltaEvent({
     accountId,
     delta,
     operation: 'memory_count',
     source,
     vaultId
-  });
+  }));
 }
 
 export async function canCreateMemory(vaultId: string): Promise<boolean> {
@@ -751,7 +759,14 @@ export async function settleAiUsage(vaultId: string, role: AiBudgetRole, estimat
   consumeTokenBucket(aiTokenBuckets, `${vaultId}:${role}:tokens`, limits.ai_tokens_per_minute, (actualTokens - estimatedTokens) * weight);
 }
 
-export async function recordModelUsage(input: ModelUsageInput, client?: Pick<PoolClient, 'query'>): Promise<void> {
+export async function recordModelUsage(input: ModelUsageInput, client?: PoolClient): Promise<void> {
+  const event = !client && getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE
+    ? await withTransaction(transaction => writeModelUsage(input, transaction))
+    : await writeModelUsage(input, client);
+  if (event) { try { recordCustomerMetric(event); } catch { /* Committed accounting stays authoritative. */ } }
+}
+
+async function writeModelUsage(input: ModelUsageInput, client?: PoolClient) {
   const period = getCurrentUsagePeriod();
   const requestCount = Math.max(0, Math.trunc(input.requestCount ?? 0));
   const embeddingCalls = Math.max(0, Math.trunc(input.embeddingCalls ?? 0));
@@ -805,7 +820,7 @@ export async function recordModelUsage(input: ModelUsageInput, client?: Pick<Poo
   const accountId = result.rows[0]?.account_id ?? null;
   if (!accountId) return;
 
-  recordCustomerMetric({
+  const event = buildCustomerMetricEvent({
     event_type: 'model_usage',
     model: input.model,
     model_request_count: requestCount,
@@ -820,70 +835,28 @@ export async function recordModelUsage(input: ModelUsageInput, client?: Pick<Poo
     ...(promptTokens ? { prompt_tokens: promptTokens } : {}),
     ...(totalTokens ? { total_tokens: totalTokens } : {})
   });
+  if (client && getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE) await captureShadowCustomerMetric(client, event);
+  return event;
 }
 
-function recordUsageQuotaDelta(input: {
-  accountId: string | null;
-  delta: number;
-  field: UsageField;
-  source: CustomerMetricSource;
-  vaultId: string;
-}): void {
-  recordQuotaDelta({
-    accountId: input.accountId,
-    delta: input.delta,
-    operation: input.field,
-    source: input.source,
-    vaultId: input.vaultId
-  });
-}
-
-function recordQuotaDelta(input: {
-  accountId: string | null;
-  delta: number;
-  operation: UsageField | 'memory_count';
-  source: CustomerMetricSource;
-  vaultId: string;
-}): void {
-  if (!input.accountId || input.delta === 0) return;
-
-  const base = {
-    event_type: 'quota_delta' as const,
-    source: input.source,
-    vault_id: input.vaultId,
-    workspace_id: input.accountId
-  };
-
+/** Prepare at the accounting boundary; both transports must reuse this envelope. */
+export function buildQuotaDeltaEvent(input: {
+  accountId: string | null; delta: number; operation: UsageField | 'memory_count';
+  source: CustomerMetricSource; vaultId: string;
+}): CustomerMetricEvent | null {
+  if (!input.accountId || input.delta === 0) return null;
+  const base = { event_type: 'quota_delta' as const, source: input.source,
+    vault_id: input.vaultId, workspace_id: input.accountId };
   switch (input.operation) {
-    case 'ingest_events':
-      recordCustomerMetric({
-        ...base,
-        ingest_events_delta: input.delta,
-        operation: 'ingest_events'
-      });
-      return;
-    case 'memory_adds':
-      recordCustomerMetric({
-        ...base,
-        memory_adds_delta: input.delta,
-        operation: 'memory_adds'
-      });
-      return;
-    case 'memory_count':
-      recordCustomerMetric({
-        ...base,
-        memory_count_delta: input.delta,
-        operation: 'memory_count'
-      });
-      return;
-    case 'searches':
-      recordCustomerMetric({
-        ...base,
-        operation: 'searches',
-        searches_delta: input.delta
-      });
-      return;
+    case 'ingest_events': return buildCustomerMetricEvent({...base, operation: input.operation, ingest_events_delta: input.delta});
+    case 'memory_adds': return buildCustomerMetricEvent({...base, operation: input.operation, memory_adds_delta: input.delta});
+    case 'memory_count': return buildCustomerMetricEvent({...base, operation: input.operation, memory_count_delta: input.delta});
+    case 'searches': return buildCustomerMetricEvent({...base, operation: input.operation, searches_delta: input.delta});
   }
+}
+
+function recordPreparedQuotaDelta(event: CustomerMetricEvent | null): void {
+  if (event) { try { recordCustomerMetric(event); } catch { /* Keep committed quota authoritative. */ } }
 }
 
 async function getMemoryCapacity(vaultId: string, client?: PoolClient): Promise<{ activeMemories: number; limit: number | undefined }> {

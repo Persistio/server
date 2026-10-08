@@ -1,6 +1,8 @@
+import { getConfig } from '../config';
+import { captureShadowCustomerMetric } from './customer-metric-shadow';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { recordCustomerMetric } from './customer-metrics';
+import { buildCustomerMetricEvent, recordCustomerMetric, type CustomerMetricEvent } from './customer-metrics';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -82,7 +84,7 @@ export function setCustomerMetricVaultId(request: FastifyRequest, vaultId: strin
   request.customerMetricVaultId = vaultId;
 }
 
-export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: FastifyReply): void {
+export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: FastifyReply): CustomerMetricEvent | undefined {
   const route = request.routeOptions.url ?? '/unmatched';
   const operation = customerMetricOperationForRoute(route, request.method);
   if (!operation) return;
@@ -92,7 +94,7 @@ export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: F
   const vaultId = getMetricVaultId(request, route);
 
   try {
-    recordCustomerMetric({
+    const event = buildCustomerMetricEvent({
       api_request_count: 1,
       duration_ms: normalizeDurationMs(reply.elapsedTime),
       event_type: 'api_request',
@@ -105,12 +107,28 @@ export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: F
       ...(vaultId ? { vault_id: vaultId } : {}),
       workspace_id: workspaceId
     });
+    recordCustomerMetric(event);
+    return event;
   } catch (error) {
     request.log.warn({
       error: error instanceof Error ? error.message : String(error),
       route
     }, 'failed to record customer API request metric');
   }
+}
+
+/** Explicitly best effort after response. This is not a CPU-throttling-safe hook. */
+export async function recordCustomerApiRequestObservation(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const observation = recordCustomerApiRequestMetric(request, reply);
+  if (!getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE || !observation) return;
+  try {
+    const { withTransaction } = await import('../db/client');
+    await withTransaction(async client => {
+      await client.query("SET LOCAL statement_timeout='250ms'");
+      await client.query("SET LOCAL lock_timeout='100ms'");
+      await captureShadowCustomerMetric(client, observation);
+    });
+  } catch { /* Never change/retry a response that has already been sent. */ }
 }
 
 function buildApiRequestLabels(request: FastifyRequest): Record<string, string> | undefined {

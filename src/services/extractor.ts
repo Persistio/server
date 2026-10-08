@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { checkpointExecutionState } from '../request-worker/state';
 import { CONFLICT_BOUNDS, conflictRequestData, reserveConflictSend, verifyConflictObjects, type PreparedConflict } from './conflict-evidence';
 import { boundedConflictFetch } from './conflict-transport';
 import { parseModelJson } from './model-json';
@@ -481,9 +482,11 @@ export class ExtractorService {
         }
       }
       circuitBreaker.onSuccess();
+      await checkpointExecutionState();
       return response;
     } catch (error) {
       const breakerResult = circuitBreaker.onFailure(error);
+      await checkpointExecutionState();
       if (breakerResult.opened && isAuthFailureError(error)) {
         operationalLog.warn(JSON.stringify({
           level: 40,

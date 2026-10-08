@@ -19,7 +19,7 @@ describe.skipIf(!databaseUrl)('curator final-state survivor invariants (real Pos
   const pool = new Pool({ connectionString: databaseUrl });
   const vaults: string[] = [], queues: string[] = [];
   let db: typeof import('../db/client');
-  let worker: typeof import('./curation-worker');
+  let worker: import('./curation-execution').CurationExecution;
   let CuratorService: typeof import('../services/curator').CuratorService;
   let config: ReturnType<typeof import('../config').getConfig>;
   let vector: number[];
@@ -40,7 +40,7 @@ describe.skipIf(!databaseUrl)('curator final-state survivor invariants (real Pos
     vector = [1, ...Array(Number(/\((\d+)\)/.exec(type)![1]) - 1).fill(0)];
     state.embed.mockResolvedValue(vector);
     ({ CuratorService } = await import('../services/curator'));
-    worker = await import('./curation-worker');
+    worker = (await import('./curation-execution')).createCurationExecution();
   });
   afterEach(async () => {
     vi.restoreAllMocks();
@@ -81,7 +81,8 @@ describe.skipIf(!databaseUrl)('curator final-state survivor invariants (real Pos
       await accounting.beforeRequest();
       const parts = request.messages[1].content;
       const result = await fn(JSON.parse(parts[0].text).memories, JSON.parse(parts[1].text).memories, JSON.parse(parts[2].text).sources);
-      await accounting.returnedUsage({ promptTokens: 100, completionTokens: 50, totalTokens: 150 });
+      await accounting.returnedUsage({ promptTokens: 100, visibleCompletionTokens: 50, reasoningTokens: 0,
+        outputTokens: 50, totalTokens: 150, reasoningTokenSource: 'unavailable' });
       return { usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(result) } }] };
     });
   }

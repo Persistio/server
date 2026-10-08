@@ -1,3 +1,4 @@
+import { captureShadowCustomerMetric } from '../services/customer-metric-shadow';
 import crypto from 'node:crypto';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
@@ -7,7 +8,7 @@ import { query, withTransaction } from '../db/client';
 import { createApiKey, ensureRequestedAccountAccess, getAuthAccountId, requireAdminScope } from '../middleware/auth';
 import { decryptForVault, encryptForVault, generateAndWrapDek, type VaultEncryptionContext } from '../services/crypto';
 import { setCustomerMetricVaultId } from '../services/customer-api-request-metrics';
-import { recordCustomerMetric } from '../services/customer-metrics';
+import { buildCustomerMetricEvent, recordCustomerMetric } from '../services/customer-metrics';
 import { getRawChunkStorage, type RawChunkStorage } from '../services/raw-chunk-storage';
 import { getVaultStats } from '../services/vault-stats';
 import {
@@ -180,7 +181,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     const body = parsedBody.data;
     const result = await query<{ id: string; limits: Record<string, unknown> }>(
       `UPDATE plans
-       SET limits = $2::jsonb
+       SET limits = limits || $2::jsonb
        WHERE id = $1
        RETURNING id, limits`,
       [id, JSON.stringify(body.limits)]
@@ -580,14 +581,21 @@ async function cleanupQueuedRawChunkBlobDeletes(
   const settled = await Promise.allSettled(activeRows.map(async (row) => {
     try {
       await storage.delete(row.blob_key);
-      await query(
-        `UPDATE raw_chunk_blob_deletion_queue
-         SET deleted_at = now(),
-             last_error = NULL
-         WHERE id = $1`,
-        [row.id]
-      );
-      recordRawChunkBlobDeleteDelta(row);
+      const event = rawChunkBlobDeleteEvent(row);
+      let settled = true;
+      if (getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE) {
+        settled = await withTransaction(async client => {
+          const result = await client.query(`UPDATE raw_chunk_blob_deletion_queue
+            SET deleted_at = now(), last_error = NULL WHERE id = $1 AND deleted_at IS NULL RETURNING id`, [row.id]);
+          if (result.rowCount && event) await captureShadowCustomerMetric(client, event);
+          return result.rowCount === 1;
+        });
+      } else {
+        await query(`UPDATE raw_chunk_blob_deletion_queue SET deleted_at = now(), last_error = NULL WHERE id = $1`, [row.id]);
+      }
+      if (settled) {
+        try { if (event) recordCustomerMetric(event); } catch { /* Committed deletion must not be retried for telemetry. */ }
+      }
     } catch (error) {
       await recordRawChunkBlobDeleteFailure(row.id, error);
       throw error;
@@ -601,13 +609,12 @@ async function cleanupQueuedRawChunkBlobDeletes(
   return { attempted: rows.length };
 }
 
-function recordRawChunkBlobDeleteDelta(
-  row: RawChunkBlobDeletionRow
-): void {
+function rawChunkBlobDeleteEvent(row: RawChunkBlobDeletionRow):
+  import('../services/customer-metrics').CustomerMetricEvent | undefined {
   const accountId = row.workspace_id;
   const storageBytes = toPositiveNumber(row.storage_bytes);
   if (!accountId || storageBytes === null || storageBytes === 0) return;
-  recordCustomerMetric({
+  return buildCustomerMetricEvent({
     event_type: 'storage_delta',
     operation: 'raw_chunk_blob_delete',
     source: 'api',
