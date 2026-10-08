@@ -1,3 +1,4 @@
+import { requestAll } from './request-work';
 import { executionSignal, executionFetch } from '../request-worker/context';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('embedder');
@@ -21,6 +22,7 @@ export interface Embedder {
 export const OPENAI_EMBEDDING_MAX_TOKENS_PER_INPUT = 8192;
 
 export interface EmbedderTelemetry {
+  signal?: AbortSignal;
   inputType?: 'document' | 'query';
   modelRole?: ModelUsageRole;
   source?: CustomerMetricSource;
@@ -148,7 +150,8 @@ export class OpenAIEmbedder implements Embedder {
       for (const batch of batches) {
         const start = performance.now();
         const request = { model: this.model, input: batch };
-        const signal = executionSignal();
+        const signals = [executionSignal(), telemetry?.signal].filter((s): s is AbortSignal => Boolean(s));
+        const signal = signals.length ? AbortSignal.any(signals) : undefined;
         const response = signal
           ? await this.client.embeddings.create(request, { signal, maxRetries: 0 })
           : await this.client.embeddings.create(request);
@@ -236,19 +239,24 @@ export class VertexEmbedder implements Embedder {
       });
       let totalDurationMs = 0;
 
-      await Promise.all(indexedBatches.map(({ batch, offset }) => limit(async () => {
-        const start = performance.now();
-        const embeddings = await this.requestEmbeddings(batch, telemetry?.inputType ?? 'document');
-        const durationMs = performance.now() - start;
-        totalDurationMs += durationMs;
-        embeddingDurationHistogram.record(durationMs, {
-          provider: 'vertex',
-          model: this.model
-        });
+      let failed = false;
+      await requestAll(indexedBatches.map(({ batch, offset }) => limit(async () => {
+        if (failed && config.API_REQUEST_BILLING) throw new Error('Embedding batch stopped');
+        try {
+          telemetry?.signal?.throwIfAborted();
+          const start = performance.now();
+          const embeddings = await this.requestEmbeddings(batch, telemetry?.inputType ?? 'document', telemetry?.signal);
+          const durationMs = performance.now() - start;
+          totalDurationMs += durationMs;
+          embeddingDurationHistogram.record(durationMs, {
+            provider: 'vertex',
+            model: this.model
+          });
 
-        for (let index = 0; index < batch.length; index++) {
-          results[offset + index] = normalizeEmbedding(embeddings[index] ?? [], this.dimensions);
-        }
+          for (let index = 0; index < batch.length; index++) {
+            results[offset + index] = normalizeEmbedding(embeddings[index] ?? [], this.dimensions);
+          }
+        } catch (error) { failed = true; throw error; }
       })));
 
       await recordEmbeddingUsage({
@@ -264,14 +272,17 @@ export class VertexEmbedder implements Embedder {
     });
   }
 
-  private async requestEmbeddings(texts: string[], inputType: NonNullable<EmbedderTelemetry['inputType']>): Promise<number[][]> {
+  private async requestEmbeddings(texts: string[], inputType: NonNullable<EmbedderTelemetry['inputType']>, signal?: AbortSignal): Promise<number[][]> {
+    signal?.throwIfAborted();
     const accessToken = await this.auth.getAccessToken();
+    signal?.throwIfAborted();
     if (!accessToken) {
       throw new Error('Could not acquire Google Cloud access token for Vertex embeddings');
     }
 
     const url = `https://${this.location}-aiplatform.googleapis.com/v1/projects/${this.projectId}/locations/${this.location}/publishers/google/models/${this.model}:predict`;
     const response = await executionFetch(url, {
+      signal,
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -326,7 +337,12 @@ export class OllamaEmbedder implements Embedder {
 
     const config = getConfig();
     const limit = pLimit(config.INGEST_EMBEDDING_CONCURRENCY);
-    return Promise.all(texts.map((text) => limit(() => this.embedOne(text, telemetry))));
+    let failed = false;
+    return requestAll(texts.map((text) => limit(async () => {
+      if (failed && getConfig().API_REQUEST_BILLING) throw new Error('Embedding batch stopped');
+      try { return await this.embedOne(text, telemetry); }
+      catch (error) { failed = true; throw error; }
+    })));
   }
 
   private async embedOne(text: string, telemetry?: EmbedderTelemetry): Promise<number[]> {
@@ -336,6 +352,7 @@ export class OllamaEmbedder implements Embedder {
     }, async (span) => {
       const start = performance.now();
       const response = await executionFetch(`${this.baseUrl}/api/embeddings`, {
+        signal: telemetry?.signal,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -406,6 +423,7 @@ export class TeiEmbedder implements Embedder {
       for (const batch of batches) {
         const start = performance.now();
         const response = await executionFetch(`${this.baseUrl}/v1/embeddings`, {
+          signal: telemetry?.signal,
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'

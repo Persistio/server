@@ -28,7 +28,7 @@ describe.skipIf(!url)('built private-worker startup (PostgreSQL)', () => {
   }
   it('starts while the migration lock is held, exposes no customer routes and idles without business connections', async () => {
     const lock = await pool.connect(); await lock.query('SELECT pg_advisory_lock(734920174600360)');
-    const run = await start({ PLATFORM_AUTH_MODE: 'oauth', PLATFORM_OAUTH_ISSUER: '', PLATFORM_OAUTH_AUDIENCE: '', PLATFORM_OAUTH_CLIENT_POLICIES: '' });
+    const run = await start({ REQUEST_WORKER_ADMISSION_ENABLED: 'false', REQUEST_WORKER_CUTOVER_ENABLED: 'true', CUSTOMER_METRICS_DURABLE_CAPTURE: 'true', PLATFORM_AUTH_MODE: 'oauth', PLATFORM_OAUTH_ISSUER: '', PLATFORM_OAUTH_AUDIENCE: '', PLATFORM_OAUTH_CLIENT_POLICIES: '' });
     try {
       await vi.waitFor(async () => {
         expect(run.child.exitCode, run.output()).toBeNull();
@@ -47,7 +47,7 @@ describe.skipIf(!url)('built private-worker startup (PostgreSQL)', () => {
     }
   }, 12000);
   it.each([
-    { REQUEST_WORKER_ENABLED: 'false' }, { TELEMETRY_PROVIDER: 'gcp_otlp' }, { CUSTOMER_METRICS_PUBLISHER: 'log' }
+    { REQUEST_WORKER_ENABLED: 'false' }, { REQUEST_WORKER_CUTOVER_ENABLED: 'true', CUSTOMER_METRICS_DURABLE_CAPTURE: 'false' }, { TELEMETRY_PROVIDER: 'gcp_otlp' }, { CUSTOMER_METRICS_PUBLISHER: 'log' }
   ])('refuses unsafe request-mode startup %j', async extra => {
     const run = await start(extra);
     try {

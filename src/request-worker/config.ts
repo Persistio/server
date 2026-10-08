@@ -3,6 +3,7 @@ import { z } from 'zod';
 const schema = z.object({
   REQUEST_WORKER_ENABLED: z.literal('true'),
   REQUEST_WORKER_ADMISSION_ENABLED: z.enum(['true', 'false']).optional(),
+  REQUEST_WORKER_CUTOVER_ENABLED: z.enum(['true', 'false']).optional(),
   REQUEST_WORKER_AUDIENCE: z.string().url().refine(value => {
     const u = new URL(value);
     return u.protocol === 'https:' && u.hostname.endsWith('.run.app') && !u.port &&

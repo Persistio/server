@@ -1,5 +1,7 @@
 import Fastify from 'fastify';
 
+export class ScheduledCleanupError extends Error {}
+
 /** Explicit scheduled requests only. Unknown I/O is terminated with the process,
  * never acknowledged while background SQL/publication can still be running. */
 export function createScheduledWorkerServer(options: {
@@ -28,7 +30,8 @@ export function createScheduledWorkerServer(options: {
         if (request.body !== undefined && request.body !== null && request.body !== '') return reply.code(400).send();
         const status = operation === 'observe' ? await options.observe() : (await options.reconcile(), 0);
         return reply.code(stopping || status !== 0 ? 503 : 204).send();
-      } catch {
+      } catch (error) {
+        if (error instanceof ScheduledCleanupError) terminate();
         return reply.code(503).send();
       } finally {
         clearTimeout(timer);

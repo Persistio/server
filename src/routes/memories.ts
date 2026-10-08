@@ -1,3 +1,4 @@
+import { requestAll } from '../services/request-work';
 import crypto from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -725,7 +726,7 @@ async function memoryGraphResponse(
   const edges = nodeIds.length
     ? await fetchGraphEdges(vault.id, nodeIds, edgeTypes)
     : [];
-  const decryptedNodes = await Promise.all(nodes.map((row) => decryptMemoryRow(vault, row)));
+  const decryptedNodes = await requestAll(nodes.map((row) => decryptMemoryRow(vault, row)));
 
   return {
     seed_memory_id: qs.seed_memory_id ?? null,
@@ -757,7 +758,7 @@ async function listMemories(
   }
 
   const rows = await listMemoryRows(vault, qs);
-  const items = await Promise.all(rows.items.map((row) => decryptMemoryRow(vault, row)));
+  const items = await requestAll(rows.items.map((row) => decryptMemoryRow(vault, row)));
   return { items, total: rows.total };
 }
 
@@ -844,7 +845,7 @@ async function listMemoryRows(
   }
 
   const countValues = qs.include_children ? values : values.slice(0, -2);
-  const [result, countResult] = await Promise.all([
+  const [result, countResult] = await requestAll([
     query<MemoryResponseRow>(sql, values),
     query<{ total: number }>(totalSql, countValues)
   ]);
@@ -873,7 +874,7 @@ async function listEncryptedSearchMemories(
     offset += page.items.length;
   } while (offset < total && rows.length < total);
 
-  const decrypted = await Promise.all(rows.map((row) => decryptMemoryRow(vault, row)));
+  const decrypted = await requestAll(rows.map((row) => decryptMemoryRow(vault, row)));
   const normalized = normalizeSearch(qs.q ?? '');
   const filtered = decrypted
     .filter((memory) => memoryMatchesQuery(memory, normalized))
@@ -911,7 +912,7 @@ async function listMemorySubjects(
   );
 
   const normalized = normalizeSearch(qs.q ?? '');
-  const subjects = (await Promise.all(result.rows.map((row) => deserializeSubjectSummary(vault, row))))
+  const subjects = (await requestAll(result.rows.map((row) => deserializeSubjectSummary(vault, row))))
     .filter((subject) => !normalized || normalizeSearch(subject.subject).includes(normalized))
     .sort((a, b) => compareSubjects(a, b, qs.sort));
 

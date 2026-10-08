@@ -5,7 +5,7 @@ import type { WorkerWake } from '../services/worker-wake-types';
 
 export type Admission = { status: 'acquired'; previousOwner: string | null } | { status: 'busy' } | { status: 'stale' };
 export class WorkerExecutionStore {
-  constructor(private readonly pool: Pick<Pool, 'connect' | 'query'>) {}
+  constructor(private readonly pool: Pick<Pool, 'connect' | 'query'>, private readonly requirePollerDrained = false) {}
 
   private async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
@@ -23,6 +23,14 @@ export class WorkerExecutionStore {
 
   async acquire(owner: string, wake: WorkerWake): Promise<Admission> {
     return this.transaction(async client => {
+      // Defence in depth during the staged IaC handoff. Actual revision drainage
+      // remains mandatory: SQL absence alone cannot prevent an old revision restart.
+      if (this.requirePollerDrained) {
+        const legacy = await client.query(`SELECT 1 FROM pg_stat_activity
+          WHERE datname=current_database() AND (application_name LIKE 'persistio:worker:%'
+            OR application_name LIKE 'persistio:combined:%') LIMIT 1`);
+        if (legacy.rowCount) return { status: 'busy' };
+      }
       const slot = (await client.query<{ owner: string | null; live: boolean }>(
         'SELECT owner, expires_at > clock_timestamp() AS live FROM worker_execution_slot WHERE id=1 FOR UPDATE'
       )).rows[0];

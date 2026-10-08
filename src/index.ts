@@ -18,7 +18,7 @@ import { registerPlatformOAuth } from './oauth';
 import { registerAnalyticsRoutes } from './routes/analytics';
 import { registerHealthRoutes } from './routes/health';
 import { initCryptoClient } from './services/crypto';
-import { recordCustomerApiRequestObservation } from './services/customer-api-request-metrics';
+import { registerCustomerRequestObservations } from './services/customer-api-request-metrics';
 import { initCustomerMetrics, shutdownCustomerMetrics } from './services/customer-metrics';
 import { getSpanAttributes } from './telemetry';
 
@@ -92,7 +92,9 @@ async function main() {
 
   if (!isAnalyticsApi) {
     const db = await import('./db/client');
-    closeDbPool = db.closePool;
+    closeDbPool = async () => {
+      await Promise.all([db.closePool(), (await import('./db/auxiliary')).closeAuxiliaryPool()]);
+    };
     const { runMigrations } = db;
     await runMigrations();
   }
@@ -112,14 +114,14 @@ async function main() {
     persistio_mode: config.PERSISTIO_MODE
   }, 'Event publisher configured');
 
-  app.addHook('onResponse', async (request, reply) => {
+  registerCustomerRequestObservations(app, config.API_REQUEST_BILLING);
+  if (!config.API_REQUEST_BILLING) app.addHook('onResponse', async (request, reply) => {
     const route = request.routeOptions.url ?? '/unmatched';
     httpRequestDurationHistogram.record(reply.elapsedTime, {
       method: request.method,
       route,
       status_code: String(reply.statusCode)
     });
-    await recordCustomerApiRequestObservation(request, reply);
   });
 
   registerPlatformErrorHandler(app);

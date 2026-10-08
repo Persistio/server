@@ -204,8 +204,16 @@ export async function registerRecallRoutes(app: FastifyInstance) {
     // claims. A counter failure cannot suppress the response or retry the request.
     const returned=assembled?.included ?? decoded;
     recallDurationHistogram.record(performance.now()-started,{mode:body.mode});
-    if (returned.length) void query(RECALL_COUNTER_UPDATE_SQL,
-      [request.vault.id,returned.map(row => row.id)]).catch(() => {});
+    if (returned.length) {
+      if (getConfig().API_REQUEST_BILLING) {
+        try {
+          const { auxiliaryQuery } = await import('../db/auxiliary');
+          await auxiliaryQuery(RECALL_COUNTER_UPDATE_SQL, [request.vault.id, returned.map(row => row.id)]);
+        } catch { /* Counters are best effort; preserve the valid recall. */ }
+      } else {
+        void query(RECALL_COUNTER_UPDATE_SQL, [request.vault.id, returned.map(row => row.id)]).catch(() => {});
+      }
+    }
     try { request.log.info({ vault_id: request.vault.id,route: '/v1/recall',status: 200,
       duration_ms: performance.now()-started,result_count: returned.length,
       response_bytes: Buffer.byteLength(JSON.stringify(response)) },'Recall served'); } catch { /* A logger failure cannot suppress a valid recall. */ }

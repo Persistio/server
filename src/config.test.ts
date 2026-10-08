@@ -39,6 +39,19 @@ async function parseConfig(overrides: NodeJS.ProcessEnv = {}) {
 }
 
 describe('config environment normalization', () => {
+  it('requires the complete guarded API configuration', async () => {
+    const guarded = { PERSISTIO_MODE: 'api', API_REQUEST_BILLING: 'true', CUSTOMER_METRICS_DURABLE_CAPTURE: 'true', TELEMETRY_PROVIDER: 'none' };
+    await expect(parseConfig(guarded)).resolves.toMatchObject({ API_REQUEST_BILLING: true });
+    for (const invalid of [{ PERSISTIO_MODE: 'combined' }, { CUSTOMER_METRICS_DURABLE_CAPTURE: 'false' }, { TELEMETRY_PROVIDER: 'gcp_otlp' }, { CUSTOMER_METRICS_PUBLISHER: 'log' }, { CUSTOMER_METRICS_SHADOW_CAPTURE: 'true' }]) {
+      await expect(parseConfig({ ...guarded, ...invalid })).rejects.toThrow();
+    }
+    await expect(parseConfig({ ...guarded, API_REQUEST_BILLING: 'false' })).rejects.toThrow('Durable production capture');
+  });
+  it('requires exclusive production delivery ownership', async () => {
+    await expect(parseConfig({PERSISTIO_MODE:'request-worker',CUSTOMER_METRICS_DURABLE_CAPTURE:'true'})).resolves.toMatchObject({CUSTOMER_METRICS_DURABLE_CAPTURE:true});
+    await expect(parseConfig({PERSISTIO_MODE:'request-worker',CUSTOMER_METRICS_DURABLE_CAPTURE:'true',CUSTOMER_METRICS_SHADOW_CAPTURE:'true'})).rejects.toThrow('Durable production capture');
+    await expect(parseConfig({PERSISTIO_MODE:'request-worker',CUSTOMER_METRICS_DURABLE_CAPTURE:'true',CUSTOMER_METRICS_PUBLISHER:'log'})).rejects.toThrow('Durable production capture');
+  });
   it('refuses raw provider debug logging before any provider client can be constructed',async()=>{
     await expect(parseConfig({DEBUG:'true'})).rejects.toThrow('Raw provider debug logging must be disabled');
     await expect(parseConfig({DEBUG:'false'})).resolves.toBeDefined();

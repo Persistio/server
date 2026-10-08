@@ -35,6 +35,17 @@ describe.skipIf(!url)('request worker ownership and real thread execution (Postg
     await pool.query("DELETE FROM platform_event_outbox WHERE payload->>'vault_id'=ANY($1::text[])", [vaults]);
     await pool.query('DELETE FROM vaults WHERE id=ANY($1::uuid[])', [vaults]); await pool.end();
   });
+  it('refuses handoff while any legacy poller database session remains', async () => {
+    const legacy = new Client({connectionString:url,application_name:'persistio:worker:extraction'});
+    await legacy.connect();
+    const guarded = new WorkerExecutionStore(pool, true);
+    const current = await wake();
+    try {
+      expect(await guarded.acquire(crypto.randomUUID(), current)).toEqual({status:'busy'});
+      expect((await active()).owner).toBeNull();
+    } finally { await legacy.end(); }
+    expect((await guarded.acquire(crypto.randomUUID(), current)).status).toBe('acquired');
+  });
   it('admits exactly one owner across duplicate deliveries and different wake kinds', async () => {
     const extraction = await wake(), usage = await wake('usage_periods');
     const results = await Promise.all(Array.from({ length: 12 }, (_, n) => store.acquire(crypto.randomUUID(), n % 2 ? extraction : usage)));

@@ -1,3 +1,4 @@
+import { requestAll } from './request-work';
 import { createOperationalLogger } from '../operational-metadata';
 const operationalLog=createOperationalLogger('curation-capacity');
 import type { PoolClient, QueryResultRow } from 'pg';
@@ -520,7 +521,7 @@ export async function recordCuratorDeferralInTransaction(client: PoolClient, inp
 
 export async function getCurationStatus(vaultId: string): Promise<CuratorCapacityStatus> {
   const period = getCurrentUsagePeriod();
-  const [result, recentRunsResult] = await Promise.all([
+  const [result, recentRunsResult] = await requestAll([
     query<StatusRow>(
     `SELECT
        v.plan_id,

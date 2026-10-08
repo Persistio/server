@@ -263,9 +263,9 @@ async function ingestChunksForVault(
     const preparedCrypto = newChunks.length ? await prepareVaultCrypto(vault) : undefined;
     // Admission above precedes embedding/encryption, and preparation shares a
     // process-wide bound. A late preparation result cannot initiate an upload.
-    const [preparedEmbeddings = []] = await rawChunkPreparationPool.map(newChunks.length ? [newChunks] : [], batch =>
+    const [preparedEmbeddings = []] = await rawChunkPreparationPool.map(newChunks.length ? [newChunks] : [], (batch, _index, signal) =>
       getEmbedder().embedBatch(batch.map(chunk => chunk.content),
-        { vaultId: vault.id, modelRole: 'embedding', source: 'api', inputType: 'document' }));
+        { vaultId: vault.id, modelRole: 'embedding', source: 'api', inputType: 'document', signal }));
     const embeddings = new Map(preparedIndexes.map((index, localIndex) => [index, preparedEmbeddings[localIndex]]));
     const storedContents = newChunks.map(chunk => preparedCrypto!.encrypt(vault, chunk.content));
     blobInputs.forEach((blob, index) => {
@@ -464,6 +464,11 @@ function uuidFromSha256(value: string): string {
 }
 
 async function reconcileRawChunkBlobWrites(storage: RawChunkStorage, blobKeys: string[]): Promise<unknown[]> {
+  if (getConfig().API_REQUEST_BILLING) {
+    // Intents were committed before PUT. Independent reconciliation owns cleanup;
+    // no deletion SDK operation may outlive this API response.
+    return blobKeys.length ? [new Error('Raw cleanup durably deferred')] : [];
+  }
   // Only four inline attempts, concurrently, each with a one-second IO deadline.
   // Remaining intents are already durable and handled by the fair background
   // reconciler. SQL proofs are still awaited; timing out SQL is not cancellation.

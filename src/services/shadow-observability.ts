@@ -42,26 +42,27 @@ export interface WorkerObservation {
  * fabricated zeros. Each kind has a separate external absence signal. */
 export async function observeWorkerShadow(
   db: Pick<Pool,'connect'>,
-  options: { enabled?: boolean; curationEnabled?: boolean; contradictionEnabled?: boolean;
+  options: { enabled?: boolean; curationEnabled?: boolean; contradictionEnabled?: boolean; productionMetrics?: boolean;
     emit?: (observation: WorkerObservation) => void } = {}
 ): Promise<WorkerObservation[]> {
   if (!options.enabled) return [];
   const output: WorkerObservation[] = [];
+  const metricTable = options.productionMetrics ? 'customer_metric_outbox' : 'customer_metric_shadow_outbox';
   for (const kind of [...WORKER_WAKE_KINDS, 'customer_metrics'] as const) {
     if (kind === 'curation' && !options.curationEnabled || kind === 'contradiction' && !options.contradictionEnabled) continue;
     let observation: WorkerObservation;
     try {
       const dueSql = kind === 'customer_metrics'
-        ? `SELECT event_ts AS age_at, GREATEST(available_at,lease_expires_at) AS due_at FROM customer_metric_shadow_outbox WHERE status='pending'`
+        ? `SELECT event_ts AS age_at, GREATEST(available_at,lease_expires_at) AS due_at FROM ${metricTable} WHERE status='pending'`
         : workerDueRowsSql[kind];
       const leases = kind === 'extraction' || kind === 'curation'
         ? `(SELECT count(*) FROM ${kind}_queue WHERE claim_token IS NOT NULL AND lease_expires_at<=now())`
         : kind === 'customer_metrics'
-          ? `(SELECT count(*) FROM customer_metric_shadow_outbox WHERE status='pending' AND lease_expires_at<=now())` : '0';
+          ? `(SELECT count(*) FROM ${metricTable} WHERE status='pending' AND lease_expires_at<=now())` : '0';
       const dead = kind === 'extraction' || kind === 'curation'
         ? `(SELECT count(*) FROM ${kind}_dead_letter WHERE dead_lettered_at>now()-interval '25 hours')`
         : kind === 'customer_metrics'
-          ? `(SELECT count(*) FROM customer_metric_shadow_outbox WHERE status='dead')`
+          ? `(SELECT count(*) FROM ${metricTable} WHERE status='dead')`
           : kind === 'platform_outbox' ? `(SELECT count(*) FROM platform_event_outbox WHERE status='dead')` : '0';
       const row = (await workerWakeQuery<{
         observed_at_ms: string; eligible_depth: string; oldest_due_age_ms: string; deferred_depth: string;

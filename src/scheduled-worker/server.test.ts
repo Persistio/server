@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createScheduledWorkerServer } from './server';
+import { createScheduledWorkerServer, ScheduledCleanupError } from './server';
 
 const runtimes: ReturnType<typeof createScheduledWorkerServer>[] = [];
 function setup(overrides: Partial<Parameters<typeof createScheduledWorkerServer>[0]> = {}) {
@@ -41,6 +41,14 @@ describe('scheduled foundation host', () => {
     expect((await first).statusCode).toBe(204);
     expect(r.options.observe).toHaveBeenCalledOnce();
     expect(r.options.reconcile).not.toHaveBeenCalled();
+  });
+  it('terminates instead of leaving uncertain publisher cleanup behind a response', async () => {
+    const r = setup({observe:vi.fn().mockRejectedValue(new ScheduledCleanupError('uncertain cleanup'))});
+    expect((await call(r.app)).statusCode).toBe(503);
+    expect(r.options.fatal).toHaveBeenCalledOnce();
+    expect((await r.app.inject('/health')).statusCode).toBe(503);
+    expect((await call(r.app)).statusCode).toBe(503);
+    expect(r.options.observe).toHaveBeenCalledOnce();
   });
   it('propagates reported delivery failures, thrown errors and auth failures without private error text', async () => {
     const observe = vi.fn().mockResolvedValueOnce(1).mockRejectedValueOnce(new Error('private-canary'));

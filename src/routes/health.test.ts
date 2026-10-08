@@ -8,6 +8,7 @@ const { poolQueryMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('../db/client', () => ({
+  query: poolQueryMock,
   pool: {
     query: poolQueryMock
   }

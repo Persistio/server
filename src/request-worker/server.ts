@@ -1,7 +1,7 @@
 import { shadowWorkerCycle } from '../services/shadow-observability';
 import crypto from 'node:crypto';
 import Fastify from 'fastify';
-import { workerWakeSchema } from '../services/worker-wake-types';
+import { workerWakeSchema, type WorkerWakeKind } from '../services/worker-wake-types';
 import type { RequestWorkerConfig } from './config';
 import type { WorkerExecutionStore } from './store';
 import { superviseExecution, type ExecutionFactory } from './supervisor';
@@ -12,6 +12,7 @@ export function createRequestWorkerServer(options: {
   authenticate: (authorization: string | undefined) => Promise<boolean>;
   fatal: () => void;
   executionFactory?: ExecutionFactory;
+  continueWork?: (kind: WorkerWakeKind) => Promise<unknown>;
 }) {
   const app = Fastify({ logger: false, bodyLimit: 1024, requestTimeout: 10_000 });
   let busy = false;
@@ -39,7 +40,7 @@ export function createRequestWorkerServer(options: {
     abort.signal.addEventListener('abort', armFatal, { once: true });
     try {
       if (!await options.authenticate(request.headers.authorization)) return reply.code(401).send();
-      if (abort.signal.aborted || stopping || options.config.REQUEST_WORKER_ADMISSION_ENABLED === 'false') {
+      if (abort.signal.aborted || stopping || (options.config.REQUEST_WORKER_ADMISSION_ENABLED === 'false' && options.config.REQUEST_WORKER_CUTOVER_ENABLED !== 'true')) {
         return reply.code(503).send();
       }
       const parsed = workerWakeSchema.safeParse(request.body);
@@ -58,6 +59,13 @@ export function createRequestWorkerServer(options: {
       const acknowledged = await options.store.finish(owner, wake, success && !abort.signal.aborted);
       outcome = acknowledged ? 'completed' : 'failed';
       owner = undefined;
+      // Business is already durable and SQL is settled. Continuation owns no
+      // business retry and remains awaited inside the original request deadline.
+      if (cleanupDeadline) { clearTimeout(cleanupDeadline); cleanupDeadline = undefined; }
+      if (acknowledged && !abort.signal.aborted && !stopping && options.continueWork) {
+        try { await options.continueWork(wake.kind); }
+        catch { /* Minute reconciliation repairs missed continuation. */ }
+      }
       return reply.code(acknowledged ? 204 : 503).send();
     } catch {
       // Unknown admission/COMMIT/cleanup leaves the lease for fenced recovery.

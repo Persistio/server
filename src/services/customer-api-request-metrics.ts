@@ -1,6 +1,6 @@
 import { getConfig } from '../config';
 import { captureShadowCustomerMetric } from './customer-metric-shadow';
-import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import { buildCustomerMetricEvent, recordCustomerMetric, type CustomerMetricEvent } from './customer-metrics';
 
@@ -84,7 +84,7 @@ export function setCustomerMetricVaultId(request: FastifyRequest, vaultId: strin
   request.customerMetricVaultId = vaultId;
 }
 
-export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: FastifyReply): CustomerMetricEvent | undefined {
+export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: FastifyReply, preResponse = false): CustomerMetricEvent | undefined {
   const route = request.routeOptions.url ?? '/unmatched';
   const operation = customerMetricOperationForRoute(route, request.method);
   if (!operation) return;
@@ -98,7 +98,7 @@ export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: F
       api_request_count: 1,
       duration_ms: normalizeDurationMs(reply.elapsedTime),
       event_type: 'api_request',
-      labels: buildApiRequestLabels(request),
+      labels: preResponse ? { ...buildApiRequestLabels(request), request_observation_version: 2, observation_phase: 'pre_response' } : buildApiRequestLabels(request),
       method: request.method,
       operation,
       route,
@@ -107,7 +107,7 @@ export function recordCustomerApiRequestMetric(request: FastifyRequest, reply: F
       ...(vaultId ? { vault_id: vaultId } : {}),
       workspace_id: workspaceId
     });
-    recordCustomerMetric(event);
+    if (!preResponse) recordCustomerMetric(event);
     return event;
   } catch (error) {
     request.log.warn({
@@ -149,4 +149,28 @@ function getMetricVaultId(request: FastifyRequest, route: string): string | unde
 
 function normalizeDurationMs(durationMs: number): number {
   return Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : 0;
+}
+
+/** Install once, before routes. No post-response asynchronous work in guarded mode. */
+export function registerCustomerRequestObservations(app: FastifyInstance, requestBilled: boolean): void {
+  if (!requestBilled) {
+    app.addHook('onResponse', recordCustomerApiRequestObservation);
+    return;
+  }
+  const observed = new WeakSet<FastifyRequest>();
+  app.addHook('onSend', async (request, reply, payload) => {
+    if (observed.has(request)) return payload;
+    observed.add(request);
+    try {
+      const event = recordCustomerApiRequestMetric(request, reply, true);
+      if (event) {
+        const { withAuxiliaryClient } = await import('../db/auxiliary');
+        await withAuxiliaryClient(client => captureShadowCustomerMetric(client, event));
+      }
+    } catch {
+      // Unknown commit is deliberately not retried. This observation is best effort.
+      try { request.log.warn('Customer request observation unavailable'); } catch { /* Preserve response. */ }
+    }
+    return payload;
+  });
 }

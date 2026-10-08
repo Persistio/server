@@ -1,4 +1,5 @@
-import { captureShadowCustomerMetric } from '../services/customer-metric-shadow';
+import { requestAll } from '../services/request-work';
+import { captureShadowCustomerMetric, customerMetricCaptureEnabled } from '../services/customer-metric-shadow';
 import crypto from 'node:crypto';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
@@ -574,7 +575,7 @@ async function cleanupQueuedRawChunkBlobDeletes(
     new Error(`Cannot delete raw chunk blob ${row.blob_key} stored in ${row.blob_store} while configured storage is ${storage.store}`)
   );
 
-  await Promise.all(mismatchedRows.map((row, index) =>
+  await requestAll(mismatchedRows.map((row, index) =>
     recordRawChunkBlobDeleteFailure(row.id, errors[index])
   ));
 
@@ -583,7 +584,7 @@ async function cleanupQueuedRawChunkBlobDeletes(
       await storage.delete(row.blob_key);
       const event = rawChunkBlobDeleteEvent(row);
       let settled = true;
-      if (getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE) {
+      if (customerMetricCaptureEnabled()) {
         settled = await withTransaction(async client => {
           const result = await client.query(`UPDATE raw_chunk_blob_deletion_queue
             SET deleted_at = now(), last_error = NULL WHERE id = $1 AND deleted_at IS NULL RETURNING id`, [row.id]);

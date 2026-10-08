@@ -81,6 +81,39 @@ describe.skipIf(!url)('durable wake protocol (PostgreSQL 17)', () => {
     expect(transport.create).not.toHaveBeenCalled();
   });
 
+  it('chains a backlog without another scheduler tick and repairs a failed continuation', async () => {
+    let pending = 12;
+    reconciliation.dueAt.mockImplementation(async kind => kind === 'extraction' && pending ? due : null);
+    const dispatcher = new WorkerWakeDispatcher({enabled:true,store,transport,reconciliation,
+      contradictionAllowance:2,contradictionCycleMs:30000});
+    const start = Date.now();
+    await dispatcher.dispatchOnce(['extraction']);
+    const tokens = new Set<string>();
+    while (pending) {
+      const current = await row();
+      const wake = {version:1 as const,kind:'extraction' as const,token:current.active_token,generation:String(current.active_generation)};
+      tokens.add(wake.token);
+      pending--;
+      expect(await completeWorkerWake(pool, wake)).toBe(true);
+      if (pending === 6) {
+        transport.create.mockRejectedValueOnce(new Error('lost connection'));
+        expect((await dispatcher.dispatchOnce(['extraction'])).outcomes.extraction).toBe('failed');
+        await ready(); // simulate the subsequent independent recovery interval
+      }
+      await dispatcher.dispatchOnce(['extraction']);
+    }
+    expect(tokens.size).toBe(12);
+    expect((await row()).active_token).toBeNull();
+    expect(Date.now()-start).toBeLessThan(10000);
+  });
+  it('does not dispatch retained intents for administratively disabled kinds', async () => {
+    await request('curation');
+    const dispatcher = new WorkerWakeDispatcher({enabled:true,kinds:['extraction'],store,transport,reconciliation,
+      contradictionAllowance:2,contradictionCycleMs:30000});
+    await dispatcher.dispatchOnce(['curation']);
+    expect(transport.create).not.toHaveBeenCalled();
+    expect((await row('curation')).active_token).toBeNull();
+  });
   it('rolls back durable work and its intent together; coalesces requests per kind', async () => {
     const client = await pool.connect();
     try {

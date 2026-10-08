@@ -301,6 +301,7 @@ let activeEmitter: CustomerMetricEmitter | null = null;
 
 export async function initCustomerMetrics(config: AppConfig, logger?: CustomerMetricLogger): Promise<void> {
   await shutdownCustomerMetrics();
+  if (!shouldRecordCustomerMetrics(config)) return;
   activeEmitter = await createConfiguredCustomerMetricEmitter(config, logger);
   if (shouldRecordCustomerMetrics(config)) {
     logger?.info?.({

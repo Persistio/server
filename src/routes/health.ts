@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
-import type { AppConfig } from '../config';
+import { getConfig, type AppConfig } from '../config';
 import { EXTRACTION_QUEUE_READY_PREDICATE } from '../services/extraction-queue-eligibility';
 
 const HEALTH_DB_TIMEOUT_MS = 2000;
@@ -43,10 +43,12 @@ async function requireHealthAuth(request: FastifyRequest, reply: FastifyReply, c
 }
 
 export async function checkDatabase(timeoutMs = HEALTH_DB_TIMEOUT_MS) {
-  const { pool } = await import('../db/client');
+  const guarded = getConfig().API_REQUEST_BILLING;
+  const query = guarded ? (await import('../db/auxiliary')).auxiliaryQuery : (await import('../db/client')).query;
+  const bounded = <T>(work: Promise<T>) => guarded ? work : withTimeout(work, timeoutMs);
   const startedAt = Date.now();
-  const dbCheck = withTimeout(pool.query('SELECT 1'), timeoutMs);
-  const queueDepthsCheck = withTimeout(pool.query<{
+  const dbCheck = bounded(query('SELECT 1'));
+  const queueDepthsCheck = bounded(query<{
     extraction_depth: number;
     extraction_inflight_depth: number;
     curation_depth: number;
@@ -55,10 +57,10 @@ export async function checkDatabase(timeoutMs = HEALTH_DB_TIMEOUT_MS) {
        (SELECT COUNT(*) FROM extraction_queue eq WHERE ${EXTRACTION_QUEUE_READY_PREDICATE})::int AS extraction_depth,
        (SELECT COUNT(*) FROM extraction_queue WHERE claimed_at IS NOT NULL)::int AS extraction_inflight_depth,
        (SELECT COUNT(*) FROM curation_queue)::int AS curation_depth`
-  ), timeoutMs);
+  ));
 
-  void dbCheck.catch(() => undefined);
-  void queueDepthsCheck.catch(() => undefined);
+  // Both bounded operations settle even if connectivity fails first.
+  await Promise.allSettled([dbCheck, queueDepthsCheck]);
 
   try {
     await dbCheck;

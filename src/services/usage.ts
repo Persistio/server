@@ -1,7 +1,7 @@
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { getConfig } from '../config';
-import { captureShadowCustomerMetric } from './customer-metric-shadow';
+import { captureShadowCustomerMetric, customerMetricCaptureEnabled } from './customer-metric-shadow';
 import { registerExecutionState } from '../request-worker/state';
 import type { PoolClient } from 'pg';
 
@@ -606,7 +606,7 @@ export async function refundApiQuotaReservation(reservation: ApiQuotaReservation
     if (event && client) await captureShadowCustomerMetric(client, event);
     return event;
   };
-  const event = getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE ? await withTransaction(update) : await update();
+  const event = customerMetricCaptureEnabled() ? await withTransaction(update) : await update();
   recordPreparedQuotaDelta(event);
 }
 
@@ -760,7 +760,7 @@ export async function settleAiUsage(vaultId: string, role: AiBudgetRole, estimat
 }
 
 export async function recordModelUsage(input: ModelUsageInput, client?: PoolClient): Promise<void> {
-  const event = !client && getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE
+  const event = !client && customerMetricCaptureEnabled()
     ? await withTransaction(transaction => writeModelUsage(input, transaction))
     : await writeModelUsage(input, client);
   if (event) { try { recordCustomerMetric(event); } catch { /* Committed accounting stays authoritative. */ } }
@@ -835,7 +835,7 @@ async function writeModelUsage(input: ModelUsageInput, client?: PoolClient) {
     ...(promptTokens ? { prompt_tokens: promptTokens } : {}),
     ...(totalTokens ? { total_tokens: totalTokens } : {})
   });
-  if (client && getConfig().CUSTOMER_METRICS_SHADOW_CAPTURE) await captureShadowCustomerMetric(client, event);
+  if (client && customerMetricCaptureEnabled()) await captureShadowCustomerMetric(client, event);
   return event;
 }
 

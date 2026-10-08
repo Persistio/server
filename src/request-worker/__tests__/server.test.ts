@@ -10,13 +10,13 @@ const config = requestWorkerConfig({ REQUEST_WORKER_ENABLED: 'true', REQUEST_WOR
   REQUEST_WORKER_INVOKER_EMAIL: 'tasks@example-project.iam.gserviceaccount.com', REQUEST_WORKER_INVOKER_SUBJECT: '123456789012345678901' });
 const wake = { version: 1 as const, kind: 'extraction' as const, token: crypto.randomUUID(), generation: '1' };
 const runtimes: ReturnType<typeof createRequestWorkerServer>[] = [];
-function setup(code = "require('node:worker_threads').parentPort.postMessage({type:'settled',success:true}); setInterval(()=>{},1000)") {
+function setup(code = "require('node:worker_threads').parentPort.postMessage({type:'settled',success:true}); setInterval(()=>{},1000)", continueWork?: (kind: typeof wake.kind) => Promise<unknown>) {
   const store = { acquire: vi.fn().mockResolvedValue({ status: 'acquired', previousOwner: null }),
     renew: vi.fn().mockResolvedValue(true), clearBackends: vi.fn().mockResolvedValue(undefined), finish: vi.fn().mockResolvedValue(true) };
   const workers: Worker[] = [];
   const factory = vi.fn<ExecutionFactory>(() => { const worker = new Worker(code, { eval: true }); workers.push(worker); return worker; });
   const authenticate = vi.fn().mockResolvedValue(true); const fatal = vi.fn();
-  const runtime = createRequestWorkerServer({ config: { ...config }, store: store as unknown as WorkerExecutionStore, authenticate, fatal, executionFactory: factory });
+  const runtime = createRequestWorkerServer({ config: { ...config }, store: store as unknown as WorkerExecutionStore, authenticate, fatal, executionFactory: factory, continueWork: continueWork as never });
   runtimes.push(runtime);
   return { runtime, store, workers, factory, authenticate, fatal };
 }
@@ -36,6 +36,14 @@ describe('private request host', () => {
     expect(factory).not.toHaveBeenCalled();
     authenticate.mockResolvedValue(false);
     expect((await deliver(runtime)).statusCode).toBe(401);
+  });
+  it('uses the new cutover gate while the old binary admission flag stays disabled', async () => {
+    const store = {acquire:vi.fn().mockResolvedValue({status:'stale'})};
+    const runtime = createRequestWorkerServer({config:{...config,REQUEST_WORKER_ADMISSION_ENABLED:'false',REQUEST_WORKER_CUTOVER_ENABLED:'true'},
+      store:store as unknown as WorkerExecutionStore,authenticate:vi.fn().mockResolvedValue(true),fatal:vi.fn()});
+    runtimes.push(runtime);
+    expect((await deliver(runtime)).statusCode).toBe(204);
+    expect(store.acquire).toHaveBeenCalledOnce();
   });
   it('rejects authentication before SQL or thread startup even with forged task headers', async () => {
     const s = setup(); s.authenticate.mockResolvedValue(false);
@@ -62,6 +70,23 @@ describe('private request host', () => {
     expect((await deliver(s.runtime)).statusCode).toBe(204);
     expect(order).toEqual(['cleanup', 'ack']);
     expect(s.store.finish).toHaveBeenCalledWith(expect.any(String), wake, true);
+  });
+  it('awaits continuation after cleanup/ack; a failed continuation never retries committed work', async () => {
+    let resolve!: () => void;
+    const continued = vi.fn(() => new Promise<void>(done => { resolve = done; }));
+    const s = setup(undefined, continued);
+    let returned = false;
+    const response = deliver(s.runtime).then(result => { returned = true; return result; });
+    await vi.waitFor(() => expect(continued).toHaveBeenCalledOnce());
+    expect(s.workers[0].threadId).toBe(-1);
+    expect(s.store.clearBackends).toHaveBeenCalledOnce();
+    expect(s.store.finish).toHaveBeenCalledWith(expect.any(String), wake, true);
+    expect(returned).toBe(false);
+    resolve(); expect((await response).statusCode).toBe(204);
+    const failure = setup(undefined, vi.fn().mockRejectedValue(new Error('transport unavailable')));
+    expect((await deliver(failure.runtime)).statusCode).toBe(204);
+    expect(failure.factory).toHaveBeenCalledOnce();
+    expect(failure.store.finish).toHaveBeenCalledOnce();
   });
   it('does not acknowledge a crash, false result or silent exit', async () => {
     for (const code of ["throw new Error('crash')", "process.exit(0)", "require('node:worker_threads').parentPort.postMessage({type:'settled',success:false})"]) {

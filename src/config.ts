@@ -98,6 +98,8 @@ const configSchema = z.object({
   RAW_CHUNK_RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(100),
   TELEMETRY_SHADOW_ENABLED: booleanFlag,
   CUSTOMER_METRICS_SHADOW_CAPTURE: booleanFlag,
+  CUSTOMER_METRICS_DURABLE_CAPTURE: booleanFlag,
+  API_REQUEST_BILLING: booleanFlag,
   CUSTOMER_METRICS_PUBLISHER: z.enum(['noop', 'log', 'gcp_pubsub']).default('noop'),
   CUSTOMER_METRICS_GCP_PUBSUB_PROJECT_ID: z.string().default(''),
   CUSTOMER_METRICS_GCP_PUBSUB_TOPIC: z.string().default(''),
@@ -370,6 +372,17 @@ const configSchema = z.object({
       message: 'GCP_PUBSUB_TOPIC is required when EVENT_PUBLISHER=gcp_pubsub',
       path: ['GCP_PUBSUB_TOPIC']
     });
+  }
+
+  if (value.CUSTOMER_METRICS_DURABLE_CAPTURE &&
+      (!(value.PERSISTIO_MODE === 'request-worker' || (value.PERSISTIO_MODE === 'api' && value.API_REQUEST_BILLING)) || value.CUSTOMER_METRICS_SHADOW_CAPTURE || value.CUSTOMER_METRICS_PUBLISHER !== 'noop')) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['CUSTOMER_METRICS_DURABLE_CAPTURE'],
+      message: 'Durable production capture requires request-worker or guarded API mode with shadow capture and buffered publication disabled' });
+  }
+
+  if (value.API_REQUEST_BILLING && (value.PERSISTIO_MODE !== 'api' || !value.CUSTOMER_METRICS_DURABLE_CAPTURE || value.TELEMETRY_PROVIDER !== 'none')) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['API_REQUEST_BILLING'],
+      message: 'Request billing requires API-only mode, durable customer capture and telemetry provider none' });
   }
 
   if (value.CUSTOMER_METRICS_PUBLISHER === 'gcp_pubsub' && !value.CUSTOMER_METRICS_GCP_PUBSUB_TOPIC) {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const configMock = vi.hoisted(() => ({
+  API_REQUEST_BILLING: false,
   OPENAI_API_KEY: 'test-openai-key',
   OPENAI_EMBEDDING_MODEL: 'text-embedding-3-small',
   TEI_BASE_URL: 'http://tei.test',
@@ -213,5 +214,27 @@ describe('Vertex embedding provider', () => {
     });
 
     vi.unstubAllGlobals();
+  });
+});
+
+
+describe('guarded API embedding settlement', () => {
+  it('stops queued calls after failure and awaits the already-running sibling', async () => {
+    configMock.API_REQUEST_BILLING = true;
+    configMock.INGEST_EMBEDDING_CONCURRENCY = 2;
+    let release!: () => void; let failed!: () => void;
+    const started = new Promise<void>(resolve => { failed = resolve; });
+    const fetchMock = vi.fn().mockImplementationOnce(async () => { await started; throw new Error('first failed'); })
+      .mockImplementationOnce(() => new Promise<Response>(resolve => { release = () => resolve(new Response(JSON.stringify({ predictions: [{ embeddings: { values: [1] } }] }))); failed(); }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      let settled = false;
+      const work = new VertexEmbedder({ getAccessToken: async () => 'token' }).embedBatch(['a', 'b', 'c', 'd'])
+        .catch(error => { settled = true; return error; });
+      await started; await new Promise(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(fetchMock).toHaveBeenCalledTimes(2);
+      release(); expect((await work).message).toBe('first failed');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally { configMock.API_REQUEST_BILLING = false; configMock.INGEST_EMBEDDING_CONCURRENCY = 4; vi.unstubAllGlobals(); }
   });
 });

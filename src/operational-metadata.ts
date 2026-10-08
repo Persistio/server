@@ -33,7 +33,7 @@ const enumValues:Record<string,ReadonlySet<string>>={
   outcome:new Set(['accepted','rejected','deferred','completed','failed','cycle','attempted','delivered','dead']),
   reasoning_token_source:new Set(['explicit','derived','unavailable'])
 };
-const safeMessages=new Set(['shadow_customer_delivery','shadow_domain_metric','shadow_worker_cycle','shadow_worker_observation','shadow_dispatch_cycle','Recall served','Extraction job failed','Curation job failed','Extraction loop iteration failed',
+const safeMessages=new Set(['Customer request observation unavailable','shadow_customer_delivery','shadow_domain_metric','shadow_worker_cycle','shadow_worker_observation','shadow_dispatch_cycle','Recall served','Extraction job failed','Curation job failed','Extraction loop iteration failed',
   'extraction pipeline attrition',
   'Curation loop iteration failed','Contradiction activation iteration failed','Extraction worker terminated','Curation worker terminated',
   'curator token usage','arbitration token usage','batch arbitration token usage','circuit_breaker_open',

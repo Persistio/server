@@ -37,6 +37,43 @@ describe.skipIf(!url)('shadow accounting and observation protocol (PostgreSQL)',
     await pool.query('DELETE FROM vaults WHERE id=$1',[vault]);
     await pool.end();await db?.closePool();
   });
+  it('isolates production events from historical shadow rows, including rollback delivery', async () => {
+    const config = (await import('../config')).getConfig();
+    const shadow = await insert();
+    config.CUSTOMER_METRICS_DURABLE_CAPTURE = true;
+    try {
+      const event = input();
+      await db.withTransaction(client => captureShadowCustomerMetric(client, event));
+      const usage = await import('./usage');
+      const reservation = await usage.reserveApiQuota(vault, 'searches');
+      await usage.refundApiQuotaReservation(reservation);
+      await usage.recordModelUsage({vaultId:vault,provider:'openai',model:'production-test',modelRole:'embedding',source:'worker',embeddingInputTokens:7,requestCount:1});
+      const durable = (await pool.query('SELECT payload FROM customer_metric_outbox')).rows.map(row => row.payload);
+      expect(durable).toHaveLength(4);
+      expect(durable.some(row => row.model === 'production-test')).toBe(true);
+      expect(durable.every(row => row.event_id !== shadow.event_id)).toBe(true);
+      await expect(db.withTransaction(async client => {
+        await captureShadowCustomerMetric(client, input()); throw new Error('rollback');
+      })).rejects.toThrow('rollback');
+      expect((await pool.query('SELECT * FROM customer_metric_outbox')).rowCount).toBe(4);
+      // Rollback changes the producer, never the destination of committed rows.
+      config.CUSTOMER_METRICS_DURABLE_CAPTURE = false;
+      const sent: CustomerMetricEvent[] = [];
+      const dispatcher = new ShadowCustomerMetricDispatcher(pool, {publish:async events => { sent.push(...events); }}, {production:true});
+      expect((await dispatcher.dispatchOnce()).delivered).toBe(4);
+      expect(sent.map(row => row.event_id).sort()).toEqual(durable.map(row => row.event_id).sort());
+      expect((await rows()).map(row => row.event_id)).toEqual([shadow.event_id]);
+      expect((await rows())[0].status).toBe('pending');
+      const rollbackSql = await (await import('node:fs/promises')).readFile(require('node:path').join(__dirname, '../db/migrations/down/066_production_customer_metrics.sql'), 'utf8');
+      await expect(pool.query(rollbackSql)).rejects.toThrow('Retain/export production');
+      await pool.query("UPDATE customer_metric_outbox SET status='dead',settled_at=now()-interval '31 days'");
+      expect((await dispatcher.dispatchOnce()).purged).toBe(0);
+      expect((await pool.query('SELECT * FROM customer_metric_outbox')).rowCount).toBe(4);
+    } finally {
+      config.CUSTOMER_METRICS_DURABLE_CAPTURE = false;
+      await pool.query('DELETE FROM customer_metric_outbox');
+    }
+  });
   it('disabled capture does no SQL and disabled observation produces no false healthy heartbeat',async()=>{
     const query=vi.fn();await captureShadowCustomerMetric({query} as never,input(),false);
     expect(query).not.toHaveBeenCalled();

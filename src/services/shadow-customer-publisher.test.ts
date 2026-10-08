@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const rpc=vi.hoisted(()=>({publish:vi.fn(),close:vi.fn(),constructed:vi.fn()}));
 vi.mock('@google-cloud/pubsub',()=>({v1:{PublisherClient:class {constructor(){rpc.constructed();}publish=rpc.publish;close=rpc.close;}}}));
-import { ShadowPubSubPublisher } from './shadow-customer-publisher';
+import { ShadowPubSubPublisher, ProductionCustomerPublisher } from './shadow-customer-publisher';
 import { buildCustomerMetricEvent } from './customer-metrics';
 beforeEach(()=>{vi.resetAllMocks();});
 describe('isolated bounded Pub/Sub shadow adapter',()=>{
@@ -23,4 +23,18 @@ describe('isolated bounded Pub/Sub shadow adapter',()=>{
     await publisher.close();expect(rpc.close).toHaveBeenCalledOnce();
     await expect(publisher.publish([event,event])).rejects.toThrow('one bounded');
   });
+});
+
+it('production adapter rejects shadow/short topics before client discovery and retains the event envelope', async () => {
+  for (const topic of ['customer', 'projects/example-project/topics/customer-shadow']) {
+    expect(() => new ProductionCustomerPublisher(topic)).toThrow();
+  }
+  expect(rpc.constructed).not.toHaveBeenCalled();
+  const publisher = new ProductionCustomerPublisher('projects/example-project/topics/customer');
+  const event = buildCustomerMetricEvent({event_type:'quota_delta',operation:'memory_count',memory_count_delta:1,
+    source:'worker',workspace_id:'workspace',vault_id:'vault'});
+  await publisher.publish([event]);
+  expect(rpc.publish.mock.calls[0][0].topic).toBe('projects/example-project/topics/customer');
+  expect(JSON.parse(rpc.publish.mock.calls[0][0].messages[0].data.toString())).toEqual(event);
+  await publisher.close();
 });

@@ -10,6 +10,7 @@ export interface WakeDispatchReport {
 }
 export interface WorkerWakeDispatcherOptions {
   enabled?: boolean;
+  kinds?: readonly WorkerWakeKind[];
   store: WorkerWakeStore;
   reconciliation: { dueAt(kind: WorkerWakeKind): Promise<Date | null> };
   transport: WakeTransport;
@@ -22,11 +23,12 @@ export interface WorkerWakeDispatcherOptions {
 export class WorkerWakeDispatcher {
   constructor(private readonly options: WorkerWakeDispatcherOptions) {}
 
-  async dispatchOnce(): Promise<WakeDispatchReport> {
+  async dispatchOnce(kinds: readonly WorkerWakeKind[] = this.options.kinds ?? WORKER_WAKE_KINDS): Promise<WakeDispatchReport> {
     if (!this.options.enabled) return { enabled: false, outcomes: {}, failures: {} };
     const { store, reconciliation, transport } = this.options;
     const report: WakeDispatchReport = { enabled: true, outcomes: {}, failures: {} };
-    for (const kind of WORKER_WAKE_KINDS) {
+    for (const kind of kinds) {
+      if (this.options.kinds && !this.options.kinds.includes(kind)) continue;
       let reservation: WakeReservation | null = null;
       let stage: 'reconciliation' | 'storage' | 'transport' = 'reconciliation';
       try {
@@ -60,7 +62,7 @@ export class WorkerWakeDispatcher {
         if (reservation) await store.failed(reservation).catch(() => {});
       }
     }
-    for (const kind of WORKER_WAKE_KINDS) shadowDispatchCycle(kind,report.outcomes[kind] ?? 'unknown');
+    for (const kind of kinds) shadowDispatchCycle(kind,report.outcomes[kind] ?? 'unknown');
     return report;
   }
 }

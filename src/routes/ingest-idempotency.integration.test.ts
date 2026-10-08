@@ -123,6 +123,36 @@ describe.skipIf(!databaseUrl)('ingest ownership and replay (real PostgreSQL)', (
     expect(await counts()).toEqual({ raw: 1, segments: 1, queue: 1, intents: 0, charges: 1 });
   });
 
+  it('guarded API preserves production accounting and replay while deferring failed upload cleanup', async () => {
+    const config = (await import('../config')).getConfig();
+    const previous = { API_REQUEST_BILLING: config.API_REQUEST_BILLING, CUSTOMER_METRICS_DURABLE_CAPTURE: config.CUSTOMER_METRICS_DURABLE_CAPTURE };
+    config.API_REQUEST_BILLING = true; config.CUSTOMER_METRICS_DURABLE_CAPTURE = true;
+    fixture.accountId = crypto.randomUUID();
+    await pool.query('UPDATE vaults SET account_id=$2 WHERE id=$1', [fixture.vaultId, fixture.accountId]);
+    try {
+      const first = await post(); expect(first.statusCode).toBe(202);
+      const original = (await pool.query("SELECT payload FROM customer_metric_outbox WHERE payload->>'vault_id'=$1 ORDER BY event_id", [fixture.vaultId])).rows;
+      expect(original).toHaveLength(2);
+      expect((await post()).json().replayed).toBe(1);
+      expect((await pool.query("SELECT payload FROM customer_metric_outbox WHERE payload->>'vault_id'=$1 ORDER BY event_id", [fixture.vaultId])).rows).toEqual(original);
+      // A provider can store the object and then lose its acknowledgement.
+      await pool.query('UPDATE vaults SET rate_limit_override=NULL WHERE id=$1', [fixture.vaultId]);
+      fixture.put.mockImplementationOnce(async (key: string, content: string) => {
+        fixture.blobs.set(key, content); throw new Error('Lost PUT acknowledgement');
+      });
+      expect((await post([chunk('failed-upload')])).statusCode).toBe(500);
+      expect(fixture.remove).not.toHaveBeenCalled();
+      expect((await counts()).intents).toBe(1);
+      const intent = (await pool.query('SELECT id FROM raw_chunk_blob_write_intents WHERE vault_id=$1', [fixture.vaultId])).rows[0];
+      expect(await cleanupRawChunkWrite(storage, { id: intent.id })).toBe('quarantined');
+      expect(await counts()).toEqual({ raw: 1, segments: 1, queue: 1, intents: 1, charges: 1 });
+      expect(fixture.blobs.size).toBe(1);
+    } finally {
+      Object.assign(config, previous);
+      await pool.query("DELETE FROM customer_metric_outbox WHERE payload->>'vault_id'=$1", [fixture.vaultId]);
+    }
+  });
+
   it('accepts concurrent identical requests with one lineage and one final quota unit', async () => {
     let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; }); let calls = 0;
     fixture.embed.mockImplementation(async () => { if (++calls === 2) release(); await barrier; return [[1, ...Array(1535).fill(0)]]; });
