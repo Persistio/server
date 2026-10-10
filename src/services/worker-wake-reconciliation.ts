@@ -53,11 +53,12 @@ export const workerDueRowsSql: Record<WorkerWakeKind, string> = {
       AND COALESCE(NULLIF(limits->>'curator_requests_per_month', '')::int, 1) > 0
       AND COALESCE(NULLIF(limits->>'curator_runs_per_month', '')::int, 1) > 0`,
   contradiction: `SELECT next_visit_at AS age_at, next_visit_at AS due_at FROM memory_contradiction_pending_vaults WHERE pending_count > 0`,
-  platform_outbox: `SELECT occurred_at AS age_at, CASE WHEN status = 'pending' THEN now() ELSE COALESCE(next_retry_at, now()) END
+  // Keep overdue timestamps stable so observation can measure lateness. Both
+  // past timestamps and now() remain immediately eligible for reconciliation.
+  platform_outbox: `SELECT occurred_at AS age_at, CASE WHEN status = 'pending' THEN LEAST(occurred_at, now()) ELSE COALESCE(next_retry_at, LEAST(occurred_at, now())) END
     AS due_at FROM platform_event_outbox WHERE status IN ('pending', 'failed')`,
   usage_periods: `SELECT (to_date(period || '-01','YYYY-MM-DD')::timestamp + interval '1 month') AT TIME ZONE 'UTC' AS age_at,
-    CASE WHEN period < to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM') THEN now()
-    ELSE (date_trunc('month', now() AT TIME ZONE 'UTC') + interval '1 month') AT TIME ZONE 'UTC' END
+    (to_date(period || '-01','YYYY-MM-DD')::timestamp + interval '1 month') AT TIME ZONE 'UTC'
     AS due_at FROM vault_usage WHERE period <= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')`,
   blob_reconciliation: `SELECT updated_at AS age_at, updated_at + interval '15 minutes' AS due_at FROM raw_chunk_blob_write_intents`
 };

@@ -70,7 +70,7 @@ export async function observeWorkerShadow(
       }>(db, `WITH due AS (${dueSql}) SELECT
         extract(epoch FROM now())*1000 AS observed_at_ms,
         count(*) FILTER (WHERE due_at<=now()) AS eligible_depth,
-        COALESCE(GREATEST(0,extract(epoch FROM now()-min(age_at) FILTER(WHERE due_at<=now()))*1000),0) AS oldest_due_age_ms,
+        COALESCE(GREATEST(0,extract(epoch FROM now()-min(due_at) FILTER(WHERE due_at<=now()))*1000),0) AS oldest_due_age_ms,
         count(*) FILTER (WHERE due_at>now()) AS deferred_depth,
         (${leases} + (SELECT count(*) FROM worker_execution_slot WHERE kind=$1 AND owner IS NOT NULL AND expires_at<=now())) AS expired_leases,${dead} AS dead_letters,
         (SELECT GREATEST(0,extract(epoch FROM now()-succeeded_at)*1000) FROM worker_observation_success WHERE kind=$1)

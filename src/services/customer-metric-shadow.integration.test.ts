@@ -256,7 +256,8 @@ describe.skipIf(!url)('shadow accounting and observation protocol (PostgreSQL)',
     expect(observations.find(o=>o.shadow_kind==='customer_metrics')).not.toHaveProperty('last_cycle_success_age_ms');
     await pool.query("UPDATE customer_metric_shadow_outbox SET event_ts=now()-interval '10 minutes',available_at=now()-interval '1 second' WHERE status='pending'");
     const overdue=await observeWorkerShadow(pool,{enabled:true,emit:()=>{}});
-    expect(overdue.find(o=>o.shadow_kind==='customer_metrics')!.oldest_due_age_ms).toBeGreaterThanOrEqual(600000);
+    expect(overdue.find(o=>o.shadow_kind==='customer_metrics')!.oldest_due_age_ms).toBeGreaterThanOrEqual(1000);
+    expect(overdue.find(o=>o.shadow_kind==='customer_metrics')!.oldest_due_age_ms).toBeLessThan(60000);
 
     const failed=await observeWorkerShadow({connect:async()=>{throw new Error('PRIVATE SQL DATA');}} as never,{enabled:true,emit:()=>{}});
     expect(failed.every(o=>o.shadow_health==='monitor_error'&&!('eligible_depth' in o))).toBe(true);

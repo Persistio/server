@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { WorkerWakeStore, requestWorkerWakes, completeWorkerWake, admitContradictionArbitration } from './worker-wake-store';
 import { WorkerWakeDispatcher } from './worker-wake-dispatcher';
 import { WorkerWakeReconciliation } from './worker-wake-reconciliation';
+import { observeWorkerShadow } from './shadow-observability';
 import { WORKER_WAKE_KINDS, type WorkerWakeKind } from './worker-wake-types';
 
 const url = process.env.PERSISTIO_TEST_DATABASE_URL;
@@ -353,7 +354,7 @@ describe.skipIf(!url)('durable wake protocol (PostgreSQL 17)', () => {
     await pool.query("UPDATE memory_contradiction_pending_vaults SET next_visit_at=now()-interval '1 second' WHERE vault_id=$1", [vault]);
     expect((await source.dueAt('contradiction'))!.getTime()).toBeLessThan(Date.now());
     await pool.query("INSERT INTO vault_usage(vault_id,period) VALUES($1,'2020-01')", [vault]);
-    expect((await source.dueAt('usage_periods'))!.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(await source.dueAt('usage_periods')).toEqual(new Date('2020-02-01T00:00:00Z'));
     await pool.query("INSERT INTO raw_chunk_blob_write_intents(vault_id,blob_store,blob_key,updated_at) VALUES($1,'local',$2,now()-interval '16 minutes')", [vault, 'wake-'+vault]);
     expect((await source.dueAt('blob_reconciliation'))!.getTime()).toBeLessThan(Date.now());
     // Other integration suites intentionally retain committed platform events.
@@ -372,11 +373,42 @@ describe.skipIf(!url)('durable wake protocol (PostgreSQL 17)', () => {
       expect(await isolated.dueAt('platform_outbox')).toBeNull();
       await client.query("UPDATE platform_event_outbox SET status='pending',occurred_at=now()+interval '1 day' WHERE event_id=$1", [event]);
       expect((await isolated.dueAt('platform_outbox'))!.getTime()).toBeLessThanOrEqual(Date.now());
+      await client.query("UPDATE platform_event_outbox SET occurred_at='2020-01-01Z' WHERE event_id=$1", [event]);
+      expect(await isolated.dueAt('platform_outbox')).toEqual(new Date('2020-01-01Z'));
+      await client.query("UPDATE platform_event_outbox SET status='failed',next_retry_at=NULL WHERE event_id=$1", [event]);
+      expect(await isolated.dueAt('platform_outbox')).toEqual(new Date('2020-01-01Z'));
+      await client.query("UPDATE platform_event_outbox SET next_retry_at='2020-01-02Z' WHERE event_id=$1", [event]);
+      expect(await isolated.dueAt('platform_outbox')).toEqual(new Date('2020-01-02Z'));
       expect((await pool.query('SELECT status FROM platform_event_outbox WHERE event_id=$1',[unrelated])).rows[0].status).toBe('pending');
     } finally {
       client.release(true); // Discard the connection and its temporary table.
       await pool.query('DELETE FROM platform_event_outbox WHERE event_id=$1',[unrelated]);
     }
+  });
+
+  it('measures scheduled curation lateness from cooldown and lease expiry, not its 19-day enqueue age', async () => {
+    await pool.query("INSERT INTO curation_queue(vault_id,work_key,enqueued_at,available_at) VALUES($1,'lateness-fixture',now()-interval '19 days',now()-interval '18 days')", [vault]);
+    await pool.query("INSERT INTO vault_curation_state(vault_id,next_curator_run_at) VALUES($1,now()-interval '10 seconds')", [vault]);
+    const observe = async () => (await observeWorkerShadow(pool, {enabled:true,curationEnabled:true,emit:()=>{}}))
+      .find(row => row.shadow_kind === 'curation')!;
+    const due = await observe();
+    expect(due).toMatchObject({shadow_health:'ok',eligible_depth:1,deferred_depth:0});
+    expect(due.oldest_due_age_ms).toBeGreaterThanOrEqual(10000);
+    expect(due.oldest_due_age_ms).toBeLessThan(60000);
+    await pool.query("UPDATE vault_curation_state SET next_curator_run_at=now()+interval '1 hour' WHERE vault_id=$1", [vault]);
+    expect(await observe()).toMatchObject({eligible_depth:0,deferred_depth:1,oldest_due_age_ms:0});
+    await pool.query("UPDATE vault_curation_state SET next_curator_run_at=now()-interval '10 minutes' WHERE vault_id=$1", [vault]);
+    await pool.query("UPDATE curation_queue SET claim_token=gen_random_uuid(),claimed_at=now(),claimed_by='lateness-test',lease_expires_at=now()+interval '1 hour' WHERE vault_id=$1", [vault]);
+    expect(await observe()).toMatchObject({eligible_depth:0,deferred_depth:1,oldest_due_age_ms:0});
+    await pool.query("UPDATE curation_queue SET lease_expires_at=now()-interval '2 seconds' WHERE vault_id=$1", [vault]);
+    const expired = await observe();
+    expect(expired).toMatchObject({eligible_depth:1,expired_leases:1});
+    expect(expired.oldest_due_age_ms).toBeGreaterThanOrEqual(2000);
+    expect(expired.oldest_due_age_ms).toBeLessThan(60000);
+    await pool.query("UPDATE curation_queue SET claim_token=NULL,claimed_at=NULL,claimed_by=NULL,lease_expires_at=NULL WHERE vault_id=$1", [vault]);
+    expect((await observe()).oldest_due_age_ms).toBeGreaterThanOrEqual(600000);
+    await pool.query('DELETE FROM curation_queue WHERE vault_id=$1', [vault]);
+    expect(await observe()).toMatchObject({eligible_depth:0,deferred_depth:0,oldest_due_age_ms:0});
   });
 
   it('respects curation cooldowns, leases, disabled plans and UTC monthly budgets', async () => {
